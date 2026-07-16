@@ -1,0 +1,7 @@
+**/.pio/
+**/.vscode/
+**/.vscode_old/
+**/.agents/
+**/__pycache__/
+*.pyc
+.env
