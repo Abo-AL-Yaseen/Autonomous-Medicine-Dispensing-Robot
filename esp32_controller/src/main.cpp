@@ -53,6 +53,16 @@ static bool lcdReady = false;
 const int ULTRASONIC_TRIG_PIN = 18;
 const int ULTRASONIC_ECHO_PIN = 34;
 const unsigned long ULTRASONIC_TIMEOUT_US = 30000;
+const int IR_SENSOR_PIN = 16;
+const int IR_DETECTED_LEVEL = LOW;
+const unsigned long IR_DEBOUNCE_MS = 100;
+const int LINE_OUT1_PIN = 35;
+const int LINE_OUT2_PIN = 36;
+const int LINE_OUT3_PIN = 39;
+const int LINE_OUT4_PIN = 17;
+const int LINE_OUT5_PIN = 4;
+const unsigned long LINE_SAMPLE_INTERVAL_MS = 20;
+const unsigned long LINE_STABLE_DURATION_MS = 50;
 
 // MH Real Time Clock Module 2 / DS1302-style 3-wire RTC wiring:
 // VCC -> ESP32 3V3, GND -> GND, CLK -> GPIO33, DAT -> GPIO32, RST -> GPIO19.
@@ -119,15 +129,32 @@ static uint8_t failedUltrasonicReadings = 0;
 static bool nextAutoTurnRight = true;
 static float lastAutoDistanceCm = -1.0f;
 
+static bool irCurrentRawDetected = false;
+static bool irLastRawDetected = false;
+static bool irStableDetected = false;
+static bool irDetectionLatched = false;
+static unsigned long irDebounceStartedMs = 0;
+
+static uint8_t lineCandidatePattern = 0;
+static uint8_t lineStablePattern = 0;
+static unsigned long lastLineSampleMs = 0;
+static unsigned long lineCandidateStartedMs = 0;
+static bool lineStablePatternReady = false;
+
 const size_t SERIAL_COMMAND_BUFFER_SIZE = 64;
+const unsigned long SERIAL_PENDING_P_TIMEOUT_MS = 125;
 static char serialCommandBuffer[SERIAL_COMMAND_BUFFER_SIZE];
 static size_t serialCommandLength = 0;
 static bool serialCommandOverflow = false;
+static bool serialTextMode = false;
+static bool serialPendingP = false;
+static unsigned long serialPendingPStartedMs = 0;
 
-enum SerialLineResult {
-  SERIAL_LINE_INCOMPLETE,
-  SERIAL_LINE_READY,
-  SERIAL_LINE_OVERFLOW
+enum SerialInputResult {
+  SERIAL_INPUT_INCOMPLETE,
+  SERIAL_INPUT_LEGACY_READY,
+  SERIAL_INPUT_LINE_READY,
+  SERIAL_INPUT_OVERFLOW
 };
 
 void stopMotors();
@@ -137,6 +164,9 @@ void stopAllOutputs();
 void setupUltrasonic();
 float readUltrasonicCm();
 void testUltrasonicOnce();
+void updateIrSensor();
+uint8_t readLineSensorPattern();
+void updateLineSensorTest();
 void setupRTC();
 void printRTC();
 void setupLCD();
@@ -149,58 +179,112 @@ void stopAutonomousMode(const char* reason, char command);
 void updateAutonomousMode();
 void handleLegacyCommand(char command);
 void handleTextCommand(const String& command);
+static bool isLegacyCommand(char command);
 
-static SerialLineResult readSerialLine(String& line) {
+// Hardware keys execute immediately. Text commands remain newline-terminated,
+// while P is held briefly so a fast PING line is not mistaken for the pump key.
+static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
   while (Serial.available() > 0) {
     char incoming = (char)Serial.read();
 
-    if (incoming == '\r') {
-      continue;
-    }
-
-    if (incoming == '\n') {
-      if (serialCommandOverflow) {
+    if (serialCommandOverflow) {
+      if (incoming == '\n') {
         serialCommandLength = 0;
         serialCommandBuffer[0] = '\0';
         serialCommandOverflow = false;
-        return SERIAL_LINE_OVERFLOW;
+        serialTextMode = false;
+        return SERIAL_INPUT_OVERFLOW;
       }
-
-      serialCommandBuffer[serialCommandLength] = '\0';
-      line = serialCommandBuffer;
-      serialCommandLength = 0;
-      serialCommandBuffer[0] = '\0';
-      return SERIAL_LINE_READY;
-    }
-
-    if (serialCommandOverflow) {
       continue;
     }
 
-    if (serialCommandLength < SERIAL_COMMAND_BUFFER_SIZE - 1) {
-      serialCommandBuffer[serialCommandLength++] = incoming;
-    } else {
-      serialCommandLength = 0;
-      serialCommandBuffer[0] = '\0';
-      serialCommandOverflow = true;
+    if (serialTextMode) {
+      if (incoming == '\r') {
+        continue;
+      }
+
+      if (incoming == '\n') {
+        serialCommandBuffer[serialCommandLength] = '\0';
+        line = serialCommandBuffer;
+        serialCommandLength = 0;
+        serialCommandBuffer[0] = '\0';
+        serialTextMode = false;
+        return SERIAL_INPUT_LINE_READY;
+      }
+
+      if (serialCommandLength < SERIAL_COMMAND_BUFFER_SIZE - 1) {
+        serialCommandBuffer[serialCommandLength++] = incoming;
+      } else {
+        serialCommandLength = 0;
+        serialCommandBuffer[0] = '\0';
+        serialCommandOverflow = true;
+      }
+      continue;
     }
+
+    if (serialPendingP) {
+      if (incoming == '\r' || incoming == '\n') {
+        serialPendingP = false;
+        legacyCommand = 'P';
+        return SERIAL_INPUT_LEGACY_READY;
+      }
+
+      if (isLegacyCommand(incoming)) {
+        serialPendingP = false;
+        legacyCommand = incoming;
+        return SERIAL_INPUT_LEGACY_READY;
+      }
+
+      serialPendingP = false;
+      serialTextMode = true;
+      serialCommandLength = 0;
+      serialCommandBuffer[serialCommandLength++] = 'P';
+      serialCommandBuffer[serialCommandLength++] = incoming;
+      continue;
+    }
+
+    if (incoming == '\r' || incoming == '\n' || incoming == ' ' || incoming == '\t') {
+      continue;
+    }
+
+    if ((char)toupper((unsigned char)incoming) == 'P') {
+      serialPendingP = true;
+      serialPendingPStartedMs = millis();
+      continue;
+    }
+
+    if (isLegacyCommand(incoming)) {
+      legacyCommand = incoming;
+      return SERIAL_INPUT_LEGACY_READY;
+    }
+
+    serialTextMode = true;
+    serialCommandLength = 0;
+    serialCommandBuffer[serialCommandLength++] = incoming;
   }
 
-  return SERIAL_LINE_INCOMPLETE;
+  if (serialPendingP && millis() - serialPendingPStartedMs >= SERIAL_PENDING_P_TIMEOUT_MS) {
+    serialPendingP = false;
+    legacyCommand = 'P';
+    return SERIAL_INPUT_LEGACY_READY;
+  }
+
+  return SERIAL_INPUT_INCOMPLETE;
 }
 
 // أثناء عملية حاجبة (دوران أو Demo)، أي أمر جديد يوقف الحركة.
 // الأمر S يعمل كتوقف طارئ، وباقي الأوامر تُعاد بعد عودة البرنامج للحلقة الرئيسية.
 static bool interruptionRequested() {
   while (true) {
+    char legacyCommand = '\0';
     String receivedLine;
-    SerialLineResult result = readSerialLine(receivedLine);
+    SerialInputResult result = readSerialInput(legacyCommand, receivedLine);
 
-    if (result == SERIAL_LINE_INCOMPLETE) {
+    if (result == SERIAL_INPUT_INCOMPLETE) {
       return false;
     }
 
-    if (result == SERIAL_LINE_OVERFLOW) {
+    if (result == SERIAL_INPUT_OVERFLOW) {
       stopAllOutputs();
       lcdShowStatus("Action Cancelled", "Outputs Off");
       Serial.println("ERROR|COMMAND_TOO_LONG");
@@ -208,9 +292,13 @@ static bool interruptionRequested() {
       return true;
     }
 
-    receivedLine.trim();
-    if (receivedLine.length() == 0) {
-      continue;
+    if (result == SERIAL_INPUT_LEGACY_READY) {
+      receivedLine = String(legacyCommand);
+    } else {
+      receivedLine.trim();
+      if (receivedLine.length() == 0) {
+        continue;
+      }
     }
 
     char command = (char)toupper((unsigned char)receivedLine.charAt(0));
@@ -337,6 +425,82 @@ void testUltrasonicOnce() {
   }
 }
 
+void updateIrSensor() {
+  irCurrentRawDetected = digitalRead(IR_SENSOR_PIN) == IR_DETECTED_LEVEL;
+  unsigned long now = millis();
+
+  if (irCurrentRawDetected != irLastRawDetected) {
+    irLastRawDetected = irCurrentRawDetected;
+    irDebounceStartedMs = now;
+    return;
+  }
+
+  if (irCurrentRawDetected == irStableDetected || now - irDebounceStartedMs < IR_DEBOUNCE_MS) {
+    return;
+  }
+
+  irStableDetected = irCurrentRawDetected;
+  if (irStableDetected) {
+    if (!irDetectionLatched) {
+      irDetectionLatched = true;
+      Serial.println("IR|HAND_DETECTED");
+      lcdShowStatus("IR Sensor", "Hand Detected");
+    }
+  } else {
+    irDetectionLatched = false;
+  }
+}
+
+uint8_t readLineSensorPattern() {
+  uint8_t out1 = digitalRead(LINE_OUT1_PIN) == HIGH ? 1 : 0;
+  uint8_t out2 = digitalRead(LINE_OUT2_PIN) == HIGH ? 1 : 0;
+  uint8_t out3 = digitalRead(LINE_OUT3_PIN) == HIGH ? 1 : 0;
+  uint8_t out4 = digitalRead(LINE_OUT4_PIN) == HIGH ? 1 : 0;
+  uint8_t out5 = digitalRead(LINE_OUT5_PIN) == HIGH ? 1 : 0;
+
+  return (out1 << 4) | (out2 << 3) | (out3 << 2) | (out4 << 1) | out5;
+}
+
+static void printLineSensorPattern(uint8_t pattern) {
+  Serial.print("LINE|O1=");
+  Serial.print((pattern >> 4) & 1);
+  Serial.print("|O2=");
+  Serial.print((pattern >> 3) & 1);
+  Serial.print("|O3=");
+  Serial.print((pattern >> 2) & 1);
+  Serial.print("|O4=");
+  Serial.print((pattern >> 1) & 1);
+  Serial.print("|O5=");
+  Serial.print(pattern & 1);
+  Serial.print("|PATTERN=");
+  for (int8_t bit = 4; bit >= 0; bit--) {
+    Serial.print((pattern >> bit) & 1);
+  }
+  Serial.println();
+}
+
+void updateLineSensorTest() {
+  unsigned long now = millis();
+  if (now - lastLineSampleMs < LINE_SAMPLE_INTERVAL_MS) return;
+
+  lastLineSampleMs = now;
+  uint8_t pattern = readLineSensorPattern();
+
+  if (pattern != lineCandidatePattern) {
+    lineCandidatePattern = pattern;
+    lineCandidateStartedMs = now;
+    return;
+  }
+
+  if (now - lineCandidateStartedMs < LINE_STABLE_DURATION_MS) return;
+
+  if (!lineStablePatternReady || lineStablePattern != lineCandidatePattern) {
+    lineStablePattern = lineCandidatePattern;
+    lineStablePatternReady = true;
+    printLineSensorPattern(lineStablePattern);
+  }
+}
+
 static void printRTCDateTime(const RtcDateTime& dt) {
   if (!dt.IsValid()) {
     Serial.println("RTC Time: invalid");
@@ -356,8 +520,8 @@ static void printRTCDateTime(const RtcDateTime& dt) {
     dt.Second()
   );
 
-  Serial.print("RTC Time: ");
-  Serial.println(dateTimeString);
+  //Serial.print("RTC Time: ");
+  //Serial.println(dateTimeString);
 }
 
 void setupRTC() {
@@ -1219,15 +1383,21 @@ void handleTextCommand(const String& command) {
 
 static void processSerialInput() {
   while (true) {
+    char legacyCommand = '\0';
     String receivedLine;
-    SerialLineResult result = readSerialLine(receivedLine);
+    SerialInputResult result = readSerialInput(legacyCommand, receivedLine);
 
-    if (result == SERIAL_LINE_INCOMPLETE) {
+    if (result == SERIAL_INPUT_INCOMPLETE) {
       return;
     }
 
-    if (result == SERIAL_LINE_OVERFLOW) {
+    if (result == SERIAL_INPUT_OVERFLOW) {
       Serial.println("ERROR|COMMAND_TOO_LONG");
+      continue;
+    }
+
+    if (result == SERIAL_INPUT_LEGACY_READY) {
+      handleLegacyCommand(legacyCommand);
       continue;
     }
 
@@ -1247,6 +1417,15 @@ static void processSerialInput() {
 void setup() {
   pinMode(PUMP_PIN, OUTPUT);
   digitalWrite(PUMP_PIN, HIGH); // OFF for active-low relay.
+  pinMode(IR_SENSOR_PIN, INPUT);
+  pinMode(LINE_OUT1_PIN, INPUT);
+  pinMode(LINE_OUT2_PIN, INPUT);
+  pinMode(LINE_OUT3_PIN, INPUT);
+  pinMode(LINE_OUT4_PIN, INPUT);
+  pinMode(LINE_OUT5_PIN, INPUT);
+  irCurrentRawDetected = digitalRead(IR_SENSOR_PIN) == IR_DETECTED_LEVEL;
+  irLastRawDetected = irCurrentRawDetected;
+  irDebounceStartedMs = millis();
 
   Serial.begin(115200);
   delay(500);
@@ -1298,6 +1477,13 @@ void setup() {
   Serial.println("Ready. Motors will not move until a command is received.");
   lcdShowReady();
   printHelp();
+
+  lineCandidatePattern = readLineSensorPattern();
+  unsigned long lineMonitorStartedMs = millis();
+  lastLineSampleMs = lineMonitorStartedMs;
+  lineCandidateStartedMs = lineMonitorStartedMs;
+  lineStablePatternReady = false;
+  Serial.println("LINE|MONITOR_READY|PINS=35,36,39,17,4");
 }
 
 void loop() {
@@ -1305,6 +1491,8 @@ void loop() {
 
   processSerialInput();
 
+  updateIrSensor();
+  updateLineSensorTest();
   updateAutonomousMode();
   delay(5);
 }
