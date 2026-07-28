@@ -48,11 +48,34 @@ python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000
 
 Swagger documentation is available at `http://<raspberry-pi-address>:8000/docs`.
 
+## Manual movement API
+
+The manual movement endpoints send exactly one command to the ESP32 per request.
+Forward and backward movement continue until another movement command or STOP is
+received. Left and right use the ESP32 firmware's existing gyro-based 90-degree
+turns. No timed or automatic movement is provided by these endpoints.
+
+```bash
+curl -X POST http://YOUR_PRIVATE_IP:8000/movement/forward
+curl -X POST http://YOUR_PRIVATE_IP:8000/movement/backward
+curl -X POST http://YOUR_PRIVATE_IP:8000/movement/left
+curl -X POST http://YOUR_PRIVATE_IP:8000/movement/right
+curl -X POST http://YOUR_PRIVATE_IP:8000/movement/stop
+```
+
+For the first movement test:
+
+- Lift the wheels off the ground.
+- Keep the project power switch accessible.
+- Test `POST /movement/stop` before placing the robot on the floor.
+- Do not use Uvicorn `--reload` or multiple workers with real Serial hardware.
+
 Do not use `--reload` while connected to real hardware, and do not start multiple
 Uvicorn workers. Only one process may open the ESP32 and Arduino UNO serial ports.
 Serial operations and medicine dispensing are blocking, so the service protects all
 hardware calls with one process-local thread lock.
 
-The current API covers hardware health, ping, status, and medicine dispensing only.
+The current API covers hardware health, ping, status, medicine dispensing, and
+manual movement only.
 Navigation, camera, database, water dispensing, room logic, and the NestJS backend
 are intentionally outside this phase.

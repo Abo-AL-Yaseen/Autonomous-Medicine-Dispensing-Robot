@@ -319,6 +319,31 @@ class RobotHardwareController:
             ),
         }
 
+    def forward(self) -> str:
+        """Start continuous forward movement on the ESP32."""
+
+        return self._request(self.esp32, "F", "ACK|FORWARD")
+
+    def backward(self) -> str:
+        """Start continuous backward movement on the ESP32."""
+
+        return self._request(self.esp32, "B", "ACK|BACKWARD")
+
+    def turn_left(self) -> str:
+        """Request the ESP32's existing 90-degree left turn."""
+
+        return self._request(self.esp32, "L", "ACK|LEFT")
+
+    def turn_right(self) -> str:
+        """Request the ESP32's existing 90-degree right turn."""
+
+        return self._request(self.esp32, "R", "ACK|RIGHT")
+
+    def stop(self) -> str:
+        """Stop ESP32 motors and outputs immediately."""
+
+        return self._request(self.esp32, "S", "ACK|STOP")
+
     def dispense(self, box_number: int, pill_count: int) -> dict[str, int]:
         """Dispense pills sequentially, requiring an ACK and DONE for each pill."""
 

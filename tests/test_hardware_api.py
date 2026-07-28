@@ -18,6 +18,7 @@ class FakeHardwareController:
         self.connected = False
         self.closed = False
         self.dispense_calls: list[tuple[int, int]] = []
+        self.movement_calls: list[str] = []
         self.hardware_error: Exception | None = None
 
     def connect(self) -> None:
@@ -43,6 +44,26 @@ class FakeHardwareController:
             "requested_pills": pill_count,
             "dispensed_pills": pill_count,
         }
+
+    def forward(self) -> str:
+        return self._record_movement("forward", "ACK|FORWARD")
+
+    def backward(self) -> str:
+        return self._record_movement("backward", "ACK|BACKWARD")
+
+    def turn_left(self) -> str:
+        return self._record_movement("left", "ACK|LEFT")
+
+    def turn_right(self) -> str:
+        return self._record_movement("right", "ACK|RIGHT")
+
+    def stop(self) -> str:
+        return self._record_movement("stop", "ACK|STOP")
+
+    def _record_movement(self, movement: str, response: str) -> str:
+        self._raise_hardware_error()
+        self.movement_calls.append(movement)
+        return response
 
     def _raise_hardware_error(self) -> None:
         if self.hardware_error is not None:
@@ -76,6 +97,7 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert body["name"] == "Autonomous Medicine Dispensing Robot Hardware API"
     assert body["version"] == "1.0.0"
     assert "/dispense" in body["endpoints"]
+    assert "/movement/stop" in body["endpoints"]
 
 
 def test_health_reports_connected_hardware(client: TestClient) -> None:
@@ -195,4 +217,50 @@ def test_hardware_error_returns_service_unavailable(
     assert response.json() == {
         "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
     }
+    assert "/dev/serial/example" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "movement", "acknowledgement"),
+    [
+        ("/movement/forward", "forward", "ACK|FORWARD"),
+        ("/movement/backward", "backward", "ACK|BACKWARD"),
+        ("/movement/left", "left", "ACK|LEFT"),
+        ("/movement/right", "right", "ACK|RIGHT"),
+        ("/movement/stop", "stop", "ACK|STOP"),
+    ],
+)
+def test_movement_endpoint_sends_exactly_one_command(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    endpoint: str,
+    movement: str,
+    acknowledgement: str,
+) -> None:
+    response = client.post(endpoint)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "movement": movement,
+        "response": acknowledgement,
+    }
+    assert fake_hardware.movement_calls == [movement]
+
+
+def test_movement_hardware_error_returns_service_unavailable(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.hardware_error = SerialConnectionError(
+        "SERIAL_WRITE_FAILED|PORT=/dev/serial/example"
+    )
+
+    response = client.post("/movement/forward")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
+    }
+    assert fake_hardware.movement_calls == []
     assert "/dev/serial/example" not in response.text

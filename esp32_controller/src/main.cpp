@@ -305,6 +305,7 @@ static bool interruptionRequested() {
     stopAllOutputs();
     if (receivedLine.length() == 1 && command == 'S') {
       lcdShowStatus("STOP", "All Outputs Off");
+      Serial.println("ACK|STOP");
       Serial.println("Emergency stop received. Action cancelled.");
     } else {
       lcdShowStatus("Action Cancelled", "Outputs Off");
@@ -1251,6 +1252,7 @@ void handleLegacyCommand(char rawCommand) {
       break;
 
     case 'F':
+      Serial.println("ACK|FORWARD");
       if (autoModeEnabled) {
         stopAutonomousMode("manual command", rawCommand);
       }
@@ -1261,6 +1263,7 @@ void handleLegacyCommand(char rawCommand) {
       break;
 
     case 'B':
+      Serial.println("ACK|BACKWARD");
       if (autoModeEnabled) {
         stopAutonomousMode("manual command", rawCommand);
       }
@@ -1271,6 +1274,7 @@ void handleLegacyCommand(char rawCommand) {
       break;
 
     case 'R':
+      Serial.println("ACK|RIGHT");
       if (autoModeEnabled) {
         stopAutonomousMode("manual command", rawCommand);
       }
@@ -1280,6 +1284,7 @@ void handleLegacyCommand(char rawCommand) {
       break;
 
     case 'L':
+      Serial.println("ACK|LEFT");
       if (autoModeEnabled) {
         stopAutonomousMode("manual command", rawCommand);
       }
@@ -1294,6 +1299,7 @@ void handleLegacyCommand(char rawCommand) {
       }
       stopAllOutputs();
       lcdShowStatus("STOP", "All Outputs Off");
+      Serial.println("ACK|STOP");
       Serial.println("Immediate stop command received. Motors and pump OFF.");
       break;
 

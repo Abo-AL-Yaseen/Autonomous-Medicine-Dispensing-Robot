@@ -159,7 +159,19 @@ def create_app(
         return {
             "name": API_NAME,
             "version": API_VERSION,
-            "endpoints": ["/", "/health", "/ping", "/status", "/dispense", "/docs"],
+            "endpoints": [
+                "/",
+                "/health",
+                "/ping",
+                "/status",
+                "/dispense",
+                "/movement/forward",
+                "/movement/backward",
+                "/movement/left",
+                "/movement/right",
+                "/movement/stop",
+                "/docs",
+            ],
         }
 
     @application.get("/health")
@@ -204,7 +216,56 @@ def create_app(
             "results": results,
         }
 
+    @application.post("/movement/forward")
+    def move_forward(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "forward",
+            lambda controller: controller.forward(),
+        )
+
+    @application.post("/movement/backward")
+    def move_backward(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "backward",
+            lambda controller: controller.backward(),
+        )
+
+    @application.post("/movement/left")
+    def turn_left(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "left",
+            lambda controller: controller.turn_left(),
+        )
+
+    @application.post("/movement/right")
+    def turn_right(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "right",
+            lambda controller: controller.turn_right(),
+        )
+
+    @application.post("/movement/stop")
+    def stop(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "stop",
+            lambda controller: controller.stop(),
+        )
+
     return application
+
+
+def _movement_response(
+    request: Request,
+    movement: str,
+    operation: Callable[[RobotHardwareController], str],
+) -> dict[str, object]:
+    response = _run_hardware_operation(request, operation)
+    return {"success": True, "movement": movement, "response": response}
 
 
 def _run_hardware_operation(
