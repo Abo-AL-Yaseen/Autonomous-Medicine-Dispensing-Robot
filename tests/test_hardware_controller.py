@@ -2,28 +2,44 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 
-from raspberry_controller.hardware_controller import RobotHardwareController
+from raspberry_controller.hardware_controller import (
+    RobotHardwareController,
+    SerialController,
+    UnexpectedSerialResponse,
+)
 
 
 class RecordingSerialController:
     """Record commands and expected responses without using pyserial."""
 
-    def __init__(self) -> None:
+    def __init__(self, responses: dict[str, str] | None = None) -> None:
         self.commands: list[str] = []
         self.expected_responses: list[str | Sequence[str]] = []
+        self.responses = responses or {}
 
     def send_command(self, command: str) -> None:
         self.commands.append(command)
 
-    def wait_for_response(self, expected: str | Sequence[str]) -> str:
+    def wait_for_response(
+        self,
+        expected: str | Sequence[str],
+        *,
+        validator: Callable[[str], bool] | None = None,
+        response_prefix: str | None = None,
+    ) -> str:
         self.expected_responses.append(expected)
-        if not isinstance(expected, str):
-            return expected[0]
-        return expected
+        response = self.responses.get(self.commands[-1])
+        if response is None:
+            response = expected if isinstance(expected, str) else expected[0]
+        if validator is not None:
+            assert validator(response)
+        if response_prefix is not None:
+            assert response.startswith(response_prefix)
+        return response
 
 
 @pytest.mark.parametrize(
@@ -55,3 +71,102 @@ def test_movement_uses_only_esp32(
     assert esp32.expected_responses == [acknowledgement]
     assert arduino_uno.commands == []
     assert arduino_uno.expected_responses == []
+
+
+@pytest.mark.parametrize(
+    ("method_name", "command", "expected", "response"),
+    [
+        (
+            "get_line_reading",
+            "GET_LINE",
+            "VALID_LINE_READING",
+            "LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=FOLLOWING|STATE=CENTERED|PATTERN=11011",
+        ),
+        (
+            "start_line_follow",
+            "START_LINE_FOLLOW",
+            "ACK|LINE_FOLLOW_STARTED",
+            "ACK|LINE_FOLLOW_STARTED",
+        ),
+        (
+            "stop_line_follow",
+            "STOP_LINE_FOLLOW",
+            "ACK|LINE_FOLLOW_STOPPED",
+            "ACK|LINE_FOLLOW_STOPPED",
+        ),
+    ],
+)
+def test_line_commands_use_only_esp32_and_validate_exact_response(
+    method_name: str,
+    command: str,
+    expected: str,
+    response: str,
+) -> None:
+    esp32 = RecordingSerialController({command: response})
+    arduino_uno = RecordingSerialController()
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=arduino_uno,  # type: ignore[arg-type]
+    )
+
+    assert getattr(controller, method_name)() == response
+    assert esp32.commands == [command]
+    assert esp32.expected_responses == [expected]
+    assert arduino_uno.commands == []
+    assert arduino_uno.expected_responses == []
+
+
+class FakeSerialConnection:
+    def __init__(self, responses: list[bytes]) -> None:
+        self.responses = responses
+        self.writes: list[bytes] = []
+        self.is_open = True
+        self.timeout = 0.01
+
+    def write(self, payload: bytes) -> None:
+        self.writes.append(payload)
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> bytes:
+        return self.responses.pop(0) if self.responses else b""
+
+
+def test_async_line_event_is_skipped_before_valid_response() -> None:
+    connection = FakeSerialConnection(
+        [
+            b"EVENT|INTERSECTION|PATTERN=00000\n",
+            b"LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011\n",
+        ]
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.get_line_reading().endswith("PATTERN=11011")
+    assert connection.writes == [b"GET_LINE\n"]
+
+
+def test_malformed_line_response_is_rejected() -> None:
+    connection = FakeSerialConnection(
+        [b"LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11111\n"]
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(UnexpectedSerialResponse):
+        controller.get_line_reading()

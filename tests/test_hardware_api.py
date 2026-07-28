@@ -19,6 +19,7 @@ class FakeHardwareController:
         self.closed = False
         self.dispense_calls: list[tuple[int, int]] = []
         self.movement_calls: list[str] = []
+        self.line_calls: list[str] = []
         self.hardware_error: Exception | None = None
 
     def connect(self) -> None:
@@ -65,6 +66,35 @@ class FakeHardwareController:
         self.movement_calls.append(movement)
         return response
 
+    def get_line_reading(self) -> str:
+        return self._record_line_call(
+            "get_line_reading",
+            "LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011",
+        )
+
+    def get_line_status(self) -> str:
+        return self._record_line_call(
+            "get_line_status",
+            "LINE_STATUS|MODE=FOLLOWING|STATE=CENTERED|PATTERN=11011",
+        )
+
+    def start_line_follow(self) -> str:
+        return self._record_line_call(
+            "start_line_follow",
+            "ACK|LINE_FOLLOW_STARTED",
+        )
+
+    def stop_line_follow(self) -> str:
+        return self._record_line_call(
+            "stop_line_follow",
+            "ACK|LINE_FOLLOW_STOPPED",
+        )
+
+    def _record_line_call(self, method: str, response: str) -> str:
+        self._raise_hardware_error()
+        self.line_calls.append(method)
+        return response
+
     def _raise_hardware_error(self) -> None:
         if self.hardware_error is not None:
             raise self.hardware_error
@@ -98,6 +128,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert body["version"] == "1.0.0"
     assert "/dispense" in body["endpoints"]
     assert "/movement/stop" in body["endpoints"]
+    assert "/line/start" in body["endpoints"]
+    assert "/line/stop" in body["endpoints"]
 
 
 def test_health_reports_connected_hardware(client: TestClient) -> None:
@@ -263,4 +295,74 @@ def test_movement_hardware_error_returns_service_unavailable(
         "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
     }
     assert fake_hardware.movement_calls == []
+    assert "/dev/serial/example" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("http_method", "endpoint", "controller_method", "response_body"),
+    [
+        (
+            "GET",
+            "/line/sensors",
+            "get_line_reading",
+            {
+                "success": True,
+                "reading": "LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011",
+            },
+        ),
+        (
+            "GET",
+            "/line/status",
+            "get_line_status",
+            {
+                "success": True,
+                "status": (
+                    "LINE_STATUS|MODE=FOLLOWING|STATE=CENTERED|PATTERN=11011"
+                ),
+            },
+        ),
+        (
+            "POST",
+            "/line/start",
+            "start_line_follow",
+            {"success": True, "response": "ACK|LINE_FOLLOW_STARTED"},
+        ),
+        (
+            "POST",
+            "/line/stop",
+            "stop_line_follow",
+            {"success": True, "response": "ACK|LINE_FOLLOW_STOPPED"},
+        ),
+    ],
+)
+def test_line_endpoint_invokes_exactly_one_controller_method(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    http_method: str,
+    endpoint: str,
+    controller_method: str,
+    response_body: dict[str, object],
+) -> None:
+    response = client.request(http_method, endpoint)
+
+    assert response.status_code == 200
+    assert response.json() == response_body
+    assert fake_hardware.line_calls == [controller_method]
+
+
+def test_line_hardware_error_returns_service_unavailable(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.hardware_error = SerialConnectionError(
+        "SERIAL_READ_FAILED|PORT=/dev/serial/example"
+    )
+
+    response = client.post("/line/start")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
+    }
+    assert fake_hardware.line_calls == []
     assert "/dev/serial/example" not in response.text

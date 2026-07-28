@@ -70,12 +70,52 @@ For the first movement test:
 - Test `POST /movement/stop` before placing the robot on the floor.
 - Do not use Uvicorn `--reload` or multiple workers with real Serial hardware.
 
+## Black-line following API
+
+Line following runs locally on the ESP32. FastAPI only reads the five active-low
+sensor values and starts or stops the mode. The current firmware pattern order is
+`O1, O2, O3, O4, O5`, where black normally reads `0`, white normally reads `1`,
+and `O3` is the center sensor.
+
+```bash
+curl http://YOUR_PRIVATE_IP:8000/line/sensors
+curl http://YOUR_PRIVATE_IP:8000/line/status
+curl -X POST http://YOUR_PRIVATE_IP:8000/line/start
+curl -X POST http://YOUR_PRIVATE_IP:8000/line/stop
+```
+
+Use this exact real-hardware testing order:
+
+1. Keep the robot wheels lifted.
+2. Keep the physical power switch accessible.
+3. Start FastAPI without `--reload` and with one worker.
+4. Call `GET /line/sensors`.
+5. Move black tape manually under each sensor and verify physical order.
+6. Verify center-line pattern.
+7. Verify all-white line-lost pattern.
+8. Verify all-black intersection pattern.
+9. Call `POST /line/stop` before the first movement test.
+10. Place the sensor over a straight black line.
+11. Call `POST /line/start`.
+12. Observe motor corrections briefly.
+13. Call `POST /line/stop`.
+14. Only after lifted-wheel testing succeeds, test on the floor at low speed.
+
+Safety warnings:
+
+- Forward correction continues until STOP, intersection, or line loss.
+- Initial PWM and proportional gain require physical calibration.
+- Do not test near stairs or table edges.
+- Do not use Uvicorn `--reload`.
+- Do not use multiple workers.
+- Only one process may open the Serial ports.
+
 Do not use `--reload` while connected to real hardware, and do not start multiple
 Uvicorn workers. Only one process may open the ESP32 and Arduino UNO serial ports.
 Serial operations and medicine dispensing are blocking, so the service protects all
 hardware calls with one process-local thread lock.
 
-The current API covers hardware health, ping, status, medicine dispensing, and
-manual movement only.
+The current API covers hardware health, ping, status, medicine dispensing, manual
+movement, and local ESP32 black-line following only.
 Navigation, camera, database, water dispensing, room logic, and the NestJS backend
 are intentionally outside this phase.

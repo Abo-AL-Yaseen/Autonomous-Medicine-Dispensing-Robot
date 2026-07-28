@@ -170,6 +170,10 @@ def create_app(
                 "/movement/left",
                 "/movement/right",
                 "/movement/stop",
+                "/line/sensors",
+                "/line/status",
+                "/line/start",
+                "/line/stop",
                 "/docs",
             ],
         }
@@ -255,6 +259,38 @@ def create_app(
             "stop",
             lambda controller: controller.stop(),
         )
+
+    @application.get("/line/sensors")
+    def get_line_sensors(request: Request) -> dict[str, object]:
+        response = _run_hardware_operation(
+            request,
+            lambda controller: controller.get_line_reading(),
+        )
+        return {"success": True, "reading": response}
+
+    @application.get("/line/status")
+    def get_line_status(request: Request) -> dict[str, object]:
+        response = _run_hardware_operation(
+            request,
+            lambda controller: controller.get_line_status(),
+        )
+        return {"success": True, "status": response}
+
+    @application.post("/line/start")
+    def start_line_follow(request: Request) -> dict[str, object]:
+        response = _run_hardware_operation(
+            request,
+            lambda controller: controller.start_line_follow(),
+        )
+        return {"success": True, "response": response}
+
+    @application.post("/line/stop")
+    def stop_line_follow(request: Request) -> dict[str, object]:
+        response = _run_hardware_operation(
+            request,
+            lambda controller: controller.stop_line_follow(),
+        )
+        return {"success": True, "response": response}
 
     return application
 

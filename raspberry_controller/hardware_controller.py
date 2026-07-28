@@ -7,7 +7,7 @@ import errno
 import os
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 ESP32_PORT = (
@@ -172,7 +172,13 @@ class SerialController:
                 f"|DETAIL={_clean_field(exc)}"
             ) from exc
 
-    def wait_for_response(self, expected: str | Sequence[str]) -> str:
+    def wait_for_response(
+        self,
+        expected: str | Sequence[str],
+        *,
+        validator: Callable[[str], bool] | None = None,
+        response_prefix: str | None = None,
+    ) -> str:
         """Scan serial lines until an expected response or overall timeout."""
 
         connection = self._require_connection()
@@ -213,8 +219,16 @@ class SerialController:
                     f"|EXPECTED={_clean_field(expected_text)}"
                     f"|RECEIVED={_clean_field(response)}"
                 )
-            if response in expected_responses:
+            if response in expected_responses or (
+                validator is not None and validator(response)
+            ):
                 return response
+            if response_prefix is not None and response.startswith(response_prefix):
+                raise UnexpectedSerialResponse(
+                    f"UNEXPECTED_RESPONSE|PORT={_clean_field(self.port)}"
+                    f"|EXPECTED={_clean_field(expected_text)}"
+                    f"|RECEIVED={_clean_field(response)}"
+                )
 
         timeout_message = (
             f"SERIAL_TIMEOUT|PORT={_clean_field(self.port)}"
@@ -248,6 +262,23 @@ class RobotHardwareController:
         "STATUS|DISPENSING_2",
         "STATUS|DISPENSING_BOTH",
     )
+    ESP32_STATUS_RESPONSES = (
+        "STATUS|IDLE",
+        "STATUS|MANUAL",
+        "STATUS|AUTONOMOUS",
+        "STATUS|LINE_FOLLOWING",
+        "STATUS|INTERSECTION",
+        "STATUS|LINE_LOST",
+    )
+    LINE_FOLLOW_STATES = {
+        "IDLE",
+        "ACQUIRING",
+        "CENTERED",
+        "CORRECTING_LEFT",
+        "CORRECTING_RIGHT",
+        "INTERSECTION",
+        "LINE_LOST",
+    }
 
     def __init__(
         self,
@@ -310,7 +341,7 @@ class RobotHardwareController:
             "ESP32": self._request(
                 self.esp32,
                 "GET_STATUS",
-                "STATUS|IDLE",
+                self.ESP32_STATUS_RESPONSES,
             ),
             "ARDUINO_UNO": self._request(
                 self.arduino_uno,
@@ -343,6 +374,46 @@ class RobotHardwareController:
         """Stop ESP32 motors and outputs immediately."""
 
         return self._request(self.esp32, "S", "ACK|STOP")
+
+    def get_line_reading(self) -> str:
+        """Return one validated active-low sensor reading from the ESP32."""
+
+        return self._request(
+            self.esp32,
+            "GET_LINE",
+            "VALID_LINE_READING",
+            validator=self._is_valid_line_reading,
+            response_prefix="LINE|",
+        )
+
+    def get_line_status(self) -> str:
+        """Return the validated line-follow mode, state, and latest pattern."""
+
+        return self._request(
+            self.esp32,
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            validator=self._is_valid_line_status,
+            response_prefix="LINE_STATUS|",
+        )
+
+    def start_line_follow(self) -> str:
+        """Start non-blocking line following on the ESP32."""
+
+        return self._request(
+            self.esp32,
+            "START_LINE_FOLLOW",
+            "ACK|LINE_FOLLOW_STARTED",
+        )
+
+    def stop_line_follow(self) -> str:
+        """Stop line following and the drive motors on the ESP32."""
+
+        return self._request(
+            self.esp32,
+            "STOP_LINE_FOLLOW",
+            "ACK|LINE_FOLLOW_STOPPED",
+        )
 
     def dispense(self, box_number: int, pill_count: int) -> dict[str, int]:
         """Dispense pills sequentially, requiring an ACK and DONE for each pill."""
@@ -405,9 +476,56 @@ class RobotHardwareController:
         controller: SerialController,
         command: str,
         expected: str | Sequence[str],
+        *,
+        validator: Callable[[str], bool] | None = None,
+        response_prefix: str | None = None,
     ) -> str:
         controller.send_command(command)
-        return controller.wait_for_response(expected)
+        if validator is None and response_prefix is None:
+            return controller.wait_for_response(expected)
+        return controller.wait_for_response(
+            expected,
+            validator=validator,
+            response_prefix=response_prefix,
+        )
+
+    @staticmethod
+    def _is_valid_line_reading(response: str) -> bool:
+        parts = response.split("|")
+        if len(parts) != 7 or parts[0] != "LINE":
+            return False
+
+        sensor_values: list[str] = []
+        for index, part in enumerate(parts[1:6], start=1):
+            expected_prefix = f"O{index}="
+            if not part.startswith(expected_prefix):
+                return False
+            value = part[len(expected_prefix) :]
+            if value not in ("0", "1"):
+                return False
+            sensor_values.append(value)
+
+        pattern_part = parts[6]
+        return pattern_part == f"PATTERN={''.join(sensor_values)}"
+
+    @classmethod
+    def _is_valid_line_status(cls, response: str) -> bool:
+        parts = response.split("|")
+        if len(parts) != 4 or parts[0] != "LINE_STATUS":
+            return False
+
+        mode = parts[1].removeprefix("MODE=")
+        state = parts[2].removeprefix("STATE=")
+        pattern = parts[3].removeprefix("PATTERN=")
+        return (
+            parts[1].startswith("MODE=")
+            and mode in ("FOLLOWING", "STOPPED")
+            and parts[2].startswith("STATE=")
+            and state in cls.LINE_FOLLOW_STATES
+            and parts[3].startswith("PATTERN=")
+            and len(pattern) == 5
+            and all(value in "01" for value in pattern)
+        )
 
     @staticmethod
     def _raise_dispense_error(

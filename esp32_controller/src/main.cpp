@@ -61,8 +61,24 @@ const int LINE_OUT2_PIN = 36;
 const int LINE_OUT3_PIN = 39;
 const int LINE_OUT4_PIN = 17;
 const int LINE_OUT5_PIN = 4;
-const unsigned long LINE_SAMPLE_INTERVAL_MS = 20;
-const unsigned long LINE_STABLE_DURATION_MS = 50;
+const uint8_t LINE_SENSOR_COUNT = 5;
+const int LINE_SENSOR_PINS[LINE_SENSOR_COUNT] = {
+  LINE_OUT1_PIN,
+  LINE_OUT2_PIN,
+  LINE_OUT3_PIN,
+  LINE_OUT4_PIN,
+  LINE_OUT5_PIN
+};
+const int8_t LINE_SENSOR_WEIGHTS[LINE_SENSOR_COUNT] = {-2, -1, 0, 1, 2};
+
+// Conservative first-test tuning; calibrate with the wheels lifted.
+const uint8_t LINE_FOLLOW_BASE_PWM = 100;
+const uint8_t LINE_FOLLOW_PROPORTIONAL_GAIN = 25;
+const uint8_t LINE_FOLLOW_MAX_CORRECTION = 50;
+const unsigned long LINE_FOLLOW_INTERVAL_MS = 25;
+const uint8_t LINE_INTERSECTION_MIN_SENSORS = 4;
+const uint8_t LINE_INTERSECTION_CONFIRM_READINGS = 3;
+const uint8_t LINE_LOST_CONFIRM_READINGS = 3;
 
 // MH Real Time Clock Module 2 / DS1302-style 3-wire RTC wiring:
 // VCC -> ESP32 3V3, GND -> GND, CLK -> GPIO33, DAT -> GPIO32, RST -> GPIO19.
@@ -119,6 +135,16 @@ enum AutoState {
   AUTO_SENSOR_RETRY
 };
 
+enum LineFollowState {
+  LINE_FOLLOW_IDLE,
+  LINE_FOLLOW_ACQUIRING,
+  LINE_FOLLOW_CENTERED,
+  LINE_FOLLOW_CORRECTING_LEFT,
+  LINE_FOLLOW_CORRECTING_RIGHT,
+  LINE_FOLLOW_INTERSECTION,
+  LINE_FOLLOW_LINE_LOST
+};
+
 static bool autoModeEnabled = false;
 static AutoState autoState = AUTO_DISABLED;
 static unsigned long autoStateStartedMs = 0;
@@ -128,6 +154,18 @@ static uint8_t consecutiveObstacleReadings = 0;
 static uint8_t failedUltrasonicReadings = 0;
 static bool nextAutoTurnRight = true;
 static float lastAutoDistanceCm = -1.0f;
+static bool manualMovementActive = false;
+
+static bool lineFollowEnabled = false;
+static LineFollowState lineFollowState = LINE_FOLLOW_IDLE;
+static uint8_t lineRawValues[LINE_SENSOR_COUNT] = {1, 1, 1, 1, 1};
+static bool lineDetected[LINE_SENSOR_COUNT] = {false, false, false, false, false};
+static uint8_t latestLinePattern = 0x1F;
+static uint8_t latestLineActiveCount = 0;
+static float latestLinePositionError = 0.0f;
+static uint8_t consecutiveIntersectionReadings = 0;
+static uint8_t consecutiveLineLostReadings = 0;
+static unsigned long lastLineFollowUpdateMs = 0;
 
 static bool irCurrentRawDetected = false;
 static bool irLastRawDetected = false;
@@ -135,20 +173,17 @@ static bool irStableDetected = false;
 static bool irDetectionLatched = false;
 static unsigned long irDebounceStartedMs = 0;
 
-static uint8_t lineCandidatePattern = 0;
-static uint8_t lineStablePattern = 0;
-static unsigned long lastLineSampleMs = 0;
-static unsigned long lineCandidateStartedMs = 0;
-static bool lineStablePatternReady = false;
-
 const size_t SERIAL_COMMAND_BUFFER_SIZE = 64;
 const unsigned long SERIAL_PENDING_P_TIMEOUT_MS = 125;
+const unsigned long SERIAL_PENDING_S_TIMEOUT_MS = 20;
 static char serialCommandBuffer[SERIAL_COMMAND_BUFFER_SIZE];
 static size_t serialCommandLength = 0;
 static bool serialCommandOverflow = false;
 static bool serialTextMode = false;
 static bool serialPendingP = false;
 static unsigned long serialPendingPStartedMs = 0;
+static bool serialPendingS = false;
+static unsigned long serialPendingSStartedMs = 0;
 
 enum SerialInputResult {
   SERIAL_INPUT_INCOMPLETE,
@@ -165,8 +200,10 @@ void setupUltrasonic();
 float readUltrasonicCm();
 void testUltrasonicOnce();
 void updateIrSensor();
-uint8_t readLineSensorPattern();
-void updateLineSensorTest();
+void sampleLineSensors();
+void updateLineFollowing();
+void startLineFollowing();
+void stopLineFollowing();
 void setupRTC();
 void printRTC();
 void setupLCD();
@@ -180,9 +217,11 @@ void updateAutonomousMode();
 void handleLegacyCommand(char command);
 void handleTextCommand(const String& command);
 static bool isLegacyCommand(char command);
+static void disableLineFollowing(LineFollowState nextState);
 
 // Hardware keys execute immediately. Text commands remain newline-terminated,
-// while P is held briefly so a fast PING line is not mistaken for the pump key.
+// while P/S are held briefly so PING and ST... text lines are not mistaken
+// for the pump or emergency-stop legacy keys.
 static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
   while (Serial.available() > 0) {
     char incoming = (char)Serial.read();
@@ -243,6 +282,28 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
       continue;
     }
 
+    if (serialPendingS) {
+      if (incoming == '\r' || incoming == '\n') {
+        serialPendingS = false;
+        legacyCommand = 'S';
+        return SERIAL_INPUT_LEGACY_READY;
+      }
+
+      if ((char)toupper((unsigned char)incoming) == 'T') {
+        serialPendingS = false;
+        serialTextMode = true;
+        serialCommandLength = 0;
+        serialCommandBuffer[serialCommandLength++] = 'S';
+        serialCommandBuffer[serialCommandLength++] = incoming;
+        continue;
+      }
+
+      // A non-text character following S still prioritizes emergency stop.
+      serialPendingS = false;
+      legacyCommand = 'S';
+      return SERIAL_INPUT_LEGACY_READY;
+    }
+
     if (incoming == '\r' || incoming == '\n' || incoming == ' ' || incoming == '\t') {
       continue;
     }
@@ -250,6 +311,12 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
     if ((char)toupper((unsigned char)incoming) == 'P') {
       serialPendingP = true;
       serialPendingPStartedMs = millis();
+      continue;
+    }
+
+    if ((char)toupper((unsigned char)incoming) == 'S') {
+      serialPendingS = true;
+      serialPendingSStartedMs = millis();
       continue;
     }
 
@@ -266,6 +333,12 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
   if (serialPendingP && millis() - serialPendingPStartedMs >= SERIAL_PENDING_P_TIMEOUT_MS) {
     serialPendingP = false;
     legacyCommand = 'P';
+    return SERIAL_INPUT_LEGACY_READY;
+  }
+
+  if (serialPendingS && millis() - serialPendingSStartedMs >= SERIAL_PENDING_S_TIMEOUT_MS) {
+    serialPendingS = false;
+    legacyCommand = 'S';
     return SERIAL_INPUT_LEGACY_READY;
   }
 
@@ -301,12 +374,23 @@ static bool interruptionRequested() {
       }
     }
 
+    receivedLine.trim();
+    receivedLine.toUpperCase();
     char command = (char)toupper((unsigned char)receivedLine.charAt(0));
+    bool startLineFollowCommand = receivedLine == "START_LINE_FOLLOW";
+    bool stopLineFollowCommand = receivedLine == "STOP_LINE_FOLLOW";
     stopAllOutputs();
+    disableLineFollowing(LINE_FOLLOW_IDLE);
     if (receivedLine.length() == 1 && command == 'S') {
       lcdShowStatus("STOP", "All Outputs Off");
       Serial.println("ACK|STOP");
       Serial.println("Emergency stop received. Action cancelled.");
+    } else if (stopLineFollowCommand) {
+      lcdShowStatus("Line Follow", "Stopped");
+      Serial.println("ACK|LINE_FOLLOW_STOPPED");
+    } else if (startLineFollowCommand) {
+      startLineFollowing();
+      lcdShowStatus("Line Follow", "Started");
     } else {
       lcdShowStatus("Action Cancelled", "Outputs Off");
       Serial.print("Action cancelled by command \"");
@@ -330,13 +414,17 @@ static bool waitSafely(unsigned long durationMs) {
 //  دوال التحكم الأساسية
 // ════════════════════════════════════════════════════════════
 
-void stopMotors() {
+static void stopMotorOutputs() {
   digitalWrite(MOTOR1_PIN1, LOW);
   digitalWrite(MOTOR1_PIN2, LOW);
   digitalWrite(MOTOR2_PIN1, LOW);
   digitalWrite(MOTOR2_PIN2, LOW);
   ledcWrite(MOTOR1_PWM_CHANNEL, 0);
   ledcWrite(MOTOR2_PWM_CHANNEL, 0);
+}
+
+void stopMotors() {
+  stopMotorOutputs();
   Serial.println("STOP");
 }
 
@@ -351,6 +439,7 @@ void pumpOff() {
 void stopAllOutputs() {
   stopMotors();
   pumpOff();
+  manualMovementActive = false;
 }
 
 static void applyMotorSpeed(uint8_t speed) {
@@ -358,10 +447,20 @@ static void applyMotorSpeed(uint8_t speed) {
   ledcWrite(MOTOR2_PWM_CHANNEL, speed);
 }
 
-static void driveForwardAt(uint8_t speed) {
+static void setForwardMotorDirection() {
   digitalWrite(MOTOR1_PIN1, LOW);  digitalWrite(MOTOR1_PIN2, HIGH);
   digitalWrite(MOTOR2_PIN1, LOW);  digitalWrite(MOTOR2_PIN2, HIGH);
+}
+
+static void driveForwardAt(uint8_t speed) {
+  setForwardMotorDirection();
   applyMotorSpeed(speed);
+}
+
+static void driveForwardDifferential(uint8_t leftSpeed, uint8_t rightSpeed) {
+  setForwardMotorDirection();
+  ledcWrite(MOTOR1_PWM_CHANNEL, leftSpeed);
+  ledcWrite(MOTOR2_PWM_CHANNEL, rightSpeed);
 }
 
 static void driveBackwardAt(uint8_t speed) {
@@ -452,54 +551,185 @@ void updateIrSensor() {
   }
 }
 
-uint8_t readLineSensorPattern() {
-  uint8_t out1 = digitalRead(LINE_OUT1_PIN) == HIGH ? 1 : 0;
-  uint8_t out2 = digitalRead(LINE_OUT2_PIN) == HIGH ? 1 : 0;
-  uint8_t out3 = digitalRead(LINE_OUT3_PIN) == HIGH ? 1 : 0;
-  uint8_t out4 = digitalRead(LINE_OUT4_PIN) == HIGH ? 1 : 0;
-  uint8_t out5 = digitalRead(LINE_OUT5_PIN) == HIGH ? 1 : 0;
+void sampleLineSensors() {
+  latestLinePattern = 0;
+  latestLineActiveCount = 0;
+  int weightedPositionSum = 0;
 
-  return (out1 << 4) | (out2 << 3) | (out3 << 2) | (out4 << 1) | out5;
+  for (uint8_t i = 0; i < LINE_SENSOR_COUNT; i++) {
+    lineRawValues[i] = digitalRead(LINE_SENSOR_PINS[i]) == HIGH ? 1 : 0;
+    lineDetected[i] = lineRawValues[i] == 0; // Active-low: true means black line.
+    latestLinePattern = (latestLinePattern << 1) | lineRawValues[i];
+
+    if (lineDetected[i]) {
+      latestLineActiveCount++;
+      weightedPositionSum += LINE_SENSOR_WEIGHTS[i];
+    }
+  }
+
+  if (latestLineActiveCount > 0) {
+    latestLinePositionError =
+      weightedPositionSum / (float)latestLineActiveCount;
+  } else {
+    latestLinePositionError = 0.0f;
+  }
 }
 
-static void printLineSensorPattern(uint8_t pattern) {
-  Serial.print("LINE|O1=");
-  Serial.print((pattern >> 4) & 1);
-  Serial.print("|O2=");
-  Serial.print((pattern >> 3) & 1);
-  Serial.print("|O3=");
-  Serial.print((pattern >> 2) & 1);
-  Serial.print("|O4=");
-  Serial.print((pattern >> 1) & 1);
-  Serial.print("|O5=");
-  Serial.print(pattern & 1);
-  Serial.print("|PATTERN=");
-  for (int8_t bit = 4; bit >= 0; bit--) {
+static void printLinePatternBits(uint8_t pattern) {
+  for (int8_t bit = LINE_SENSOR_COUNT - 1; bit >= 0; bit--) {
     Serial.print((pattern >> bit) & 1);
   }
+}
+
+static void printLineSensorReading() {
+  Serial.print("LINE|O1=");
+  Serial.print(lineRawValues[0]);
+  Serial.print("|O2=");
+  Serial.print(lineRawValues[1]);
+  Serial.print("|O3=");
+  Serial.print(lineRawValues[2]);
+  Serial.print("|O4=");
+  Serial.print(lineRawValues[3]);
+  Serial.print("|O5=");
+  Serial.print(lineRawValues[4]);
+  Serial.print("|PATTERN=");
+  printLinePatternBits(latestLinePattern);
   Serial.println();
 }
 
-void updateLineSensorTest() {
+static const char* lineFollowStateName(LineFollowState state) {
+  switch (state) {
+    case LINE_FOLLOW_IDLE: return "IDLE";
+    case LINE_FOLLOW_ACQUIRING: return "ACQUIRING";
+    case LINE_FOLLOW_CENTERED: return "CENTERED";
+    case LINE_FOLLOW_CORRECTING_LEFT: return "CORRECTING_LEFT";
+    case LINE_FOLLOW_CORRECTING_RIGHT: return "CORRECTING_RIGHT";
+    case LINE_FOLLOW_INTERSECTION: return "INTERSECTION";
+    case LINE_FOLLOW_LINE_LOST: return "LINE_LOST";
+  }
+  return "UNKNOWN";
+}
+
+static void printLineFollowStatus() {
+  Serial.print("LINE_STATUS|MODE=");
+  Serial.print(lineFollowEnabled ? "FOLLOWING" : "STOPPED");
+  Serial.print("|STATE=");
+  Serial.print(lineFollowStateName(lineFollowState));
+  Serial.print("|PATTERN=");
+  printLinePatternBits(latestLinePattern);
+  Serial.println();
+}
+
+static void resetLineFollowConfirmation() {
+  consecutiveIntersectionReadings = 0;
+  consecutiveLineLostReadings = 0;
+}
+
+static void disableLineFollowing(LineFollowState nextState) {
+  lineFollowEnabled = false;
+  lineFollowState = nextState;
+  resetLineFollowConfirmation();
+}
+
+static void stopLineFollowingForEvent(
+  LineFollowState eventState,
+  const char* eventName
+) {
+  disableLineFollowing(eventState);
+  manualMovementActive = false;
+  stopMotorOutputs();
+  Serial.print("EVENT|");
+  Serial.print(eventName);
+  Serial.print("|PATTERN=");
+  printLinePatternBits(latestLinePattern);
+  Serial.println();
+}
+
+void startLineFollowing() {
+  if (autoModeEnabled) {
+    stopAutonomousMode("line-follow command", 'S');
+  }
+
+  manualMovementActive = false;
+  stopMotorOutputs();
+  sampleLineSensors();
+  resetLineFollowConfirmation();
+  lineFollowState = LINE_FOLLOW_ACQUIRING;
+  lineFollowEnabled = true;
+  lastLineFollowUpdateMs = 0;
+  Serial.println("ACK|LINE_FOLLOW_STARTED");
+}
+
+void stopLineFollowing() {
+  disableLineFollowing(LINE_FOLLOW_IDLE);
+  manualMovementActive = false;
+  stopMotorOutputs();
+  Serial.println("ACK|LINE_FOLLOW_STOPPED");
+}
+
+void updateLineFollowing() {
+  if (!lineFollowEnabled) return;
+
   unsigned long now = millis();
-  if (now - lastLineSampleMs < LINE_SAMPLE_INTERVAL_MS) return;
+  if (now - lastLineFollowUpdateMs < LINE_FOLLOW_INTERVAL_MS) return;
+  lastLineFollowUpdateMs = now;
 
-  lastLineSampleMs = now;
-  uint8_t pattern = readLineSensorPattern();
+  sampleLineSensors();
 
-  if (pattern != lineCandidatePattern) {
-    lineCandidatePattern = pattern;
-    lineCandidateStartedMs = now;
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    stopMotorOutputs();
+    consecutiveLineLostReadings = 0;
+    if (consecutiveIntersectionReadings < 255) {
+      consecutiveIntersectionReadings++;
+    }
+    if (consecutiveIntersectionReadings >= LINE_INTERSECTION_CONFIRM_READINGS) {
+      stopLineFollowingForEvent(LINE_FOLLOW_INTERSECTION, "INTERSECTION");
+    }
     return;
   }
 
-  if (now - lineCandidateStartedMs < LINE_STABLE_DURATION_MS) return;
-
-  if (!lineStablePatternReady || lineStablePattern != lineCandidatePattern) {
-    lineStablePattern = lineCandidatePattern;
-    lineStablePatternReady = true;
-    printLineSensorPattern(lineStablePattern);
+  consecutiveIntersectionReadings = 0;
+  if (latestLineActiveCount == 0) {
+    stopMotorOutputs();
+    if (consecutiveLineLostReadings < 255) {
+      consecutiveLineLostReadings++;
+    }
+    if (consecutiveLineLostReadings >= LINE_LOST_CONFIRM_READINGS) {
+      stopLineFollowingForEvent(LINE_FOLLOW_LINE_LOST, "LINE_LOST");
+    }
+    return;
   }
+
+  consecutiveLineLostReadings = 0;
+  int correction = (int)roundf(
+    latestLinePositionError * LINE_FOLLOW_PROPORTIONAL_GAIN
+  );
+  correction = constrain(
+    correction,
+    -(int)LINE_FOLLOW_MAX_CORRECTION,
+    (int)LINE_FOLLOW_MAX_CORRECTION
+  );
+
+  int leftPwm = constrain(
+    (int)LINE_FOLLOW_BASE_PWM + correction,
+    0,
+    255
+  );
+  int rightPwm = constrain(
+    (int)LINE_FOLLOW_BASE_PWM - correction,
+    0,
+    255
+  );
+
+  if (latestLinePositionError < -0.1f) {
+    lineFollowState = LINE_FOLLOW_CORRECTING_LEFT;
+  } else if (latestLinePositionError > 0.1f) {
+    lineFollowState = LINE_FOLLOW_CORRECTING_RIGHT;
+  } else {
+    lineFollowState = LINE_FOLLOW_CENTERED;
+  }
+
+  driveForwardDifferential((uint8_t)leftPwm, (uint8_t)rightPwm);
 }
 
 static void printRTCDateTime(const RtcDateTime& dt) {
@@ -925,6 +1155,7 @@ static void enterAutonomousState(AutoState newState) {
 }
 
 void startAutonomousMode() {
+  disableLineFollowing(LINE_FOLLOW_IDLE);
   stopAllOutputs();
   autoModeEnabled = true;
   nextAutoTurnRight = true;
@@ -1246,6 +1477,11 @@ static bool isLegacyCommand(char command) {
 void handleLegacyCommand(char rawCommand) {
   char command = (char)toupper((unsigned char)rawCommand);
 
+  // Any output-changing legacy command takes ownership from line following.
+  if (command != 'T') {
+    disableLineFollowing(LINE_FOLLOW_IDLE);
+  }
+
   switch (command) {
     case 'A':
       startAutonomousMode();
@@ -1260,6 +1496,7 @@ void handleLegacyCommand(char rawCommand) {
       delay(50);
       lcdShowStatus("Motors", "Forward");
       moveForward();
+      manualMovementActive = true;
       break;
 
     case 'B':
@@ -1271,6 +1508,7 @@ void handleLegacyCommand(char rawCommand) {
       delay(50);
       lcdShowStatus("Motors", "Backward");
       moveBackward();
+      manualMovementActive = true;
       break;
 
     case 'R':
@@ -1280,7 +1518,9 @@ void handleLegacyCommand(char rawCommand) {
       }
       stopAllOutputs();
       lcdShowStatus("Motors", "Turning Right");
+      manualMovementActive = true;
       turnRight90();
+      manualMovementActive = false;
       break;
 
     case 'L':
@@ -1290,7 +1530,9 @@ void handleLegacyCommand(char rawCommand) {
       }
       stopAllOutputs();
       lcdShowStatus("Motors", "Turning Left");
+      manualMovementActive = true;
       turnLeft90();
+      manualMovementActive = false;
       break;
 
     case 'S':
@@ -1373,6 +1615,22 @@ void handleLegacyCommand(char rawCommand) {
   }
 }
 
+static void printControllerStatus() {
+  if (lineFollowEnabled) {
+    Serial.println("STATUS|LINE_FOLLOWING");
+  } else if (lineFollowState == LINE_FOLLOW_INTERSECTION) {
+    Serial.println("STATUS|INTERSECTION");
+  } else if (lineFollowState == LINE_FOLLOW_LINE_LOST) {
+    Serial.println("STATUS|LINE_LOST");
+  } else if (autoModeEnabled) {
+    Serial.println("STATUS|AUTONOMOUS");
+  } else if (manualMovementActive) {
+    Serial.println("STATUS|MANUAL");
+  } else {
+    Serial.println("STATUS|IDLE");
+  }
+}
+
 void handleTextCommand(const String& command) {
   String normalizedCommand = command;
   normalizedCommand.trim();
@@ -1381,7 +1639,17 @@ void handleTextCommand(const String& command) {
   if (normalizedCommand == "PING") {
     Serial.println("ACK|PING");
   } else if (normalizedCommand == "GET_STATUS") {
-    Serial.println("STATUS|IDLE");
+    printControllerStatus();
+  } else if (normalizedCommand == "GET_LINE") {
+    sampleLineSensors();
+    printLineSensorReading();
+  } else if (normalizedCommand == "GET_LINE_STATUS") {
+    sampleLineSensors();
+    printLineFollowStatus();
+  } else if (normalizedCommand == "START_LINE_FOLLOW") {
+    startLineFollowing();
+  } else if (normalizedCommand == "STOP_LINE_FOLLOW") {
+    stopLineFollowing();
   } else {
     Serial.println("ERROR|UNKNOWN_COMMAND");
   }
@@ -1484,12 +1752,8 @@ void setup() {
   lcdShowReady();
   printHelp();
 
-  lineCandidatePattern = readLineSensorPattern();
-  unsigned long lineMonitorStartedMs = millis();
-  lastLineSampleMs = lineMonitorStartedMs;
-  lineCandidateStartedMs = lineMonitorStartedMs;
-  lineStablePatternReady = false;
-  Serial.println("LINE|MONITOR_READY|PINS=35,36,39,17,4");
+  sampleLineSensors();
+  Serial.println("LINE_READY|PINS=35,36,39,17,4|ACTIVE_LOW=1");
 }
 
 void loop() {
@@ -1498,7 +1762,7 @@ void loop() {
   processSerialInput();
 
   updateIrSensor();
-  updateLineSensorTest();
+  updateLineFollowing();
   updateAutonomousMode();
   delay(5);
 }
