@@ -72,7 +72,7 @@ const int LINE_SENSOR_PINS[LINE_SENSOR_COUNT] = {
 const int8_t LINE_SENSOR_WEIGHTS[LINE_SENSOR_COUNT] = {-2, -1, 0, 1, 2};
 
 // Conservative first-test tuning; calibrate with the wheels lifted.
-const uint8_t LINE_FOLLOW_BASE_PWM = 100;
+const uint8_t LINE_FOLLOW_BASE_PWM = 220;
 const uint8_t LINE_FOLLOW_PROPORTIONAL_GAIN = 25;
 const uint8_t LINE_FOLLOW_MAX_CORRECTION = 50;
 const unsigned long LINE_FOLLOW_INTERVAL_MS = 25;
