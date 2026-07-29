@@ -75,7 +75,7 @@ class FakeHardwareController:
     def get_line_status(self) -> str:
         return self._record_line_call(
             "get_line_status",
-            "LINE_STATUS|MODE=FOLLOWING|STATE=CENTERED|PATTERN=11011",
+            "LINE_STATUS|MODE=FOLLOWING|STATE=SEARCHING_LEFT|PATTERN=11111",
         )
 
     def start_line_follow(self) -> str:
@@ -317,7 +317,7 @@ def test_movement_hardware_error_returns_service_unavailable(
             {
                 "success": True,
                 "status": (
-                    "LINE_STATUS|MODE=FOLLOWING|STATE=CENTERED|PATTERN=11011"
+                    "LINE_STATUS|MODE=FOLLOWING|STATE=SEARCHING_LEFT|PATTERN=11111"
                 ),
             },
         ),

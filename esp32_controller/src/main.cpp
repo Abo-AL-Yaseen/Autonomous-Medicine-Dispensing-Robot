@@ -71,14 +71,17 @@ const int LINE_SENSOR_PINS[LINE_SENSOR_COUNT] = {
 };
 const int8_t LINE_SENSOR_WEIGHTS[LINE_SENSOR_COUNT] = {-2, -1, 0, 1, 2};
 
-// Conservative first-test tuning; calibrate with the wheels lifted.
-const uint8_t LINE_FOLLOW_BASE_PWM = 220;
+// Real-hardware tuning; these motors need about PWM 160 to move reliably.
+const uint8_t LINE_FOLLOW_BASE_PWM = 210;
 const uint8_t LINE_FOLLOW_PROPORTIONAL_GAIN = 25;
 const uint8_t LINE_FOLLOW_MAX_CORRECTION = 50;
 const unsigned long LINE_FOLLOW_INTERVAL_MS = 25;
 const uint8_t LINE_INTERSECTION_MIN_SENSORS = 4;
 const uint8_t LINE_INTERSECTION_CONFIRM_READINGS = 3;
-const uint8_t LINE_LOST_CONFIRM_READINGS = 3;
+const unsigned long LINE_SEARCH_PRIMARY_MS = 300;
+const unsigned long LINE_SEARCH_OPPOSITE_MS = 600;
+const uint8_t LINE_SEARCH_OUTER_PWM = 180;
+const uint8_t LINE_SEARCH_INNER_PWM = 0;
 
 // MH Real Time Clock Module 2 / DS1302-style 3-wire RTC wiring:
 // VCC -> ESP32 3V3, GND -> GND, CLK -> GPIO33, DAT -> GPIO32, RST -> GPIO19.
@@ -141,8 +144,16 @@ enum LineFollowState {
   LINE_FOLLOW_CENTERED,
   LINE_FOLLOW_CORRECTING_LEFT,
   LINE_FOLLOW_CORRECTING_RIGHT,
+  LINE_FOLLOW_SEARCHING_LEFT,
+  LINE_FOLLOW_SEARCHING_RIGHT,
   LINE_FOLLOW_INTERSECTION,
   LINE_FOLLOW_LINE_LOST
+};
+
+enum LineSearchPhase {
+  LINE_SEARCH_INACTIVE,
+  LINE_SEARCH_PRIMARY,
+  LINE_SEARCH_OPPOSITE
 };
 
 static bool autoModeEnabled = false;
@@ -163,8 +174,11 @@ static bool lineDetected[LINE_SENSOR_COUNT] = {false, false, false, false, false
 static uint8_t latestLinePattern = 0x1F;
 static uint8_t latestLineActiveCount = 0;
 static float latestLinePositionError = 0.0f;
+static float lastValidLinePositionError = 0.0f;
 static uint8_t consecutiveIntersectionReadings = 0;
-static uint8_t consecutiveLineLostReadings = 0;
+static LineSearchPhase lineSearchPhase = LINE_SEARCH_INACTIVE;
+static bool lineSearchPrimaryLeft = false;
+static unsigned long lineSearchPhaseStartedMs = 0;
 static unsigned long lastLineFollowUpdateMs = 0;
 
 static bool irCurrentRawDetected = false;
@@ -604,6 +618,8 @@ static const char* lineFollowStateName(LineFollowState state) {
     case LINE_FOLLOW_CENTERED: return "CENTERED";
     case LINE_FOLLOW_CORRECTING_LEFT: return "CORRECTING_LEFT";
     case LINE_FOLLOW_CORRECTING_RIGHT: return "CORRECTING_RIGHT";
+    case LINE_FOLLOW_SEARCHING_LEFT: return "SEARCHING_LEFT";
+    case LINE_FOLLOW_SEARCHING_RIGHT: return "SEARCHING_RIGHT";
     case LINE_FOLLOW_INTERSECTION: return "INTERSECTION";
     case LINE_FOLLOW_LINE_LOST: return "LINE_LOST";
   }
@@ -620,9 +636,15 @@ static void printLineFollowStatus() {
   Serial.println();
 }
 
+static void resetLineSearch() {
+  lineSearchPhase = LINE_SEARCH_INACTIVE;
+  lineSearchPrimaryLeft = false;
+  lineSearchPhaseStartedMs = 0;
+}
+
 static void resetLineFollowConfirmation() {
   consecutiveIntersectionReadings = 0;
-  consecutiveLineLostReadings = 0;
+  resetLineSearch();
 }
 
 static void disableLineFollowing(LineFollowState nextState) {
@@ -654,6 +676,11 @@ void startLineFollowing() {
   stopMotorOutputs();
   sampleLineSensors();
   resetLineFollowConfirmation();
+  lastValidLinePositionError =
+    latestLineActiveCount > 0 &&
+    latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS
+      ? latestLinePositionError
+      : 0.0f;
   lineFollowState = LINE_FOLLOW_ACQUIRING;
   lineFollowEnabled = true;
   lastLineFollowUpdateMs = 0;
@@ -678,7 +705,7 @@ void updateLineFollowing() {
 
   if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
     stopMotorOutputs();
-    consecutiveLineLostReadings = 0;
+    resetLineSearch();
     if (consecutiveIntersectionReadings < 255) {
       consecutiveIntersectionReadings++;
     }
@@ -690,17 +717,43 @@ void updateLineFollowing() {
 
   consecutiveIntersectionReadings = 0;
   if (latestLineActiveCount == 0) {
-    stopMotorOutputs();
-    if (consecutiveLineLostReadings < 255) {
-      consecutiveLineLostReadings++;
+    if (lineSearchPhase == LINE_SEARCH_INACTIVE) {
+      lineSearchPrimaryLeft = lastValidLinePositionError < 0.0f;
+      lineSearchPhase = LINE_SEARCH_PRIMARY;
+      lineSearchPhaseStartedMs = now;
     }
-    if (consecutiveLineLostReadings >= LINE_LOST_CONFIRM_READINGS) {
-      stopLineFollowingForEvent(LINE_FOLLOW_LINE_LOST, "LINE_LOST");
+
+    bool searchLeft = lineSearchPrimaryLeft;
+    if (lineSearchPhase == LINE_SEARCH_PRIMARY) {
+      if (now - lineSearchPhaseStartedMs >= LINE_SEARCH_PRIMARY_MS) {
+        lineSearchPhase = LINE_SEARCH_OPPOSITE;
+        lineSearchPhaseStartedMs = now;
+        searchLeft = !lineSearchPrimaryLeft;
+      }
+    } else {
+      searchLeft = !lineSearchPrimaryLeft;
+      if (now - lineSearchPhaseStartedMs >= LINE_SEARCH_OPPOSITE_MS) {
+        stopLineFollowingForEvent(LINE_FOLLOW_LINE_LOST, "LINE_LOST");
+        return;
+      }
+    }
+
+    // Both search phases are forward-only strong arcs; the opposite sweep is
+    // longer so it crosses the original heading before checking the far side.
+    if (searchLeft) {
+      lineFollowState = LINE_FOLLOW_SEARCHING_LEFT;
+      driveForwardDifferential(LINE_SEARCH_INNER_PWM, LINE_SEARCH_OUTER_PWM);
+    } else {
+      lineFollowState = LINE_FOLLOW_SEARCHING_RIGHT;
+      driveForwardDifferential(LINE_SEARCH_OUTER_PWM, LINE_SEARCH_INNER_PWM);
     }
     return;
   }
 
-  consecutiveLineLostReadings = 0;
+  // Any reacquisition cancels both search phases and restores the
+  // normal proportional controller on this same update.
+  resetLineSearch();
+  lastValidLinePositionError = latestLinePositionError;
   int correction = (int)roundf(
     latestLinePositionError * LINE_FOLLOW_PROPORTIONAL_GAIN
   );

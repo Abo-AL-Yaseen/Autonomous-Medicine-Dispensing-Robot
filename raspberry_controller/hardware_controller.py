@@ -276,6 +276,8 @@ class RobotHardwareController:
         "CENTERED",
         "CORRECTING_LEFT",
         "CORRECTING_RIGHT",
+        "SEARCHING_LEFT",
+        "SEARCHING_RIGHT",
         "INTERSECTION",
         "LINE_LOST",
     }

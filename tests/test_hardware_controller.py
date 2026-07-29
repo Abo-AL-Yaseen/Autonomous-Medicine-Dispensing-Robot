@@ -86,7 +86,13 @@ def test_movement_uses_only_esp32(
             "get_line_status",
             "GET_LINE_STATUS",
             "VALID_LINE_STATUS",
-            "LINE_STATUS|MODE=FOLLOWING|STATE=CENTERED|PATTERN=11011",
+            "LINE_STATUS|MODE=FOLLOWING|STATE=SEARCHING_LEFT|PATTERN=11111",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=FOLLOWING|STATE=SEARCHING_RIGHT|PATTERN=11111",
         ),
         (
             "start_line_follow",
