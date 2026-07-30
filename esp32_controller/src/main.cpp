@@ -86,8 +86,13 @@ const uint8_t LINE_SEARCH_INNER_PWM = 0;
 // Conservative starting values for physical intersection tuning. Each phase
 // has its own deadline so a maneuver can never turn or drive indefinitely.
 const uint8_t INTERSECTION_STRAIGHT_PWM = 180;
-const uint8_t INTERSECTION_TURN_OUTER_PWM = 180;
-const uint8_t INTERSECTION_TURN_INNER_PWM = 0;
+const uint8_t INTERSECTION_CENTER_PWM = 160;
+const unsigned long INTERSECTION_CENTER_MS = 200;
+const uint8_t INTERSECTION_PIVOT_PWM = 180;
+const float INTERSECTION_TURN_TARGET_DEG = 88.0f;
+const float INTERSECTION_MIN_ACQUIRE_ANGLE_DEG = 60.0f;
+const unsigned long INTERSECTION_TURN_TIMEOUT_MS = 2500;
+const uint8_t INTERSECTION_ACQUIRE_PWM = 160;
 const unsigned long INTERSECTION_CLEAR_TIMEOUT_MS = 1500;
 const unsigned long INTERSECTION_ACQUIRE_TIMEOUT_MS = 2500;
 const uint8_t INTERSECTION_LINE_CONFIRM_READINGS = 3;
@@ -176,8 +181,10 @@ enum IntersectionDirection {
 enum IntersectionNavigationState {
   INTERSECTION_NAVIGATION_INACTIVE,
   INTERSECTION_GOING_STRAIGHT,
-  INTERSECTION_TURNING_LEFT,
-  INTERSECTION_TURNING_RIGHT,
+  INTERSECTION_CENTERING_LEFT,
+  INTERSECTION_CENTERING_RIGHT,
+  INTERSECTION_PIVOTING_LEFT,
+  INTERSECTION_PIVOTING_RIGHT,
   INTERSECTION_ACQUIRING_LINE
 };
 
@@ -212,6 +219,8 @@ static IntersectionNavigationState intersectionNavigationState =
   INTERSECTION_NAVIGATION_INACTIVE;
 static unsigned long intersectionPhaseStartedMs = 0;
 static uint8_t consecutiveOutgoingLineReadings = 0;
+static float intersectionTurnAngleDeg = 0.0f;
+static unsigned long intersectionLastGyroUpdateMs = 0;
 
 static bool irCurrentRawDetected = false;
 static bool irLastRawDetected = false;
@@ -675,8 +684,10 @@ static const char* intersectionDirectionName(IntersectionDirection direction) {
 static const char* intersectionNavigationStateName() {
   switch (intersectionNavigationState) {
     case INTERSECTION_GOING_STRAIGHT: return "GOING_STRAIGHT";
-    case INTERSECTION_TURNING_LEFT: return "TURNING_LEFT";
-    case INTERSECTION_TURNING_RIGHT: return "TURNING_RIGHT";
+    case INTERSECTION_CENTERING_LEFT: return "CENTERING_LEFT";
+    case INTERSECTION_CENTERING_RIGHT: return "CENTERING_RIGHT";
+    case INTERSECTION_PIVOTING_LEFT: return "PIVOTING_LEFT";
+    case INTERSECTION_PIVOTING_RIGHT: return "PIVOTING_RIGHT";
     case INTERSECTION_ACQUIRING_LINE:
       switch (intersectionDirection) {
         case INTERSECTION_DIRECTION_LEFT: return "ACQUIRING_LEFT";
@@ -725,6 +736,8 @@ static void cancelIntersectionNavigation() {
   intersectionNavigationState = INTERSECTION_NAVIGATION_INACTIVE;
   intersectionPhaseStartedMs = 0;
   consecutiveOutgoingLineReadings = 0;
+  intersectionTurnAngleDeg = 0.0f;
+  intersectionLastGyroUpdateMs = 0;
 }
 
 static void disableLineFollowing(LineFollowState nextState) {
@@ -823,26 +836,36 @@ static void applyProportionalLineControl() {
 }
 
 static void driveIntersectionManeuver() {
-  switch (intersectionDirection) {
-    case INTERSECTION_DIRECTION_LEFT:
-      driveForwardDifferential(
-        INTERSECTION_TURN_INNER_PWM,
-        INTERSECTION_TURN_OUTER_PWM
-      );
-      break;
-    case INTERSECTION_DIRECTION_RIGHT:
-      driveForwardDifferential(
-        INTERSECTION_TURN_OUTER_PWM,
-        INTERSECTION_TURN_INNER_PWM
-      );
-      break;
-    case INTERSECTION_DIRECTION_STRAIGHT:
+  switch (intersectionNavigationState) {
+    case INTERSECTION_GOING_STRAIGHT:
       driveForwardDifferential(
         INTERSECTION_STRAIGHT_PWM,
         INTERSECTION_STRAIGHT_PWM
       );
       break;
-    case INTERSECTION_DIRECTION_NONE:
+    case INTERSECTION_CENTERING_LEFT:
+    case INTERSECTION_CENTERING_RIGHT:
+      driveForwardAt(INTERSECTION_CENTER_PWM);
+      break;
+    case INTERSECTION_PIVOTING_LEFT:
+      // Reuse the verified manual helper: left side backward, right forward.
+      turnLeftInPlaceAt(INTERSECTION_PIVOT_PWM);
+      break;
+    case INTERSECTION_PIVOTING_RIGHT:
+      // Reuse the verified manual helper: left side forward, right backward.
+      turnRightInPlaceAt(INTERSECTION_PIVOT_PWM);
+      break;
+    case INTERSECTION_ACQUIRING_LINE:
+      if (intersectionDirection == INTERSECTION_DIRECTION_STRAIGHT) {
+        driveForwardDifferential(
+          INTERSECTION_STRAIGHT_PWM,
+          INTERSECTION_STRAIGHT_PWM
+        );
+      } else {
+        driveForwardAt(INTERSECTION_ACQUIRE_PWM);
+      }
+      break;
+    case INTERSECTION_NAVIGATION_INACTIVE:
       stopMotorOutputs();
       break;
   }
@@ -854,6 +877,8 @@ static void failIntersectionNavigation() {
   intersectionCleared = false;
   intersectionNavigationState = INTERSECTION_NAVIGATION_INACTIVE;
   consecutiveOutgoingLineReadings = 0;
+  intersectionTurnAngleDeg = 0.0f;
+  intersectionLastGyroUpdateMs = 0;
   lineFollowEnabled = false;
   lineFollowState = LINE_FOLLOW_NAVIGATION_FAILED;
   manualMovementActive = false;
@@ -870,6 +895,8 @@ static void completeIntersectionNavigation() {
   intersectionNavigationState = INTERSECTION_NAVIGATION_INACTIVE;
   intersectionDirection = INTERSECTION_DIRECTION_NONE;
   consecutiveOutgoingLineReadings = 0;
+  intersectionTurnAngleDeg = 0.0f;
+  intersectionLastGyroUpdateMs = 0;
   resetLineFollowConfirmation();
   lineFollowEnabled = true;
   manualMovementActive = false;
@@ -895,17 +922,19 @@ static void startIntersectionNavigation(IntersectionDirection direction) {
   intersectionCleared = false;
   consecutiveOutgoingLineReadings = 0;
   intersectionPhaseStartedMs = millis();
+  intersectionTurnAngleDeg = 0.0f;
+  intersectionLastGyroUpdateMs = 0;
   lineFollowEnabled = false;
   manualMovementActive = false;
   resetLineFollowConfirmation();
 
   switch (direction) {
     case INTERSECTION_DIRECTION_LEFT:
-      intersectionNavigationState = INTERSECTION_TURNING_LEFT;
+      intersectionNavigationState = INTERSECTION_CENTERING_LEFT;
       Serial.println("ACK|INTERSECTION_LEFT_STARTED");
       break;
     case INTERSECTION_DIRECTION_RIGHT:
-      intersectionNavigationState = INTERSECTION_TURNING_RIGHT;
+      intersectionNavigationState = INTERSECTION_CENTERING_RIGHT;
       Serial.println("ACK|INTERSECTION_RIGHT_STARTED");
       break;
     case INTERSECTION_DIRECTION_STRAIGHT:
@@ -921,14 +950,28 @@ static void startIntersectionNavigation(IntersectionDirection direction) {
   driveIntersectionManeuver();
 }
 
-void updateIntersectionNavigation() {
-  if (!intersectionNavigationActive) return;
+static bool confirmOutgoingIntersectionLine() {
+  bool validOutgoingLine =
+    latestLineActiveCount > 0 &&
+    latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS;
+  if (validOutgoingLine) {
+    if (consecutiveOutgoingLineReadings < 255) {
+      consecutiveOutgoingLineReadings++;
+    }
+    if (
+      consecutiveOutgoingLineReadings >=
+      INTERSECTION_LINE_CONFIRM_READINGS
+    ) {
+      completeIntersectionNavigation();
+      return true;
+    }
+  } else {
+    consecutiveOutgoingLineReadings = 0;
+  }
+  return false;
+}
 
-  unsigned long now = millis();
-  if (now - lastLineFollowUpdateMs < LINE_FOLLOW_INTERVAL_MS) return;
-  lastLineFollowUpdateMs = now;
-  sampleLineSensors();
-
+static void updateStraightIntersectionNavigation(unsigned long now) {
   if (!intersectionCleared) {
     if (now - intersectionPhaseStartedMs >= INTERSECTION_CLEAR_TIMEOUT_MS) {
       failIntersectionNavigation();
@@ -951,26 +994,114 @@ void updateIntersectionNavigation() {
   }
 
   if (intersectionCleared) {
-    bool validOutgoingLine =
-      latestLineActiveCount > 0 &&
-      latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS;
-    if (validOutgoingLine) {
-      if (consecutiveOutgoingLineReadings < 255) {
-        consecutiveOutgoingLineReadings++;
-      }
-      if (
-        consecutiveOutgoingLineReadings >=
-        INTERSECTION_LINE_CONFIRM_READINGS
-      ) {
-        completeIntersectionNavigation();
-        return;
-      }
-    } else {
-      consecutiveOutgoingLineReadings = 0;
-    }
+    if (confirmOutgoingIntersectionLine()) return;
   }
 
   driveIntersectionManeuver();
+}
+
+static void startIntersectionPivot(unsigned long now) {
+  stopMotorOutputs();
+  intersectionTurnAngleDeg = 0.0f;
+  intersectionLastGyroUpdateMs = now;
+  intersectionPhaseStartedMs = now;
+  consecutiveOutgoingLineReadings = 0;
+  intersectionNavigationState =
+    intersectionDirection == INTERSECTION_DIRECTION_LEFT
+      ? INTERSECTION_PIVOTING_LEFT
+      : INTERSECTION_PIVOTING_RIGHT;
+  driveIntersectionManeuver();
+}
+
+static void startTurningLineAcquisition(unsigned long now) {
+  stopMotorOutputs();
+  intersectionNavigationState = INTERSECTION_ACQUIRING_LINE;
+  intersectionPhaseStartedMs = now;
+  consecutiveOutgoingLineReadings = 0;
+  driveIntersectionManeuver();
+}
+
+static void updateTurningIntersectionNavigation(unsigned long now) {
+  if (
+    intersectionNavigationState == INTERSECTION_CENTERING_LEFT ||
+    intersectionNavigationState == INTERSECTION_CENTERING_RIGHT
+  ) {
+    // Sensor readings are intentionally ignored while positioning the wheel
+    // center over the middle of the physical '+' intersection.
+    if (now - intersectionPhaseStartedMs >= INTERSECTION_CENTER_MS) {
+      startIntersectionPivot(now);
+    } else {
+      driveIntersectionManeuver();
+    }
+    return;
+  }
+
+  if (
+    intersectionNavigationState == INTERSECTION_PIVOTING_LEFT ||
+    intersectionNavigationState == INTERSECTION_PIVOTING_RIGHT
+  ) {
+    // The starting all-black pattern and every early line crossing are ignored
+    // throughout the pivot. Only the calibrated gyro determines its end.
+    if (now - intersectionPhaseStartedMs >= INTERSECTION_TURN_TIMEOUT_MS) {
+      failIntersectionNavigation();
+      return;
+    }
+
+    sensors_event_t acceleration, gyro, temperature;
+    if (!mpu.getEvent(&acceleration, &gyro, &temperature)) {
+      failIntersectionNavigation();
+      return;
+    }
+
+    float deltaSeconds = (now - intersectionLastGyroUpdateMs) / 1000.0f;
+    intersectionLastGyroUpdateMs = now;
+    float angularSpeedDegPerSecond =
+      (gyro.gyro.x - gyroBiasX) * (180.0f / PI);
+    if (abs(angularSpeedDegPerSecond) > GYRO_THRESHOLD) {
+      intersectionTurnAngleDeg += abs(angularSpeedDegPerSecond) * deltaSeconds;
+    }
+
+    if (intersectionTurnAngleDeg >= INTERSECTION_TURN_TARGET_DEG) {
+      startTurningLineAcquisition(now);
+      return;
+    }
+
+    driveIntersectionManeuver();
+    return;
+  }
+
+  if (intersectionNavigationState == INTERSECTION_ACQUIRING_LINE) {
+    if (now - intersectionPhaseStartedMs >= INTERSECTION_ACQUIRE_TIMEOUT_MS) {
+      failIntersectionNavigation();
+      return;
+    }
+
+    // This explicit guard prevents the original incoming/straight line from
+    // being accepted before enough rotation, even if target tuning changes.
+    if (
+      intersectionTurnAngleDeg >= INTERSECTION_MIN_ACQUIRE_ANGLE_DEG &&
+      confirmOutgoingIntersectionLine()
+    ) {
+      return;
+    }
+
+    driveIntersectionManeuver();
+  }
+}
+
+void updateIntersectionNavigation() {
+  if (!intersectionNavigationActive) return;
+
+  unsigned long now = millis();
+  if (now - lastLineFollowUpdateMs < LINE_FOLLOW_INTERVAL_MS) return;
+  lastLineFollowUpdateMs = now;
+  sampleLineSensors();
+
+  if (intersectionDirection == INTERSECTION_DIRECTION_STRAIGHT) {
+    updateStraightIntersectionNavigation(now);
+  } else {
+    updateTurningIntersectionNavigation(now);
+  }
 }
 
 void updateLineFollowing() {

@@ -143,6 +143,30 @@ def test_navigation_uses_only_esp32_and_validates_exact_ack(
             "get_line_status",
             "GET_LINE_STATUS",
             "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=CENTERING_LEFT|PATTERN=00000",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=CENTERING_RIGHT|PATTERN=00000",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=PIVOTING_LEFT|PATTERN=00000",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=PIVOTING_RIGHT|PATTERN=00000",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
             "LINE_STATUS|MODE=NAVIGATION|STATE=ACQUIRING_RIGHT|PATTERN=11101",
         ),
         (

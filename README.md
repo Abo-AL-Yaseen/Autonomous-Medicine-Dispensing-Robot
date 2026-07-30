@@ -133,15 +133,26 @@ require the exact acknowledgement shown:
 
 The ESP32 returns `ERROR|NOT_AT_INTERSECTION` if a decision is requested in any
 other line state. While a maneuver is active, `GET /line/status` reports
-`MODE=NAVIGATION` and a state such as `GOING_STRAIGHT`, `TURNING_LEFT`,
-`TURNING_RIGHT`, `ACQUIRING_STRAIGHT`, `ACQUIRING_LEFT`, or `ACQUIRING_RIGHT`.
+`MODE=NAVIGATION` and a state such as `GOING_STRAIGHT`, `CENTERING_LEFT`,
+`CENTERING_RIGHT`, `PIVOTING_LEFT`, `PIVOTING_RIGHT`, `ACQUIRING_STRAIGHT`,
+`ACQUIRING_LEFT`, or `ACQUIRING_RIGHT`.
 
-Initial motor settings are 180/180 PWM for straight, 0/180 for left (left/right
-motor), and 180/0 for right. The original intersection is considered cleared
-only after fewer than four sensors see black. The selected outgoing line must
-then produce three consecutive readings with one to three black sensors. On
-success, proportional line following resumes immediately without another
-`POST /line/start`, and the ESP32 emits exactly one event:
+STRAIGHT retains its verified 180/180 PWM behavior: it clears the wide black
+intersection and confirms the outgoing straight line. LEFT and RIGHT use a
+separate physical sequence for the front-mounted sensor array:
+
+1. Drive forward at PWM 160 for 200 ms to center the wheel/rotation axis in the
+   `+` intersection. Sensor patterns are ignored during this phase.
+2. Pivot in place at PWM 180 using the MPU6050: LEFT drives the left side
+   backward and right side forward; RIGHT drives left forward and right
+   backward. Sensor patterns are ignored throughout the pivot.
+3. At the 88-degree gyro target, stop pivoting and drive forward at PWM 160 to
+   acquire the selected outgoing line. Acquisition is prohibited below 60
+   degrees even if future target-angle tuning changes.
+
+The selected outgoing line must produce three consecutive readings with one to
+three black sensors. On success, proportional line following resumes immediately
+without another `POST /line/start`, and the ESP32 emits exactly one event:
 
 ```text
 EVENT|INTERSECTION_COMPLETE|DIRECTION=LEFT|PATTERN=...
@@ -149,8 +160,9 @@ EVENT|INTERSECTION_COMPLETE|DIRECTION=RIGHT|PATTERN=...
 EVENT|INTERSECTION_COMPLETE|DIRECTION=STRAIGHT|PATTERN=...
 ```
 
-Clearing is limited to 1500 ms and outgoing-line acquisition to 2500 ms. A
-timeout stops both motors, disables line following, reports
+STRAIGHT clearing is limited to 1500 ms. LEFT/RIGHT gyro pivoting is limited to
+2500 ms, and outgoing-line acquisition for every direction is limited to 2500
+ms. A timeout stops both motors, disables line following, reports
 `STATE=NAVIGATION_FAILED`, and emits exactly one corresponding failure event:
 
 ```text

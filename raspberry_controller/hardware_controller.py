@@ -286,6 +286,10 @@ class RobotHardwareController:
     }
     NAVIGATION_STATES = {
         "GOING_STRAIGHT",
+        "CENTERING_LEFT",
+        "CENTERING_RIGHT",
+        "PIVOTING_LEFT",
+        "PIVOTING_RIGHT",
         "TURNING_LEFT",
         "TURNING_RIGHT",
         "ACQUIRING_LEFT",
