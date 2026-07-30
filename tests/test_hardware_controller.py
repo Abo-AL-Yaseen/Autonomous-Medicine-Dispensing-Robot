@@ -74,6 +74,45 @@ def test_movement_uses_only_esp32(
 
 
 @pytest.mark.parametrize(
+    ("method_name", "command", "acknowledgement"),
+    [
+        (
+            "intersection_left",
+            "INTERSECTION_LEFT",
+            "ACK|INTERSECTION_LEFT_STARTED",
+        ),
+        (
+            "intersection_right",
+            "INTERSECTION_RIGHT",
+            "ACK|INTERSECTION_RIGHT_STARTED",
+        ),
+        (
+            "intersection_straight",
+            "INTERSECTION_STRAIGHT",
+            "ACK|INTERSECTION_STRAIGHT_STARTED",
+        ),
+    ],
+)
+def test_navigation_uses_only_esp32_and_validates_exact_ack(
+    method_name: str,
+    command: str,
+    acknowledgement: str,
+) -> None:
+    esp32 = RecordingSerialController({command: acknowledgement})
+    arduino_uno = RecordingSerialController()
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=arduino_uno,  # type: ignore[arg-type]
+    )
+
+    assert getattr(controller, method_name)() == acknowledgement
+    assert esp32.commands == [command]
+    assert esp32.expected_responses == [acknowledgement]
+    assert arduino_uno.commands == []
+    assert arduino_uno.expected_responses == []
+
+
+@pytest.mark.parametrize(
     ("method_name", "command", "expected", "response"),
     [
         (
@@ -93,6 +132,18 @@ def test_movement_uses_only_esp32(
             "GET_LINE_STATUS",
             "VALID_LINE_STATUS",
             "LINE_STATUS|MODE=FOLLOWING|STATE=SEARCHING_RIGHT|PATTERN=11111",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=TURNING_LEFT|PATTERN=00000",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=ACQUIRING_RIGHT|PATTERN=11101",
         ),
         (
             "start_line_follow",
@@ -176,3 +227,41 @@ def test_malformed_line_response_is_rejected() -> None:
 
     with pytest.raises(UnexpectedSerialResponse):
         controller.get_line_reading()
+
+
+def test_malformed_navigation_acknowledgement_is_rejected() -> None:
+    connection = FakeSerialConnection([b"ACK|INTERSECTION_LEFT\n"])
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(UnexpectedSerialResponse):
+        controller.intersection_left()
+
+    assert connection.writes == [b"INTERSECTION_LEFT\n"]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        b"EVENT|INTERSECTION_COMPLETE|DIRECTION=LEFT|PATTERN=11011\n",
+        b"EVENT|INTERSECTION_FAILED|DIRECTION=RIGHT\n",
+    ],
+)
+def test_async_navigation_event_does_not_corrupt_later_request(event: bytes) -> None:
+    connection = FakeSerialConnection([event, b"ACK|INTERSECTION_STRAIGHT_STARTED\n"])
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert (
+        controller.intersection_straight()
+        == "ACK|INTERSECTION_STRAIGHT_STARTED"
+    )
+    assert connection.writes == [b"INTERSECTION_STRAIGHT\n"]

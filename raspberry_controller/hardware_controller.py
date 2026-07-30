@@ -269,6 +269,8 @@ class RobotHardwareController:
         "STATUS|LINE_FOLLOWING",
         "STATUS|INTERSECTION",
         "STATUS|LINE_LOST",
+        "STATUS|NAVIGATION",
+        "STATUS|NAVIGATION_FAILED",
     )
     LINE_FOLLOW_STATES = {
         "IDLE",
@@ -280,6 +282,15 @@ class RobotHardwareController:
         "SEARCHING_RIGHT",
         "INTERSECTION",
         "LINE_LOST",
+        "NAVIGATION_FAILED",
+    }
+    NAVIGATION_STATES = {
+        "GOING_STRAIGHT",
+        "TURNING_LEFT",
+        "TURNING_RIGHT",
+        "ACQUIRING_LEFT",
+        "ACQUIRING_RIGHT",
+        "ACQUIRING_STRAIGHT",
     }
 
     def __init__(
@@ -417,6 +428,36 @@ class RobotHardwareController:
             "ACK|LINE_FOLLOW_STOPPED",
         )
 
+    def intersection_left(self) -> str:
+        """Start non-blocking acquisition of the left intersection branch."""
+
+        return self._request(
+            self.esp32,
+            "INTERSECTION_LEFT",
+            "ACK|INTERSECTION_LEFT_STARTED",
+            response_prefix="ACK|INTERSECTION_",
+        )
+
+    def intersection_right(self) -> str:
+        """Start non-blocking acquisition of the right intersection branch."""
+
+        return self._request(
+            self.esp32,
+            "INTERSECTION_RIGHT",
+            "ACK|INTERSECTION_RIGHT_STARTED",
+            response_prefix="ACK|INTERSECTION_",
+        )
+
+    def intersection_straight(self) -> str:
+        """Start non-blocking acquisition of the straight intersection branch."""
+
+        return self._request(
+            self.esp32,
+            "INTERSECTION_STRAIGHT",
+            "ACK|INTERSECTION_STRAIGHT_STARTED",
+            response_prefix="ACK|INTERSECTION_",
+        )
+
     def dispense(self, box_number: int, pill_count: int) -> dict[str, int]:
         """Dispense pills sequentially, requiring an ACK and DONE for each pill."""
 
@@ -521,9 +562,12 @@ class RobotHardwareController:
         pattern = parts[3].removeprefix("PATTERN=")
         return (
             parts[1].startswith("MODE=")
-            and mode in ("FOLLOWING", "STOPPED")
+            and mode in ("FOLLOWING", "STOPPED", "NAVIGATION")
             and parts[2].startswith("STATE=")
-            and state in cls.LINE_FOLLOW_STATES
+            and (
+                (mode == "NAVIGATION" and state in cls.NAVIGATION_STATES)
+                or (mode != "NAVIGATION" and state in cls.LINE_FOLLOW_STATES)
+            )
             and parts[3].startswith("PATTERN=")
             and len(pattern) == 5
             and all(value in "01" for value in pattern)

@@ -174,6 +174,9 @@ def create_app(
                 "/line/status",
                 "/line/start",
                 "/line/stop",
+                "/navigation/intersection/left",
+                "/navigation/intersection/right",
+                "/navigation/intersection/straight",
                 "/docs",
             ],
         }
@@ -292,6 +295,30 @@ def create_app(
         )
         return {"success": True, "response": response}
 
+    @application.post("/navigation/intersection/left")
+    def intersection_left(request: Request) -> dict[str, object]:
+        return _navigation_response(
+            request,
+            "left",
+            lambda controller: controller.intersection_left(),
+        )
+
+    @application.post("/navigation/intersection/right")
+    def intersection_right(request: Request) -> dict[str, object]:
+        return _navigation_response(
+            request,
+            "right",
+            lambda controller: controller.intersection_right(),
+        )
+
+    @application.post("/navigation/intersection/straight")
+    def intersection_straight(request: Request) -> dict[str, object]:
+        return _navigation_response(
+            request,
+            "straight",
+            lambda controller: controller.intersection_straight(),
+        )
+
     return application
 
 
@@ -302,6 +329,15 @@ def _movement_response(
 ) -> dict[str, object]:
     response = _run_hardware_operation(request, operation)
     return {"success": True, "movement": movement, "response": response}
+
+
+def _navigation_response(
+    request: Request,
+    direction: str,
+    operation: Callable[[RobotHardwareController], str],
+) -> dict[str, object]:
+    response = _run_hardware_operation(request, operation)
+    return {"success": True, "direction": direction, "response": response}
 
 
 def _run_hardware_operation(

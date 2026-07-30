@@ -83,6 +83,15 @@ const unsigned long LINE_SEARCH_OPPOSITE_MS = 600;
 const uint8_t LINE_SEARCH_OUTER_PWM = 180;
 const uint8_t LINE_SEARCH_INNER_PWM = 0;
 
+// Conservative starting values for physical intersection tuning. Each phase
+// has its own deadline so a maneuver can never turn or drive indefinitely.
+const uint8_t INTERSECTION_STRAIGHT_PWM = 180;
+const uint8_t INTERSECTION_TURN_OUTER_PWM = 180;
+const uint8_t INTERSECTION_TURN_INNER_PWM = 0;
+const unsigned long INTERSECTION_CLEAR_TIMEOUT_MS = 1500;
+const unsigned long INTERSECTION_ACQUIRE_TIMEOUT_MS = 2500;
+const uint8_t INTERSECTION_LINE_CONFIRM_READINGS = 3;
+
 // MH Real Time Clock Module 2 / DS1302-style 3-wire RTC wiring:
 // VCC -> ESP32 3V3, GND -> GND, CLK -> GPIO33, DAT -> GPIO32, RST -> GPIO19.
 const int RTC_CLK_PIN = 33;
@@ -147,13 +156,29 @@ enum LineFollowState {
   LINE_FOLLOW_SEARCHING_LEFT,
   LINE_FOLLOW_SEARCHING_RIGHT,
   LINE_FOLLOW_INTERSECTION,
-  LINE_FOLLOW_LINE_LOST
+  LINE_FOLLOW_LINE_LOST,
+  LINE_FOLLOW_NAVIGATION_FAILED
 };
 
 enum LineSearchPhase {
   LINE_SEARCH_INACTIVE,
   LINE_SEARCH_PRIMARY,
   LINE_SEARCH_OPPOSITE
+};
+
+enum IntersectionDirection {
+  INTERSECTION_DIRECTION_NONE,
+  INTERSECTION_DIRECTION_LEFT,
+  INTERSECTION_DIRECTION_RIGHT,
+  INTERSECTION_DIRECTION_STRAIGHT
+};
+
+enum IntersectionNavigationState {
+  INTERSECTION_NAVIGATION_INACTIVE,
+  INTERSECTION_GOING_STRAIGHT,
+  INTERSECTION_TURNING_LEFT,
+  INTERSECTION_TURNING_RIGHT,
+  INTERSECTION_ACQUIRING_LINE
 };
 
 static bool autoModeEnabled = false;
@@ -180,6 +205,13 @@ static LineSearchPhase lineSearchPhase = LINE_SEARCH_INACTIVE;
 static bool lineSearchPrimaryLeft = false;
 static unsigned long lineSearchPhaseStartedMs = 0;
 static unsigned long lastLineFollowUpdateMs = 0;
+static bool intersectionNavigationActive = false;
+static bool intersectionCleared = false;
+static IntersectionDirection intersectionDirection = INTERSECTION_DIRECTION_NONE;
+static IntersectionNavigationState intersectionNavigationState =
+  INTERSECTION_NAVIGATION_INACTIVE;
+static unsigned long intersectionPhaseStartedMs = 0;
+static uint8_t consecutiveOutgoingLineReadings = 0;
 
 static bool irCurrentRawDetected = false;
 static bool irLastRawDetected = false;
@@ -216,6 +248,7 @@ void testUltrasonicOnce();
 void updateIrSensor();
 void sampleLineSensors();
 void updateLineFollowing();
+void updateIntersectionNavigation();
 void startLineFollowing();
 void stopLineFollowing();
 void setupRTC();
@@ -232,6 +265,7 @@ void handleLegacyCommand(char command);
 void handleTextCommand(const String& command);
 static bool isLegacyCommand(char command);
 static void disableLineFollowing(LineFollowState nextState);
+static void cancelIntersectionNavigation();
 
 // Hardware keys execute immediately. Text commands remain newline-terminated,
 // while P/S are held briefly so PING and ST... text lines are not mistaken
@@ -394,6 +428,7 @@ static bool interruptionRequested() {
     bool startLineFollowCommand = receivedLine == "START_LINE_FOLLOW";
     bool stopLineFollowCommand = receivedLine == "STOP_LINE_FOLLOW";
     stopAllOutputs();
+    cancelIntersectionNavigation();
     disableLineFollowing(LINE_FOLLOW_IDLE);
     if (receivedLine.length() == 1 && command == 'S') {
       lcdShowStatus("STOP", "All Outputs Off");
@@ -622,15 +657,51 @@ static const char* lineFollowStateName(LineFollowState state) {
     case LINE_FOLLOW_SEARCHING_RIGHT: return "SEARCHING_RIGHT";
     case LINE_FOLLOW_INTERSECTION: return "INTERSECTION";
     case LINE_FOLLOW_LINE_LOST: return "LINE_LOST";
+    case LINE_FOLLOW_NAVIGATION_FAILED: return "NAVIGATION_FAILED";
+  }
+  return "UNKNOWN";
+}
+
+static const char* intersectionDirectionName(IntersectionDirection direction) {
+  switch (direction) {
+    case INTERSECTION_DIRECTION_LEFT: return "LEFT";
+    case INTERSECTION_DIRECTION_RIGHT: return "RIGHT";
+    case INTERSECTION_DIRECTION_STRAIGHT: return "STRAIGHT";
+    case INTERSECTION_DIRECTION_NONE: return "NONE";
+  }
+  return "NONE";
+}
+
+static const char* intersectionNavigationStateName() {
+  switch (intersectionNavigationState) {
+    case INTERSECTION_GOING_STRAIGHT: return "GOING_STRAIGHT";
+    case INTERSECTION_TURNING_LEFT: return "TURNING_LEFT";
+    case INTERSECTION_TURNING_RIGHT: return "TURNING_RIGHT";
+    case INTERSECTION_ACQUIRING_LINE:
+      switch (intersectionDirection) {
+        case INTERSECTION_DIRECTION_LEFT: return "ACQUIRING_LEFT";
+        case INTERSECTION_DIRECTION_RIGHT: return "ACQUIRING_RIGHT";
+        case INTERSECTION_DIRECTION_STRAIGHT: return "ACQUIRING_STRAIGHT";
+        case INTERSECTION_DIRECTION_NONE: return "ACQUIRING_LINE";
+      }
+    case INTERSECTION_NAVIGATION_INACTIVE: return "INACTIVE";
   }
   return "UNKNOWN";
 }
 
 static void printLineFollowStatus() {
   Serial.print("LINE_STATUS|MODE=");
-  Serial.print(lineFollowEnabled ? "FOLLOWING" : "STOPPED");
+  if (intersectionNavigationActive) {
+    Serial.print("NAVIGATION");
+  } else {
+    Serial.print(lineFollowEnabled ? "FOLLOWING" : "STOPPED");
+  }
   Serial.print("|STATE=");
-  Serial.print(lineFollowStateName(lineFollowState));
+  Serial.print(
+    intersectionNavigationActive
+      ? intersectionNavigationStateName()
+      : lineFollowStateName(lineFollowState)
+  );
   Serial.print("|PATTERN=");
   printLinePatternBits(latestLinePattern);
   Serial.println();
@@ -645,6 +716,15 @@ static void resetLineSearch() {
 static void resetLineFollowConfirmation() {
   consecutiveIntersectionReadings = 0;
   resetLineSearch();
+}
+
+static void cancelIntersectionNavigation() {
+  intersectionNavigationActive = false;
+  intersectionCleared = false;
+  intersectionDirection = INTERSECTION_DIRECTION_NONE;
+  intersectionNavigationState = INTERSECTION_NAVIGATION_INACTIVE;
+  intersectionPhaseStartedMs = 0;
+  consecutiveOutgoingLineReadings = 0;
 }
 
 static void disableLineFollowing(LineFollowState nextState) {
@@ -668,6 +748,11 @@ static void stopLineFollowingForEvent(
 }
 
 void startLineFollowing() {
+  if (intersectionNavigationActive) {
+    Serial.println("ERROR|NAVIGATION_IN_PROGRESS");
+    return;
+  }
+
   if (autoModeEnabled) {
     stopAutonomousMode("line-follow command", 'S');
   }
@@ -675,6 +760,15 @@ void startLineFollowing() {
   manualMovementActive = false;
   stopMotorOutputs();
   sampleLineSensors();
+  if (
+    lineFollowState == LINE_FOLLOW_INTERSECTION ||
+    lineFollowState == LINE_FOLLOW_NAVIGATION_FAILED ||
+    latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS
+  ) {
+    Serial.println("ERROR|INTERSECTION_UNRESOLVED");
+    return;
+  }
+
   resetLineFollowConfirmation();
   lastValidLinePositionError =
     latestLineActiveCount > 0 &&
@@ -688,10 +782,195 @@ void startLineFollowing() {
 }
 
 void stopLineFollowing() {
+  cancelIntersectionNavigation();
   disableLineFollowing(LINE_FOLLOW_IDLE);
   manualMovementActive = false;
   stopMotorOutputs();
   Serial.println("ACK|LINE_FOLLOW_STOPPED");
+}
+
+static void applyProportionalLineControl() {
+  lastValidLinePositionError = latestLinePositionError;
+  int correction = (int)roundf(
+    latestLinePositionError * LINE_FOLLOW_PROPORTIONAL_GAIN
+  );
+  correction = constrain(
+    correction,
+    -(int)LINE_FOLLOW_MAX_CORRECTION,
+    (int)LINE_FOLLOW_MAX_CORRECTION
+  );
+
+  int leftPwm = constrain(
+    (int)LINE_FOLLOW_BASE_PWM + correction,
+    0,
+    255
+  );
+  int rightPwm = constrain(
+    (int)LINE_FOLLOW_BASE_PWM - correction,
+    0,
+    255
+  );
+
+  if (latestLinePositionError < -0.1f) {
+    lineFollowState = LINE_FOLLOW_CORRECTING_LEFT;
+  } else if (latestLinePositionError > 0.1f) {
+    lineFollowState = LINE_FOLLOW_CORRECTING_RIGHT;
+  } else {
+    lineFollowState = LINE_FOLLOW_CENTERED;
+  }
+
+  driveForwardDifferential((uint8_t)leftPwm, (uint8_t)rightPwm);
+}
+
+static void driveIntersectionManeuver() {
+  switch (intersectionDirection) {
+    case INTERSECTION_DIRECTION_LEFT:
+      driveForwardDifferential(
+        INTERSECTION_TURN_INNER_PWM,
+        INTERSECTION_TURN_OUTER_PWM
+      );
+      break;
+    case INTERSECTION_DIRECTION_RIGHT:
+      driveForwardDifferential(
+        INTERSECTION_TURN_OUTER_PWM,
+        INTERSECTION_TURN_INNER_PWM
+      );
+      break;
+    case INTERSECTION_DIRECTION_STRAIGHT:
+      driveForwardDifferential(
+        INTERSECTION_STRAIGHT_PWM,
+        INTERSECTION_STRAIGHT_PWM
+      );
+      break;
+    case INTERSECTION_DIRECTION_NONE:
+      stopMotorOutputs();
+      break;
+  }
+}
+
+static void failIntersectionNavigation() {
+  const char* direction = intersectionDirectionName(intersectionDirection);
+  intersectionNavigationActive = false;
+  intersectionCleared = false;
+  intersectionNavigationState = INTERSECTION_NAVIGATION_INACTIVE;
+  consecutiveOutgoingLineReadings = 0;
+  lineFollowEnabled = false;
+  lineFollowState = LINE_FOLLOW_NAVIGATION_FAILED;
+  manualMovementActive = false;
+  stopMotorOutputs();
+  Serial.print("EVENT|INTERSECTION_FAILED|DIRECTION=");
+  Serial.println(direction);
+  intersectionDirection = INTERSECTION_DIRECTION_NONE;
+}
+
+static void completeIntersectionNavigation() {
+  const char* direction = intersectionDirectionName(intersectionDirection);
+  intersectionNavigationActive = false;
+  intersectionCleared = false;
+  intersectionNavigationState = INTERSECTION_NAVIGATION_INACTIVE;
+  intersectionDirection = INTERSECTION_DIRECTION_NONE;
+  consecutiveOutgoingLineReadings = 0;
+  resetLineFollowConfirmation();
+  lineFollowEnabled = true;
+  manualMovementActive = false;
+  lastLineFollowUpdateMs = millis();
+  applyProportionalLineControl();
+  Serial.print("EVENT|INTERSECTION_COMPLETE|DIRECTION=");
+  Serial.print(direction);
+  Serial.print("|PATTERN=");
+  printLinePatternBits(latestLinePattern);
+  Serial.println();
+}
+
+static void startIntersectionNavigation(IntersectionDirection direction) {
+  if (
+    intersectionNavigationActive ||
+    lineFollowState != LINE_FOLLOW_INTERSECTION
+  ) {
+    Serial.println("ERROR|NOT_AT_INTERSECTION");
+    return;
+  }
+
+  intersectionDirection = direction;
+  intersectionCleared = false;
+  consecutiveOutgoingLineReadings = 0;
+  intersectionPhaseStartedMs = millis();
+  lineFollowEnabled = false;
+  manualMovementActive = false;
+  resetLineFollowConfirmation();
+
+  switch (direction) {
+    case INTERSECTION_DIRECTION_LEFT:
+      intersectionNavigationState = INTERSECTION_TURNING_LEFT;
+      Serial.println("ACK|INTERSECTION_LEFT_STARTED");
+      break;
+    case INTERSECTION_DIRECTION_RIGHT:
+      intersectionNavigationState = INTERSECTION_TURNING_RIGHT;
+      Serial.println("ACK|INTERSECTION_RIGHT_STARTED");
+      break;
+    case INTERSECTION_DIRECTION_STRAIGHT:
+      intersectionNavigationState = INTERSECTION_GOING_STRAIGHT;
+      Serial.println("ACK|INTERSECTION_STRAIGHT_STARTED");
+      break;
+    case INTERSECTION_DIRECTION_NONE:
+      Serial.println("ERROR|NOT_AT_INTERSECTION");
+      return;
+  }
+
+  intersectionNavigationActive = true;
+  driveIntersectionManeuver();
+}
+
+void updateIntersectionNavigation() {
+  if (!intersectionNavigationActive) return;
+
+  unsigned long now = millis();
+  if (now - lastLineFollowUpdateMs < LINE_FOLLOW_INTERVAL_MS) return;
+  lastLineFollowUpdateMs = now;
+  sampleLineSensors();
+
+  if (!intersectionCleared) {
+    if (now - intersectionPhaseStartedMs >= INTERSECTION_CLEAR_TIMEOUT_MS) {
+      failIntersectionNavigation();
+      return;
+    }
+
+    // The original wide black area is cleared only after fewer than the
+    // normal intersection threshold of sensors remain on black.
+    if (latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS) {
+      intersectionCleared = true;
+      intersectionNavigationState = INTERSECTION_ACQUIRING_LINE;
+      intersectionPhaseStartedMs = now;
+      consecutiveOutgoingLineReadings = 0;
+    }
+  } else if (
+    now - intersectionPhaseStartedMs >= INTERSECTION_ACQUIRE_TIMEOUT_MS
+  ) {
+    failIntersectionNavigation();
+    return;
+  }
+
+  if (intersectionCleared) {
+    bool validOutgoingLine =
+      latestLineActiveCount > 0 &&
+      latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS;
+    if (validOutgoingLine) {
+      if (consecutiveOutgoingLineReadings < 255) {
+        consecutiveOutgoingLineReadings++;
+      }
+      if (
+        consecutiveOutgoingLineReadings >=
+        INTERSECTION_LINE_CONFIRM_READINGS
+      ) {
+        completeIntersectionNavigation();
+        return;
+      }
+    } else {
+      consecutiveOutgoingLineReadings = 0;
+    }
+  }
+
+  driveIntersectionManeuver();
 }
 
 void updateLineFollowing() {
@@ -753,36 +1032,7 @@ void updateLineFollowing() {
   // Any reacquisition cancels both search phases and restores the
   // normal proportional controller on this same update.
   resetLineSearch();
-  lastValidLinePositionError = latestLinePositionError;
-  int correction = (int)roundf(
-    latestLinePositionError * LINE_FOLLOW_PROPORTIONAL_GAIN
-  );
-  correction = constrain(
-    correction,
-    -(int)LINE_FOLLOW_MAX_CORRECTION,
-    (int)LINE_FOLLOW_MAX_CORRECTION
-  );
-
-  int leftPwm = constrain(
-    (int)LINE_FOLLOW_BASE_PWM + correction,
-    0,
-    255
-  );
-  int rightPwm = constrain(
-    (int)LINE_FOLLOW_BASE_PWM - correction,
-    0,
-    255
-  );
-
-  if (latestLinePositionError < -0.1f) {
-    lineFollowState = LINE_FOLLOW_CORRECTING_LEFT;
-  } else if (latestLinePositionError > 0.1f) {
-    lineFollowState = LINE_FOLLOW_CORRECTING_RIGHT;
-  } else {
-    lineFollowState = LINE_FOLLOW_CENTERED;
-  }
-
-  driveForwardDifferential((uint8_t)leftPwm, (uint8_t)rightPwm);
+  applyProportionalLineControl();
 }
 
 static void printRTCDateTime(const RtcDateTime& dt) {
@@ -1476,6 +1726,9 @@ void printHelp() {
   Serial.println("X : Turn pump OFF and stop motors");
   Serial.println("U - Ultrasonic distance test");
   Serial.println("T : Show RTC time once on Serial and LCD");
+  Serial.println("INTERSECTION_LEFT : acquire left branch after intersection stop");
+  Serial.println("INTERSECTION_RIGHT : acquire right branch after intersection stop");
+  Serial.println("INTERSECTION_STRAIGHT : acquire straight branch after intersection stop");
   Serial.println("Commands are case-insensitive.");
   Serial.println("==========================================");
 }
@@ -1532,6 +1785,7 @@ void handleLegacyCommand(char rawCommand) {
 
   // Any output-changing legacy command takes ownership from line following.
   if (command != 'T') {
+    cancelIntersectionNavigation();
     disableLineFollowing(LINE_FOLLOW_IDLE);
   }
 
@@ -1669,12 +1923,16 @@ void handleLegacyCommand(char rawCommand) {
 }
 
 static void printControllerStatus() {
-  if (lineFollowEnabled) {
+  if (intersectionNavigationActive) {
+    Serial.println("STATUS|NAVIGATION");
+  } else if (lineFollowEnabled) {
     Serial.println("STATUS|LINE_FOLLOWING");
   } else if (lineFollowState == LINE_FOLLOW_INTERSECTION) {
     Serial.println("STATUS|INTERSECTION");
   } else if (lineFollowState == LINE_FOLLOW_LINE_LOST) {
     Serial.println("STATUS|LINE_LOST");
+  } else if (lineFollowState == LINE_FOLLOW_NAVIGATION_FAILED) {
+    Serial.println("STATUS|NAVIGATION_FAILED");
   } else if (autoModeEnabled) {
     Serial.println("STATUS|AUTONOMOUS");
   } else if (manualMovementActive) {
@@ -1703,6 +1961,12 @@ void handleTextCommand(const String& command) {
     startLineFollowing();
   } else if (normalizedCommand == "STOP_LINE_FOLLOW") {
     stopLineFollowing();
+  } else if (normalizedCommand == "INTERSECTION_LEFT") {
+    startIntersectionNavigation(INTERSECTION_DIRECTION_LEFT);
+  } else if (normalizedCommand == "INTERSECTION_RIGHT") {
+    startIntersectionNavigation(INTERSECTION_DIRECTION_RIGHT);
+  } else if (normalizedCommand == "INTERSECTION_STRAIGHT") {
+    startIntersectionNavigation(INTERSECTION_DIRECTION_STRAIGHT);
   } else {
     Serial.println("ERROR|UNKNOWN_COMMAND");
   }
@@ -1815,6 +2079,7 @@ void loop() {
   processSerialInput();
 
   updateIrSensor();
+  updateIntersectionNavigation();
   updateLineFollowing();
   updateAutonomousMode();
   delay(5);

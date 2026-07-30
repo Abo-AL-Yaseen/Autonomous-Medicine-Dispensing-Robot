@@ -20,6 +20,7 @@ class FakeHardwareController:
         self.dispense_calls: list[tuple[int, int]] = []
         self.movement_calls: list[str] = []
         self.line_calls: list[str] = []
+        self.navigation_calls: list[str] = []
         self.hardware_error: Exception | None = None
 
     def connect(self) -> None:
@@ -90,9 +91,32 @@ class FakeHardwareController:
             "ACK|LINE_FOLLOW_STOPPED",
         )
 
+    def intersection_left(self) -> str:
+        return self._record_navigation_call(
+            "left",
+            "ACK|INTERSECTION_LEFT_STARTED",
+        )
+
+    def intersection_right(self) -> str:
+        return self._record_navigation_call(
+            "right",
+            "ACK|INTERSECTION_RIGHT_STARTED",
+        )
+
+    def intersection_straight(self) -> str:
+        return self._record_navigation_call(
+            "straight",
+            "ACK|INTERSECTION_STRAIGHT_STARTED",
+        )
+
     def _record_line_call(self, method: str, response: str) -> str:
         self._raise_hardware_error()
         self.line_calls.append(method)
+        return response
+
+    def _record_navigation_call(self, direction: str, response: str) -> str:
+        self._raise_hardware_error()
+        self.navigation_calls.append(direction)
         return response
 
     def _raise_hardware_error(self) -> None:
@@ -130,6 +154,9 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/movement/stop" in body["endpoints"]
     assert "/line/start" in body["endpoints"]
     assert "/line/stop" in body["endpoints"]
+    assert "/navigation/intersection/left" in body["endpoints"]
+    assert "/navigation/intersection/right" in body["endpoints"]
+    assert "/navigation/intersection/straight" in body["endpoints"]
 
 
 def test_health_reports_connected_hardware(client: TestClient) -> None:
@@ -366,3 +393,59 @@ def test_line_hardware_error_returns_service_unavailable(
     }
     assert fake_hardware.line_calls == []
     assert "/dev/serial/example" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("direction", "acknowledgement"),
+    [
+        ("left", "ACK|INTERSECTION_LEFT_STARTED"),
+        ("right", "ACK|INTERSECTION_RIGHT_STARTED"),
+        ("straight", "ACK|INTERSECTION_STRAIGHT_STARTED"),
+    ],
+)
+def test_navigation_endpoint_invokes_exactly_one_controller_method(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    direction: str,
+    acknowledgement: str,
+) -> None:
+    response = client.post(f"/navigation/intersection/{direction}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "direction": direction,
+        "response": acknowledgement,
+    }
+    assert fake_hardware.navigation_calls == [direction]
+
+
+def test_navigation_hardware_error_returns_service_unavailable(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.hardware_error = SerialConnectionError(
+        "SERIAL_READ_FAILED|PORT=/dev/serial/example"
+    )
+
+    response = client.post("/navigation/intersection/left")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
+    }
+    assert fake_hardware.navigation_calls == []
+    assert "/dev/serial/example" not in response.text
+
+
+def test_navigation_unexpected_error_returns_safe_internal_error(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.hardware_error = RuntimeError("private stack detail")
+
+    response = client.post("/navigation/intersection/right")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "INTERNAL_ERROR"}}
+    assert "private stack detail" not in response.text

@@ -110,12 +110,86 @@ Safety warnings:
 - Do not use multiple workers.
 - Only one process may open the Serial ports.
 
+## Intersection decisions
+
+When line following confirms a wide black intersection, the ESP32 stops with
+`LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=00000`. A decision can then
+be started without waiting for physical completion:
+
+```bash
+curl -X POST http://YOUR_PRIVATE_IP:8000/navigation/intersection/straight
+curl -X POST http://YOUR_PRIVATE_IP:8000/navigation/intersection/left
+curl -X POST http://YOUR_PRIVATE_IP:8000/navigation/intersection/right
+```
+
+These endpoints send only the following newline-terminated ESP32 commands and
+require the exact acknowledgement shown:
+
+| Direction | Command | Immediate acknowledgement |
+| --- | --- | --- |
+| Left | `INTERSECTION_LEFT` | `ACK|INTERSECTION_LEFT_STARTED` |
+| Right | `INTERSECTION_RIGHT` | `ACK|INTERSECTION_RIGHT_STARTED` |
+| Straight | `INTERSECTION_STRAIGHT` | `ACK|INTERSECTION_STRAIGHT_STARTED` |
+
+The ESP32 returns `ERROR|NOT_AT_INTERSECTION` if a decision is requested in any
+other line state. While a maneuver is active, `GET /line/status` reports
+`MODE=NAVIGATION` and a state such as `GOING_STRAIGHT`, `TURNING_LEFT`,
+`TURNING_RIGHT`, `ACQUIRING_STRAIGHT`, `ACQUIRING_LEFT`, or `ACQUIRING_RIGHT`.
+
+Initial motor settings are 180/180 PWM for straight, 0/180 for left (left/right
+motor), and 180/0 for right. The original intersection is considered cleared
+only after fewer than four sensors see black. The selected outgoing line must
+then produce three consecutive readings with one to three black sensors. On
+success, proportional line following resumes immediately without another
+`POST /line/start`, and the ESP32 emits exactly one event:
+
+```text
+EVENT|INTERSECTION_COMPLETE|DIRECTION=LEFT|PATTERN=...
+EVENT|INTERSECTION_COMPLETE|DIRECTION=RIGHT|PATTERN=...
+EVENT|INTERSECTION_COMPLETE|DIRECTION=STRAIGHT|PATTERN=...
+```
+
+Clearing is limited to 1500 ms and outgoing-line acquisition to 2500 ms. A
+timeout stops both motors, disables line following, reports
+`STATE=NAVIGATION_FAILED`, and emits exactly one corresponding failure event:
+
+```text
+EVENT|INTERSECTION_FAILED|DIRECTION=LEFT
+EVENT|INTERSECTION_FAILED|DIRECTION=RIGHT
+EVENT|INTERSECTION_FAILED|DIRECTION=STRAIGHT
+```
+
+The legacy `S` command and `POST /line/stop` cancel any maneuver and stop both
+motors immediately. Manual `F`, `B`, `L`, or `R` takes control and cancels the
+maneuver. `START_LINE_FOLLOW` is rejected at an unresolved intersection instead
+of driving away from it.
+
+Use this exact physical intersection test order:
+
+1. Keep the power switch accessible.
+2. Test with wheels lifted first.
+3. Place the sensor array over a real intersection.
+4. Confirm `STATE=INTERSECTION`.
+5. Test STRAIGHT first.
+6. Confirm the original intersection clears.
+7. Confirm the outgoing straight line is acquired.
+8. Test LEFT.
+9. Test RIGHT.
+10. Test each timeout by removing the expected outgoing branch.
+11. Verify STOP interrupts every maneuver.
+12. Only then test all decisions on the floor.
+
+The initial PWM values, confirmation count, and timeouts require real-hardware
+tuning. Do not test near table edges or stairs. Keep the power switch within
+reach throughout every test.
+
 Do not use `--reload` while connected to real hardware, and do not start multiple
 Uvicorn workers. Only one process may open the ESP32 and Arduino UNO serial ports.
 Serial operations and medicine dispensing are blocking, so the service protects all
 hardware calls with one process-local thread lock.
 
 The current API covers hardware health, ping, status, medicine dispensing, manual
-movement, and local ESP32 black-line following only.
-Navigation, camera, database, water dispensing, room logic, and the NestJS backend
-are intentionally outside this phase.
+movement, local ESP32 black-line following, and left/right/straight decisions at
+an already-detected physical intersection. U-turns, camera, ArUco, route planning,
+missions, database, water dispensing, room logic, mobile applications, and the
+NestJS backend are intentionally outside this phase.
