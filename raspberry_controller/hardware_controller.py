@@ -307,6 +307,9 @@ class RobotHardwareController:
         "ACQUIRING_LEFT",
         "ACQUIRING_RIGHT",
         "ACQUIRING_STRAIGHT",
+        "UTURN_PIVOT_SEARCH",
+        "UTURN_SENSOR_ALIGN",
+        "UTURN_LINE_LOCK",
     }
 
     def __init__(
@@ -472,6 +475,16 @@ class RobotHardwareController:
             "INTERSECTION_STRAIGHT",
             "ACK|INTERSECTION_STRAIGHT_STARTED",
             response_prefix="ACK|INTERSECTION_",
+        )
+
+    def u_turn(self) -> str:
+        """Start the ESP32's bounded, sensor-guided physical U-turn."""
+
+        return self._request(
+            self.esp32,
+            "U_TURN",
+            "ACK|U_TURN_STARTED",
+            response_prefix="ACK|U_TURN",
         )
 
     def dispense(self, box_number: int, pill_count: int) -> dict[str, int]:

@@ -110,6 +110,18 @@ const unsigned long INTERSECTION_CLEAR_TIMEOUT_MS = 1500;
 const unsigned long INTERSECTION_ACQUIRE_TIMEOUT_MS = 2500;
 const uint8_t INTERSECTION_LINE_CONFIRM_READINGS = 3;
 
+// Initial bounded calibration for a manually requested U-turn. The fast
+// physical-right pivot ignores the original line until 120 degrees, then the
+// existing sensor-guided alignment and line-lock controllers take over.
+const uint8_t UTURN_PIVOT_PWM = 170;
+const float UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG = 120.0f;
+const float UTURN_MAX_ANGLE_DEG = 260.0f;
+const unsigned long UTURN_PIVOT_TIMEOUT_MS = 15000;
+const uint8_t UTURN_SENSOR_ALIGN_PWM = 160;
+const unsigned long UTURN_SENSOR_ALIGN_TIMEOUT_MS = 6000;
+const unsigned long UTURN_SENSOR_LOSS_GRACE_MS = 500;
+const unsigned long UTURN_MANEUVER_TIMEOUT_MS = 24000;
+
 // MH Real Time Clock Module 2 / DS1302-style 3-wire RTC wiring:
 // VCC -> ESP32 3V3, GND -> GND, CLK -> GPIO33, DAT -> GPIO32, RST -> GPIO19.
 const int RTC_CLK_PIN = 33;
@@ -188,7 +200,8 @@ enum IntersectionDirection {
   INTERSECTION_DIRECTION_NONE,
   INTERSECTION_DIRECTION_LEFT,
   INTERSECTION_DIRECTION_RIGHT,
-  INTERSECTION_DIRECTION_STRAIGHT
+  INTERSECTION_DIRECTION_STRAIGHT,
+  INTERSECTION_DIRECTION_U_TURN
 };
 
 enum IntersectionNavigationState {
@@ -204,7 +217,10 @@ enum IntersectionNavigationState {
   INTERSECTION_LOCKING_LINE_RIGHT,
   INTERSECTION_REACQUIRING_LEFT,
   INTERSECTION_REACQUIRING_RIGHT,
-  INTERSECTION_ACQUIRING_LINE
+  INTERSECTION_ACQUIRING_LINE,
+  INTERSECTION_UTURN_PIVOT_SEARCH,
+  INTERSECTION_UTURN_SENSOR_ALIGN,
+  INTERSECTION_UTURN_LINE_LOCK
 };
 
 static bool autoModeEnabled = false;
@@ -246,6 +262,7 @@ static bool intersectionWideBlackCleared = false;
 static uint8_t consecutiveIntersectionWideClearReadings = 0;
 static unsigned long intersectionLockStableStartedMs = 0;
 static float intersectionLastLockError = 0.0f;
+static unsigned long uTurnStartedMs = 0;
 
 static bool irCurrentRawDetected = false;
 static bool irLastRawDetected = false;
@@ -256,6 +273,7 @@ static unsigned long irDebounceStartedMs = 0;
 const size_t SERIAL_COMMAND_BUFFER_SIZE = 64;
 const unsigned long SERIAL_PENDING_P_TIMEOUT_MS = 125;
 const unsigned long SERIAL_PENDING_S_TIMEOUT_MS = 20;
+const unsigned long SERIAL_PENDING_U_TIMEOUT_MS = 20;
 static char serialCommandBuffer[SERIAL_COMMAND_BUFFER_SIZE];
 static size_t serialCommandLength = 0;
 static bool serialCommandOverflow = false;
@@ -264,6 +282,8 @@ static bool serialPendingP = false;
 static unsigned long serialPendingPStartedMs = 0;
 static bool serialPendingS = false;
 static unsigned long serialPendingSStartedMs = 0;
+static bool serialPendingU = false;
+static unsigned long serialPendingUStartedMs = 0;
 
 enum SerialInputResult {
   SERIAL_INPUT_INCOMPLETE,
@@ -300,10 +320,11 @@ void handleTextCommand(const String& command);
 static bool isLegacyCommand(char command);
 static void disableLineFollowing(LineFollowState nextState);
 static void cancelIntersectionNavigation();
+static void startUturnNavigation();
 
 // Hardware keys execute immediately. Text commands remain newline-terminated,
-// while P/S are held briefly so PING and ST... text lines are not mistaken
-// for the pump or emergency-stop legacy keys.
+// while P/S/U are held briefly so PING, ST..., and U_TURN text lines are not
+// mistaken for the pump, emergency-stop, or ultrasonic legacy keys.
 static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
   while (Serial.available() > 0) {
     char incoming = (char)Serial.read();
@@ -386,6 +407,28 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
       return SERIAL_INPUT_LEGACY_READY;
     }
 
+    if (serialPendingU) {
+      if (incoming == '\r' || incoming == '\n') {
+        serialPendingU = false;
+        legacyCommand = 'U';
+        return SERIAL_INPUT_LEGACY_READY;
+      }
+
+      if (incoming == '_') {
+        serialPendingU = false;
+        serialTextMode = true;
+        serialCommandLength = 0;
+        serialCommandBuffer[serialCommandLength++] = 'U';
+        serialCommandBuffer[serialCommandLength++] = incoming;
+        continue;
+      }
+
+      // A non-text character following U preserves the ultrasonic shortcut.
+      serialPendingU = false;
+      legacyCommand = 'U';
+      return SERIAL_INPUT_LEGACY_READY;
+    }
+
     if (incoming == '\r' || incoming == '\n' || incoming == ' ' || incoming == '\t') {
       continue;
     }
@@ -399,6 +442,12 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
     if ((char)toupper((unsigned char)incoming) == 'S') {
       serialPendingS = true;
       serialPendingSStartedMs = millis();
+      continue;
+    }
+
+    if ((char)toupper((unsigned char)incoming) == 'U') {
+      serialPendingU = true;
+      serialPendingUStartedMs = millis();
       continue;
     }
 
@@ -421,6 +470,12 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
   if (serialPendingS && millis() - serialPendingSStartedMs >= SERIAL_PENDING_S_TIMEOUT_MS) {
     serialPendingS = false;
     legacyCommand = 'S';
+    return SERIAL_INPUT_LEGACY_READY;
+  }
+
+  if (serialPendingU && millis() - serialPendingUStartedMs >= SERIAL_PENDING_U_TIMEOUT_MS) {
+    serialPendingU = false;
+    legacyCommand = 'U';
     return SERIAL_INPUT_LEGACY_READY;
   }
 
@@ -461,6 +516,7 @@ static bool interruptionRequested() {
     char command = (char)toupper((unsigned char)receivedLine.charAt(0));
     bool startLineFollowCommand = receivedLine == "START_LINE_FOLLOW";
     bool stopLineFollowCommand = receivedLine == "STOP_LINE_FOLLOW";
+    bool uTurnCommand = receivedLine == "U_TURN";
     stopAllOutputs();
     cancelIntersectionNavigation();
     disableLineFollowing(LINE_FOLLOW_IDLE);
@@ -474,6 +530,9 @@ static bool interruptionRequested() {
     } else if (startLineFollowCommand) {
       startLineFollowing();
       lcdShowStatus("Line Follow", "Started");
+    } else if (uTurnCommand) {
+      lcdShowStatus("Action Active", "U-turn Rejected");
+      Serial.println("ERROR|MANEUVER_ACTIVE");
     } else {
       lcdShowStatus("Action Cancelled", "Outputs Off");
       Serial.print("Action cancelled by command \"");
@@ -701,6 +760,7 @@ static const char* intersectionDirectionName(IntersectionDirection direction) {
     case INTERSECTION_DIRECTION_LEFT: return "LEFT";
     case INTERSECTION_DIRECTION_RIGHT: return "RIGHT";
     case INTERSECTION_DIRECTION_STRAIGHT: return "STRAIGHT";
+    case INTERSECTION_DIRECTION_U_TURN: return "U_TURN";
     case INTERSECTION_DIRECTION_NONE: return "NONE";
   }
   return "NONE";
@@ -719,11 +779,15 @@ static const char* intersectionNavigationStateName() {
     case INTERSECTION_LOCKING_LINE_RIGHT: return "LOCKING_LINE_RIGHT";
     case INTERSECTION_REACQUIRING_LEFT: return "REACQUIRING_LEFT";
     case INTERSECTION_REACQUIRING_RIGHT: return "REACQUIRING_RIGHT";
+    case INTERSECTION_UTURN_PIVOT_SEARCH: return "UTURN_PIVOT_SEARCH";
+    case INTERSECTION_UTURN_SENSOR_ALIGN: return "UTURN_SENSOR_ALIGN";
+    case INTERSECTION_UTURN_LINE_LOCK: return "UTURN_LINE_LOCK";
     case INTERSECTION_ACQUIRING_LINE:
       switch (intersectionDirection) {
         case INTERSECTION_DIRECTION_LEFT: return "ACQUIRING_LEFT";
         case INTERSECTION_DIRECTION_RIGHT: return "ACQUIRING_RIGHT";
         case INTERSECTION_DIRECTION_STRAIGHT: return "ACQUIRING_STRAIGHT";
+        case INTERSECTION_DIRECTION_U_TURN: return "UTURN_PIVOT_SEARCH";
         case INTERSECTION_DIRECTION_NONE: return "ACQUIRING_LINE";
       }
     case INTERSECTION_NAVIGATION_INACTIVE: return "INACTIVE";
@@ -775,6 +839,7 @@ static void cancelIntersectionNavigation() {
   consecutiveIntersectionWideClearReadings = 0;
   intersectionLockStableStartedMs = 0;
   intersectionLastLockError = 0.0f;
+  uTurnStartedMs = 0;
 }
 
 static void disableLineFollowing(LineFollowState nextState) {
@@ -918,16 +983,30 @@ static void driveIntersectionManeuver() {
       // Physical intersection RIGHT is the opposite of the manual helper name.
       turnLeftInPlaceAt(INTERSECTION_PIVOT_SEARCH_PWM);
       break;
+    case INTERSECTION_UTURN_PIVOT_SEARCH:
+      // The first U-turn calibration consistently pivots physical RIGHT.
+      turnLeftInPlaceAt(UTURN_PIVOT_PWM);
+      break;
     case INTERSECTION_SENSOR_ALIGN_LEFT:
     case INTERSECTION_SENSOR_ALIGN_RIGHT:
+    case INTERSECTION_UTURN_SENSOR_ALIGN:
       if (intersectionAlignmentPivotLeft) {
-        turnRightInPlaceAt(INTERSECTION_SENSOR_ALIGN_PWM);
+        turnRightInPlaceAt(
+          intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+            ? UTURN_SENSOR_ALIGN_PWM
+            : INTERSECTION_SENSOR_ALIGN_PWM
+        );
       } else {
-        turnLeftInPlaceAt(INTERSECTION_SENSOR_ALIGN_PWM);
+        turnLeftInPlaceAt(
+          intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+            ? UTURN_SENSOR_ALIGN_PWM
+            : INTERSECTION_SENSOR_ALIGN_PWM
+        );
       }
       break;
     case INTERSECTION_LOCKING_LINE_LEFT:
     case INTERSECTION_LOCKING_LINE_RIGHT:
+    case INTERSECTION_UTURN_LINE_LOCK:
       driveForwardAt(INTERSECTION_LOCK_PWM);
       break;
     case INTERSECTION_REACQUIRING_LEFT:
@@ -947,6 +1026,7 @@ static void driveIntersectionManeuver() {
 }
 
 static void failIntersectionNavigation() {
+  bool uTurn = intersectionDirection == INTERSECTION_DIRECTION_U_TURN;
   const char* direction = intersectionDirectionName(intersectionDirection);
   intersectionNavigationActive = false;
   intersectionCleared = false;
@@ -954,6 +1034,79 @@ static void failIntersectionNavigation() {
   consecutiveOutgoingLineReadings = 0;
   intersectionTurnAngleDeg = 0.0f;
   intersectionLastGyroUpdateMs = 0;
+  intersectionAlignmentPivotLeft = false;
+  intersectionLastLineSeenMs = 0;
+  intersectionWideBlackCleared = false;
+  consecutiveIntersectionWideClearReadings = 0;
+  intersectionLockStableStartedMs = 0;
+  intersectionLastLockError = 0.0f;
+  uTurnStartedMs = 0;
+  lineFollowEnabled = false;
+  lineFollowState = LINE_FOLLOW_NAVIGATION_FAILED;
+  manualMovementActive = false;
+  stopMotorOutputs();
+  if (uTurn) {
+    Serial.println("EVENT|U_TURN_FAILED");
+  } else {
+    Serial.print("EVENT|INTERSECTION_FAILED|DIRECTION=");
+    Serial.println(direction);
+  }
+  intersectionDirection = INTERSECTION_DIRECTION_NONE;
+}
+
+static void completeIntersectionNavigation() {
+  bool uTurn = intersectionDirection == INTERSECTION_DIRECTION_U_TURN;
+  const char* direction = intersectionDirectionName(intersectionDirection);
+  intersectionNavigationActive = false;
+  intersectionCleared = false;
+  intersectionNavigationState = INTERSECTION_NAVIGATION_INACTIVE;
+  intersectionDirection = INTERSECTION_DIRECTION_NONE;
+  consecutiveOutgoingLineReadings = 0;
+  intersectionTurnAngleDeg = 0.0f;
+  intersectionLastGyroUpdateMs = 0;
+  intersectionAlignmentPivotLeft = false;
+  intersectionLastLineSeenMs = 0;
+  intersectionWideBlackCleared = false;
+  consecutiveIntersectionWideClearReadings = 0;
+  intersectionLockStableStartedMs = 0;
+  intersectionLastLockError = 0.0f;
+  uTurnStartedMs = 0;
+  resetLineFollowConfirmation();
+  lineFollowEnabled = true;
+  manualMovementActive = false;
+  lastLineFollowUpdateMs = millis();
+  applyProportionalLineControl();
+  if (uTurn) {
+    Serial.print("EVENT|U_TURN_COMPLETE|PATTERN=");
+  } else {
+    Serial.print("EVENT|INTERSECTION_COMPLETE|DIRECTION=");
+    Serial.print(direction);
+    Serial.print("|PATTERN=");
+  }
+  printLinePatternBits(latestLinePattern);
+  Serial.println();
+}
+
+static void startUturnNavigation() {
+  if (
+    intersectionNavigationActive ||
+    lineFollowEnabled ||
+    manualMovementActive ||
+    autoModeEnabled
+  ) {
+    Serial.println("ERROR|MANEUVER_ACTIVE");
+    return;
+  }
+
+  stopMotorOutputs();
+  sampleLineSensors();
+  intersectionDirection = INTERSECTION_DIRECTION_U_TURN;
+  intersectionCleared = false;
+  consecutiveOutgoingLineReadings = 0;
+  intersectionPhaseStartedMs = millis();
+  uTurnStartedMs = intersectionPhaseStartedMs;
+  intersectionTurnAngleDeg = 0.0f;
+  intersectionLastGyroUpdateMs = intersectionPhaseStartedMs;
   intersectionAlignmentPivotLeft = false;
   intersectionLastLineSeenMs = 0;
   intersectionWideBlackCleared = false;
@@ -961,39 +1114,12 @@ static void failIntersectionNavigation() {
   intersectionLockStableStartedMs = 0;
   intersectionLastLockError = 0.0f;
   lineFollowEnabled = false;
-  lineFollowState = LINE_FOLLOW_NAVIGATION_FAILED;
   manualMovementActive = false;
-  stopMotorOutputs();
-  Serial.print("EVENT|INTERSECTION_FAILED|DIRECTION=");
-  Serial.println(direction);
-  intersectionDirection = INTERSECTION_DIRECTION_NONE;
-}
-
-static void completeIntersectionNavigation() {
-  const char* direction = intersectionDirectionName(intersectionDirection);
-  intersectionNavigationActive = false;
-  intersectionCleared = false;
-  intersectionNavigationState = INTERSECTION_NAVIGATION_INACTIVE;
-  intersectionDirection = INTERSECTION_DIRECTION_NONE;
-  consecutiveOutgoingLineReadings = 0;
-  intersectionTurnAngleDeg = 0.0f;
-  intersectionLastGyroUpdateMs = 0;
-  intersectionAlignmentPivotLeft = false;
-  intersectionLastLineSeenMs = 0;
-  intersectionWideBlackCleared = false;
-  consecutiveIntersectionWideClearReadings = 0;
-  intersectionLockStableStartedMs = 0;
-  intersectionLastLockError = 0.0f;
   resetLineFollowConfirmation();
-  lineFollowEnabled = true;
-  manualMovementActive = false;
-  lastLineFollowUpdateMs = millis();
-  applyProportionalLineControl();
-  Serial.print("EVENT|INTERSECTION_COMPLETE|DIRECTION=");
-  Serial.print(direction);
-  Serial.print("|PATTERN=");
-  printLinePatternBits(latestLinePattern);
-  Serial.println();
+  intersectionNavigationState = INTERSECTION_UTURN_PIVOT_SEARCH;
+  intersectionNavigationActive = true;
+  Serial.println("ACK|U_TURN_STARTED");
+  driveIntersectionManeuver();
 }
 
 static void startIntersectionNavigation(IntersectionDirection direction) {
@@ -1034,6 +1160,9 @@ static void startIntersectionNavigation(IntersectionDirection direction) {
       intersectionNavigationState = INTERSECTION_GOING_STRAIGHT;
       Serial.println("ACK|INTERSECTION_STRAIGHT_STARTED");
       break;
+    case INTERSECTION_DIRECTION_U_TURN:
+      Serial.println("ERROR|NOT_AT_INTERSECTION");
+      return;
     case INTERSECTION_DIRECTION_NONE:
       Serial.println("ERROR|NOT_AT_INTERSECTION");
       return;
@@ -1179,11 +1308,17 @@ static bool updateIntersectionTurnAngle(
 }
 
 static void startLowSpeedLineLock(unsigned long now) {
-  stopMotorOutputs();
-  intersectionNavigationState =
-    intersectionDirection == INTERSECTION_DIRECTION_LEFT
-      ? INTERSECTION_LOCKING_LINE_LEFT
-      : INTERSECTION_LOCKING_LINE_RIGHT;
+  bool uTurn = intersectionDirection == INTERSECTION_DIRECTION_U_TURN;
+  if (!uTurn) {
+    stopMotorOutputs();
+  }
+  intersectionNavigationState = uTurn
+    ? INTERSECTION_UTURN_LINE_LOCK
+    : (
+      intersectionDirection == INTERSECTION_DIRECTION_LEFT
+        ? INTERSECTION_LOCKING_LINE_LEFT
+        : INTERSECTION_LOCKING_LINE_RIGHT
+    );
   intersectionPhaseStartedMs = now;
   intersectionLockStableStartedMs = now;
   intersectionLastLineSeenMs = now;
@@ -1202,7 +1337,11 @@ static void applySensorGuidedPivotAlignment(unsigned long now) {
     consecutiveOutgoingLineReadings = 0;
     if (
       now - intersectionLastLineSeenMs <=
-      INTERSECTION_SENSOR_LOSS_GRACE_MS
+      (
+        intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+          ? UTURN_SENSOR_LOSS_GRACE_MS
+          : INTERSECTION_SENSOR_LOSS_GRACE_MS
+      )
     ) {
       // Continue the last low-speed pivot direction through brief line loss.
       driveIntersectionManeuver();
@@ -1261,9 +1400,13 @@ static void applySensorGuidedPivotAlignment(unsigned long now) {
 
 static void startSensorGuidedPivotAlignment(unsigned long now) {
   intersectionNavigationState =
-    intersectionDirection == INTERSECTION_DIRECTION_LEFT
-      ? INTERSECTION_SENSOR_ALIGN_LEFT
-      : INTERSECTION_SENSOR_ALIGN_RIGHT;
+    intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+      ? INTERSECTION_UTURN_SENSOR_ALIGN
+      : (
+        intersectionDirection == INTERSECTION_DIRECTION_LEFT
+          ? INTERSECTION_SENSOR_ALIGN_LEFT
+          : INTERSECTION_SENSOR_ALIGN_RIGHT
+      );
   intersectionPhaseStartedMs = now;
   intersectionLastLineSeenMs = now;
   intersectionLastGyroUpdateMs = now;
@@ -1289,9 +1432,17 @@ static void startTurningForwardReacquisition(unsigned long now) {
 }
 
 static void updateSensorGuidedPivotAlignment(unsigned long now) {
+  unsigned long alignTimeoutMs =
+    intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+      ? UTURN_SENSOR_ALIGN_TIMEOUT_MS
+      : INTERSECTION_SENSOR_ALIGN_TIMEOUT_MS;
+  float maxAngleDeg =
+    intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+      ? UTURN_MAX_ANGLE_DEG
+      : INTERSECTION_PIVOT_MAX_ANGLE_DEG;
   if (
     now - intersectionPhaseStartedMs >=
-    INTERSECTION_SENSOR_ALIGN_TIMEOUT_MS
+    alignTimeoutMs
   ) {
     failIntersectionNavigation();
     return;
@@ -1302,7 +1453,7 @@ static void updateSensorGuidedPivotAlignment(unsigned long now) {
       now,
       intersectionAlignmentPivotLeft
     ) ||
-    intersectionTurnAngleDeg > INTERSECTION_PIVOT_MAX_ANGLE_DEG
+    intersectionTurnAngleDeg > maxAngleDeg
   ) {
     failIntersectionNavigation();
     return;
@@ -1322,9 +1473,13 @@ static bool isLineWithinInnerLockSensors() {
 static void returnLockToSensorGuidedPivot(unsigned long now) {
   stopMotorOutputs();
   intersectionNavigationState =
-    intersectionDirection == INTERSECTION_DIRECTION_LEFT
-      ? INTERSECTION_SENSOR_ALIGN_LEFT
-      : INTERSECTION_SENSOR_ALIGN_RIGHT;
+    intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+      ? INTERSECTION_UTURN_SENSOR_ALIGN
+      : (
+        intersectionDirection == INTERSECTION_DIRECTION_LEFT
+          ? INTERSECTION_SENSOR_ALIGN_LEFT
+          : INTERSECTION_SENSOR_ALIGN_RIGHT
+      );
   intersectionPhaseStartedMs = now;
   intersectionLastGyroUpdateMs = now;
   intersectionLastLineSeenMs = now;
@@ -1343,7 +1498,11 @@ static void updateLowSpeedLineLock(unsigned long now) {
     intersectionLockStableStartedMs = 0;
     if (
       now - intersectionLastLineSeenMs <=
-      INTERSECTION_SENSOR_LOSS_GRACE_MS
+      (
+        intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+          ? UTURN_SENSOR_LOSS_GRACE_MS
+          : INTERSECTION_SENSOR_LOSS_GRACE_MS
+      )
     ) {
       // Keep the last low-speed correction output through a short dropout.
       return;
@@ -1485,6 +1644,56 @@ static void updateTurningIntersectionNavigation(unsigned long now) {
   }
 }
 
+static bool isValidUturnSearchPattern() {
+  return latestLineActiveCount >= 1 && latestLineActiveCount <= 3;
+}
+
+static void updateUturnNavigation(unsigned long now) {
+  if (now - uTurnStartedMs >= UTURN_MANEUVER_TIMEOUT_MS) {
+    failIntersectionNavigation();
+    return;
+  }
+
+  if (intersectionNavigationState == INTERSECTION_UTURN_PIVOT_SEARCH) {
+    if (now - intersectionPhaseStartedMs >= UTURN_PIVOT_TIMEOUT_MS) {
+      failIntersectionNavigation();
+      return;
+    }
+
+    // The initial U-turn always pivots physical RIGHT. Sensor patterns are
+    // deliberately ignored until the gyro reaches the minimum search angle.
+    if (!updateIntersectionTurnAngle(now, false)) {
+      failIntersectionNavigation();
+      return;
+    }
+
+    if (
+      intersectionTurnAngleDeg >= UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG &&
+      isValidUturnSearchPattern()
+    ) {
+      startSensorGuidedPivotAlignment(now);
+      return;
+    }
+
+    if (intersectionTurnAngleDeg >= UTURN_MAX_ANGLE_DEG) {
+      failIntersectionNavigation();
+      return;
+    }
+
+    driveIntersectionManeuver();
+    return;
+  }
+
+  if (intersectionNavigationState == INTERSECTION_UTURN_SENSOR_ALIGN) {
+    updateSensorGuidedPivotAlignment(now);
+    return;
+  }
+
+  if (intersectionNavigationState == INTERSECTION_UTURN_LINE_LOCK) {
+    updateLowSpeedLineLock(now);
+  }
+}
+
 void updateIntersectionNavigation() {
   if (!intersectionNavigationActive) return;
 
@@ -1493,7 +1702,9 @@ void updateIntersectionNavigation() {
   lastLineFollowUpdateMs = now;
   sampleLineSensors();
 
-  if (intersectionDirection == INTERSECTION_DIRECTION_STRAIGHT) {
+  if (intersectionDirection == INTERSECTION_DIRECTION_U_TURN) {
+    updateUturnNavigation(now);
+  } else if (intersectionDirection == INTERSECTION_DIRECTION_STRAIGHT) {
     updateStraightIntersectionNavigation(now);
   } else {
     updateTurningIntersectionNavigation(now);
@@ -2256,6 +2467,7 @@ void printHelp() {
   Serial.println("INTERSECTION_LEFT : acquire left branch after intersection stop");
   Serial.println("INTERSECTION_RIGHT : acquire right branch after intersection stop");
   Serial.println("INTERSECTION_STRAIGHT : acquire straight branch after intersection stop");
+  Serial.println("U_TURN : start a bounded physical-right sensor-guided U-turn");
   Serial.println("Commands are case-insensitive.");
   Serial.println("==========================================");
 }
@@ -2494,6 +2706,8 @@ void handleTextCommand(const String& command) {
     startIntersectionNavigation(INTERSECTION_DIRECTION_RIGHT);
   } else if (normalizedCommand == "INTERSECTION_STRAIGHT") {
     startIntersectionNavigation(INTERSECTION_DIRECTION_STRAIGHT);
+  } else if (normalizedCommand == "U_TURN") {
+    startUturnNavigation();
   } else {
     Serial.println("ERROR|UNKNOWN_COMMAND");
   }

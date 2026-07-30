@@ -229,8 +229,43 @@ Uvicorn workers. Only one process may open the ESP32 and Arduino UNO serial port
 Serial operations and medicine dispensing are blocking, so the service protects all
 hardware calls with one process-local thread lock.
 
+## Manual U-turn
+
+With the robot stopped and centered over a normal straight black line, start the
+first bounded U-turn implementation with:
+
+```bash
+curl -X POST http://YOUR_PRIVATE_IP:8000/navigation/u-turn
+```
+
+The endpoint sends the newline-terminated ESP32 command `U_TURN` and requires
+`ACK|U_TURN_STARTED`. It is rejected with `ERROR|MANEUVER_ACTIVE` while another
+movement or navigation controller owns the motors.
+
+The initial calibration pivots in place toward physical RIGHT at PWM 170. Sensor
+patterns are ignored below 120 degrees; from that angle onward, the first narrow
+one-to-three-sensor black pattern immediately enters sensor-guided alignment at
+PWM 160. Alignment uses O1/O2 for physical-left correction and O4/O5 for
+physical-right correction. Strict center requires O3 black, O1/O5 white, one to
+three black sensors total, and five consecutive approximately 25 ms readings.
+
+After centering, the verified proportional line lock runs forward at PWM 110,
+gain 35, and maximum correction 70 for approximately 500 ms before normal line
+following resumes. The states are `UTURN_PIVOT_SEARCH`, `UTURN_SENSOR_ALIGN`, and
+`UTURN_LINE_LOCK`. Success emits `EVENT|U_TURN_COMPLETE|PATTERN=...`; a bounded
+failure stops both motors, enters `NAVIGATION_FAILED`, and emits
+`EVENT|U_TURN_FAILED`. The fast search is limited to 260 degrees or 15000 ms,
+sensor alignment is limited to 6000 ms, and sensor-loss grace is 500 ms. An
+independent 24000 ms whole-maneuver deadline prevents recovery transitions from
+extending the U-turn indefinitely.
+
+The pivot PWM, gyro angles/timeouts, alignment PWM, and line-lock tuning are
+initial physical values and must be calibrated with the power switch accessible.
+`S`, `STOP_LINE_FOLLOW`, and manual `F`/`B`/`L`/`R` remain cancellation paths.
+
 The current API covers hardware health, ping, status, medicine dispensing, manual
-movement, local ESP32 black-line following, and left/right/straight decisions at
-an already-detected physical intersection. U-turns, camera, ArUco, route planning,
-missions, database, water dispensing, room logic, mobile applications, and the
-NestJS backend are intentionally outside this phase.
+movement, local ESP32 black-line following, left/right/straight decisions at an
+already-detected physical intersection, and a manually triggered U-turn. Camera,
+ArUco, route planning, missions, database, water dispensing, automatic room and
+return-home logic, mobile applications, and the NestJS backend are intentionally
+outside this phase.

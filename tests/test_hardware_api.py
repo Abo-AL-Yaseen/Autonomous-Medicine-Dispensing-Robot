@@ -109,6 +109,12 @@ class FakeHardwareController:
             "ACK|INTERSECTION_STRAIGHT_STARTED",
         )
 
+    def u_turn(self) -> str:
+        return self._record_navigation_call(
+            "u-turn",
+            "ACK|U_TURN_STARTED",
+        )
+
     def _record_line_call(self, method: str, response: str) -> str:
         self._raise_hardware_error()
         self.line_calls.append(method)
@@ -157,6 +163,7 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/navigation/intersection/left" in body["endpoints"]
     assert "/navigation/intersection/right" in body["endpoints"]
     assert "/navigation/intersection/straight" in body["endpoints"]
+    assert "/navigation/u-turn" in body["endpoints"]
 
 
 def test_health_reports_connected_hardware(client: TestClient) -> None:
@@ -420,6 +427,21 @@ def test_navigation_endpoint_invokes_exactly_one_controller_method(
     assert fake_hardware.navigation_calls == [direction]
 
 
+def test_u_turn_endpoint_invokes_exactly_one_controller_method(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.post("/navigation/u-turn")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "direction": "u-turn",
+        "response": "ACK|U_TURN_STARTED",
+    }
+    assert fake_hardware.navigation_calls == ["u-turn"]
+
+
 def test_navigation_hardware_error_returns_service_unavailable(
     client: TestClient,
     fake_hardware: FakeHardwareController,
@@ -429,6 +451,24 @@ def test_navigation_hardware_error_returns_service_unavailable(
     )
 
     response = client.post("/navigation/intersection/left")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
+    }
+    assert fake_hardware.navigation_calls == []
+    assert "/dev/serial/example" not in response.text
+
+
+def test_u_turn_hardware_error_returns_service_unavailable(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.hardware_error = SerialConnectionError(
+        "SERIAL_READ_FAILED|PORT=/dev/serial/example"
+    )
+
+    response = client.post("/navigation/u-turn")
 
     assert response.status_code == 503
     assert response.json() == {

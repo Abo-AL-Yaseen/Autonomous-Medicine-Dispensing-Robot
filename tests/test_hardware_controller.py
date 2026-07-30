@@ -91,6 +91,11 @@ def test_movement_uses_only_esp32(
             "INTERSECTION_STRAIGHT",
             "ACK|INTERSECTION_STRAIGHT_STARTED",
         ),
+        (
+            "u_turn",
+            "U_TURN",
+            "ACK|U_TURN_STARTED",
+        ),
     ],
 )
 def test_navigation_uses_only_esp32_and_validates_exact_ack(
@@ -218,6 +223,24 @@ def test_navigation_uses_only_esp32_and_validates_exact_ack(
             "LINE_STATUS|MODE=NAVIGATION|STATE=ACQUIRING_RIGHT|PATTERN=11101",
         ),
         (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=UTURN_PIVOT_SEARCH|PATTERN=11011",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=UTURN_SENSOR_ALIGN|PATTERN=01111",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=UTURN_LINE_LOCK|PATTERN=11011",
+        ),
+        (
             "start_line_follow",
             "START_LINE_FOLLOW",
             "ACK|LINE_FOLLOW_STARTED",
@@ -316,6 +339,21 @@ def test_malformed_navigation_acknowledgement_is_rejected() -> None:
     assert connection.writes == [b"INTERSECTION_LEFT\n"]
 
 
+def test_malformed_u_turn_acknowledgement_is_rejected() -> None:
+    connection = FakeSerialConnection([b"ACK|U_TURN\n"])
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(UnexpectedSerialResponse):
+        controller.u_turn()
+
+    assert connection.writes == [b"U_TURN\n"]
+
+
 @pytest.mark.parametrize(
     "event",
     [
@@ -337,3 +375,23 @@ def test_async_navigation_event_does_not_corrupt_later_request(event: bytes) -> 
         == "ACK|INTERSECTION_STRAIGHT_STARTED"
     )
     assert connection.writes == [b"INTERSECTION_STRAIGHT\n"]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        b"EVENT|U_TURN_COMPLETE|PATTERN=11011\n",
+        b"EVENT|U_TURN_FAILED\n",
+    ],
+)
+def test_async_u_turn_event_does_not_corrupt_ack(event: bytes) -> None:
+    connection = FakeSerialConnection([event, b"ACK|U_TURN_STARTED\n"])
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.u_turn() == "ACK|U_TURN_STARTED"
+    assert connection.writes == [b"U_TURN\n"]
