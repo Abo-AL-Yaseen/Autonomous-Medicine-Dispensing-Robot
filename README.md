@@ -134,25 +134,52 @@ require the exact acknowledgement shown:
 The ESP32 returns `ERROR|NOT_AT_INTERSECTION` if a decision is requested in any
 other line state. While a maneuver is active, `GET /line/status` reports
 `MODE=NAVIGATION` and a state such as `GOING_STRAIGHT`, `CENTERING_LEFT`,
-`CENTERING_RIGHT`, `PIVOTING_LEFT`, `PIVOTING_RIGHT`, `ACQUIRING_STRAIGHT`,
-`ACQUIRING_LEFT`, or `ACQUIRING_RIGHT`.
+`CENTERING_RIGHT`, `PIVOT_SEARCH_LEFT`, `PIVOT_SEARCH_RIGHT`,
+`SENSOR_ALIGN_LEFT`, `SENSOR_ALIGN_RIGHT`, `LOCKING_LINE_LEFT`,
+`LOCKING_LINE_RIGHT`, `REACQUIRING_LEFT`, `REACQUIRING_RIGHT`, or
+`ACQUIRING_STRAIGHT`.
 
 STRAIGHT retains its verified 180/180 PWM behavior: it clears the wide black
 intersection and confirms the outgoing straight line. LEFT and RIGHT use a
 separate physical sequence for the front-mounted sensor array:
 
-1. Drive forward at PWM 160 for 200 ms to center the wheel/rotation axis in the
-   `+` intersection. Sensor patterns are ignored during this phase.
-2. Pivot in place at PWM 180 using the MPU6050: LEFT drives the left side
-   backward and right side forward; RIGHT drives left forward and right
-   backward. Sensor patterns are ignored throughout the pivot.
-3. At the 88-degree gyro target, stop pivoting and drive forward at PWM 160 to
-   acquire the selected outgoing line. Acquisition is prohibited below 60
-   degrees even if future target-angle tuning changes.
+1. Drive forward at PWM 160 for 1800 ms to cover the estimated 20 cm distance
+   from the front sensor array to the wheel rotation axis. All sensor patterns
+   are ignored and pivot output is prohibited for the complete interval. This
+   time-based value should be calibrated physically in 100 ms increments.
+2. Pivot in place at PWM 160 using the MPU6050. The intersection mapping is
+   intentionally swapped from the manual helper names after physical testing:
+   LEFT uses the existing right-pivot output (left side backward/right forward),
+   while RIGHT uses the existing left-pivot output (left forward/right backward).
+3. Ignore line patterns below 50 degrees. After both the angle and wide-black
+   clearance guards pass, LEFT accepts initial branch entry only through O1/O2,
+   while RIGHT accepts it only through O4/O5. O3 must still be white and the
+   total black count must be one to three. Every four/five-black pattern and the
+   initial `00000` remain rejected. Search is bounded to 110 degrees or 3000 ms.
+4. On the first expected-edge reading, immediately continue with sensor-guided
+   in-place pivoting at PWM 105. O1/O2 commands a physical-left pivot; O4/O5
+   commands a physical-right pivot, allowing a small overshoot to be corrected
+   by reversing direction. Normal forward proportional control does not start
+   during alignment. Four/five-black patterns continue the current pivot and
+   can never declare alignment.
+5. Strict pivot centering requires O3 black, O1/O5 white, and one to three total
+   black sensors. O2 and/or O4 may accompany O3. Five consecutive approximately
+   25 ms readings are required before leaving the pivot controller.
+6. After strict centering, run live forward proportional correction at base PWM
+   110, gain 35, and maximum correction 70. The line must remain entirely within
+   O2/O3/O4 for 500 continuous ms; any O1/O5 excursion resets this stability
+   timer while strong correction continues. Only then does normal line following
+   resume and emit completion.
+7. A temporary all-white loss continues the last correction for at most 250 ms.
+   A longer loss returns to bounded sensor-guided pivoting using the last known
+   line side; it never invokes forward fallback after the branch was detected.
+8. Only if no expected outgoing edge was ever detected, drive
+   forward at PWM 140 for at most 1200 ms. A valid reading immediately enters
+   the same sensor-guided pivot alignment. All-white and all-black readings
+   during this fallback do not cause an immediate stop.
 
-The selected outgoing line must produce three consecutive readings with one to
-three black sensors. On success, proportional line following resumes immediately
-without another `POST /line/start`, and the ESP32 emits exactly one event:
+On success, proportional line following resumes immediately without another
+`POST /line/start`, and the ESP32 emits exactly one event:
 
 ```text
 EVENT|INTERSECTION_COMPLETE|DIRECTION=LEFT|PATTERN=...
@@ -160,9 +187,11 @@ EVENT|INTERSECTION_COMPLETE|DIRECTION=RIGHT|PATTERN=...
 EVENT|INTERSECTION_COMPLETE|DIRECTION=STRAIGHT|PATTERN=...
 ```
 
-STRAIGHT clearing is limited to 1500 ms. LEFT/RIGHT gyro pivoting is limited to
-2500 ms, and outgoing-line acquisition for every direction is limited to 2500
-ms. A timeout stops both motors, disables line following, reports
+STRAIGHT clearing remains limited to 1500 ms and its acquisition remains limited
+to 2500 ms. LEFT/RIGHT pivoting is limited to 110 degrees or 3000 ms; sensor
+alignment and forward reacquisition are each bounded to 1200 ms, and line lock
+has a 2000 ms overall safety timeout. A final timeout stops both motors, disables
+line following, reports
 `STATE=NAVIGATION_FAILED`, and emits exactly one corresponding failure event:
 
 ```text
