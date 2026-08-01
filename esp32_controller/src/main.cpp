@@ -858,11 +858,11 @@ static void driveIntersectionManeuver() {
     case INTERSECTION_ACQUIRING_LINE:
       if (intersectionDirection == INTERSECTION_DIRECTION_STRAIGHT) {
         driveForwardDifferential(
-          INTERSECTION_STRAIGHT_PWM,
-          INTERSECTION_STRAIGHT_PWM
+          95,
+          95
         );
       } else {
-        driveForwardAt(INTERSECTION_ACQUIRE_PWM);
+        driveForwardAt(95);
       }
       break;
     case INTERSECTION_NAVIGATION_INACTIVE:
@@ -899,9 +899,10 @@ static void completeIntersectionNavigation() {
   intersectionLastGyroUpdateMs = 0;
   resetLineFollowConfirmation();
   lineFollowEnabled = true;
+  lineFollowState = LINE_FOLLOW_CENTERED;
   manualMovementActive = false;
   lastLineFollowUpdateMs = millis();
-  applyProportionalLineControl();
+  driveForwardDifferential(95, 95);
   Serial.print("EVENT|INTERSECTION_COMPLETE|DIRECTION=");
   Serial.print(direction);
   Serial.print("|PATTERN=");
@@ -953,7 +954,8 @@ static void startIntersectionNavigation(IntersectionDirection direction) {
 static bool confirmOutgoingIntersectionLine() {
   bool validOutgoingLine =
     latestLineActiveCount > 0 &&
-    latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS;
+    latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS &&
+    (lineDetected[2] || lineDetected[3]);
   if (validOutgoingLine) {
     if (consecutiveOutgoingLineReadings < 255) {
       consecutiveOutgoingLineReadings++;
