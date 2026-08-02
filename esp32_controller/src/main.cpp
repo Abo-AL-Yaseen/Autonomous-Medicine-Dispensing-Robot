@@ -111,16 +111,18 @@ const unsigned long INTERSECTION_ACQUIRE_TIMEOUT_MS = 2500;
 const uint8_t INTERSECTION_LINE_CONFIRM_READINGS = 3;
 
 // Initial bounded calibration for a manually requested U-turn. The fast
-// physical-right pivot ignores the original line until 120 degrees, then the
-// existing sensor-guided alignment and line-lock controllers take over.
-const uint8_t UTURN_PIVOT_PWM = 170;
-const float UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG = 120.0f;
-const float UTURN_MAX_ANGLE_DEG = 260.0f;
-const unsigned long UTURN_PIVOT_TIMEOUT_MS = 15000;
+// physical-right pivot must clear the original line before sensor reacquisition
+// is allowed, then the existing alignment and line-lock controllers take over.
+const uint8_t UTURN_PIVOT_PWM = 180;
+const float UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG = 90.0f;
+const float UTURN_MAX_ANGLE_DEG = 320.0f;
+const unsigned long UTURN_PIVOT_TIMEOUT_MS = 22000;
 const uint8_t UTURN_SENSOR_ALIGN_PWM = 160;
 const unsigned long UTURN_SENSOR_ALIGN_TIMEOUT_MS = 6000;
 const unsigned long UTURN_SENSOR_LOSS_GRACE_MS = 500;
-const unsigned long UTURN_MANEUVER_TIMEOUT_MS = 24000;
+const unsigned long UTURN_TOTAL_TIMEOUT_MS = 35000;
+const uint8_t UTURN_ORIGINAL_LINE_CLEAR_READINGS = 3;
+const unsigned long UTURN_DIAGNOSTIC_INTERVAL_MS = 250;
 
 // MH Real Time Clock Module 2 / DS1302-style 3-wire RTC wiring:
 // VCC -> ESP32 3V3, GND -> GND, CLK -> GPIO33, DAT -> GPIO32, RST -> GPIO19.
@@ -263,6 +265,10 @@ static uint8_t consecutiveIntersectionWideClearReadings = 0;
 static unsigned long intersectionLockStableStartedMs = 0;
 static float intersectionLastLockError = 0.0f;
 static unsigned long uTurnStartedMs = 0;
+static bool uturnOriginalLineCleared = false;
+static uint8_t uturnConsecutiveAllWhiteReadings = 0;
+static unsigned long uturnLastDiagnosticMs = 0;
+static unsigned long uturnPivotElapsedMs = 0;
 
 static bool irCurrentRawDetected = false;
 static bool irLastRawDetected = false;
@@ -840,6 +846,10 @@ static void cancelIntersectionNavigation() {
   intersectionLockStableStartedMs = 0;
   intersectionLastLockError = 0.0f;
   uTurnStartedMs = 0;
+  uturnOriginalLineCleared = false;
+  uturnConsecutiveAllWhiteReadings = 0;
+  uturnLastDiagnosticMs = 0;
+  uturnPivotElapsedMs = 0;
 }
 
 static void disableLineFollowing(LineFollowState nextState) {
@@ -1041,6 +1051,10 @@ static void failIntersectionNavigation() {
   intersectionLockStableStartedMs = 0;
   intersectionLastLockError = 0.0f;
   uTurnStartedMs = 0;
+  uturnOriginalLineCleared = false;
+  uturnConsecutiveAllWhiteReadings = 0;
+  uturnLastDiagnosticMs = 0;
+  uturnPivotElapsedMs = 0;
   lineFollowEnabled = false;
   lineFollowState = LINE_FOLLOW_NAVIGATION_FAILED;
   manualMovementActive = false;
@@ -1071,6 +1085,10 @@ static void completeIntersectionNavigation() {
   intersectionLockStableStartedMs = 0;
   intersectionLastLockError = 0.0f;
   uTurnStartedMs = 0;
+  uturnOriginalLineCleared = false;
+  uturnConsecutiveAllWhiteReadings = 0;
+  uturnLastDiagnosticMs = 0;
+  uturnPivotElapsedMs = 0;
   resetLineFollowConfirmation();
   lineFollowEnabled = true;
   manualMovementActive = false;
@@ -1113,6 +1131,10 @@ static void startUturnNavigation() {
   consecutiveIntersectionWideClearReadings = 0;
   intersectionLockStableStartedMs = 0;
   intersectionLastLockError = 0.0f;
+  uturnOriginalLineCleared = false;
+  uturnConsecutiveAllWhiteReadings = 0;
+  uturnLastDiagnosticMs = 0;
+  uturnPivotElapsedMs = 0;
   lineFollowEnabled = false;
   manualMovementActive = false;
   resetLineFollowConfirmation();
@@ -1648,30 +1670,75 @@ static bool isValidUturnSearchPattern() {
   return latestLineActiveCount >= 1 && latestLineActiveCount <= 3;
 }
 
+static void updateUturnOriginalLineClearance() {
+  if (uturnOriginalLineCleared) return;
+
+  if (latestLinePattern == 0x1F) {
+    if (uturnConsecutiveAllWhiteReadings < 255) {
+      uturnConsecutiveAllWhiteReadings++;
+    }
+    if (
+      uturnConsecutiveAllWhiteReadings >=
+      UTURN_ORIGINAL_LINE_CLEAR_READINGS
+    ) {
+      uturnOriginalLineCleared = true;
+    }
+  } else {
+    uturnConsecutiveAllWhiteReadings = 0;
+  }
+}
+
+static void printUturnDiagnostic(unsigned long now) {
+  if (
+    uturnLastDiagnosticMs != 0 &&
+    now - uturnLastDiagnosticMs < UTURN_DIAGNOSTIC_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  uturnLastDiagnosticMs = now;
+  Serial.print("UTURN_DIAG|STATE=");
+  Serial.print(intersectionNavigationStateName());
+  Serial.print("|ANGLE_DEG=");
+  Serial.print(intersectionTurnAngleDeg, 1);
+  Serial.print("|PATTERN=");
+  printLinePatternBits(latestLinePattern);
+  Serial.print("|ORIGINAL_LINE_CLEARED=");
+  Serial.print(uturnOriginalLineCleared ? 1 : 0);
+  Serial.print("|PIVOT_ELAPSED_MS=");
+  Serial.println(uturnPivotElapsedMs);
+}
+
 static void updateUturnNavigation(unsigned long now) {
-  if (now - uTurnStartedMs >= UTURN_MANEUVER_TIMEOUT_MS) {
+  if (now - uTurnStartedMs >= UTURN_TOTAL_TIMEOUT_MS) {
     failIntersectionNavigation();
     return;
   }
 
   if (intersectionNavigationState == INTERSECTION_UTURN_PIVOT_SEARCH) {
-    if (now - intersectionPhaseStartedMs >= UTURN_PIVOT_TIMEOUT_MS) {
-      failIntersectionNavigation();
-      return;
-    }
-
-    // The initial U-turn always pivots physical RIGHT. Sensor patterns are
-    // deliberately ignored until the gyro reaches the minimum search angle.
+    uturnPivotElapsedMs = now - intersectionPhaseStartedMs;
+    // The initial U-turn always pivots physical RIGHT. The original line must
+    // first clear for three all-white readings, and reacquisition remains
+    // disabled until the gyro reaches the minimum search angle.
     if (!updateIntersectionTurnAngle(now, false)) {
       failIntersectionNavigation();
       return;
     }
 
+    updateUturnOriginalLineClearance();
+    printUturnDiagnostic(now);
+
     if (
+      uturnOriginalLineCleared &&
       intersectionTurnAngleDeg >= UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG &&
       isValidUturnSearchPattern()
     ) {
       startSensorGuidedPivotAlignment(now);
+      return;
+    }
+
+    if (uturnPivotElapsedMs >= UTURN_PIVOT_TIMEOUT_MS) {
+      failIntersectionNavigation();
       return;
     }
 
@@ -1685,11 +1752,13 @@ static void updateUturnNavigation(unsigned long now) {
   }
 
   if (intersectionNavigationState == INTERSECTION_UTURN_SENSOR_ALIGN) {
+    printUturnDiagnostic(now);
     updateSensorGuidedPivotAlignment(now);
     return;
   }
 
   if (intersectionNavigationState == INTERSECTION_UTURN_LINE_LOCK) {
+    printUturnDiagnostic(now);
     updateLowSpeedLineLock(now);
   }
 }
