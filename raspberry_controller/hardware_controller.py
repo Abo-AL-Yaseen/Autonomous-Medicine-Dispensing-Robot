@@ -212,6 +212,12 @@ class SerialController:
             if not response:
                 continue
 
+            # Recovery diagnostics are asynchronous telemetry. In particular,
+            # they intentionally share the LINE prefix used by GET_LINE and
+            # must not be mistaken for a malformed sensor response.
+            if response.startswith("LINE|RECOVERY|"):
+                continue
+
             last_non_empty_response = response
             if response.startswith("ERROR|"):
                 raise UnexpectedSerialResponse(

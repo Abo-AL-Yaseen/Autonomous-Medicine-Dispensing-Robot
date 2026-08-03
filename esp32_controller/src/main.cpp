@@ -78,10 +78,38 @@ const uint8_t LINE_FOLLOW_MAX_CORRECTION = 50;
 const unsigned long LINE_FOLLOW_INTERVAL_MS = 25;
 const uint8_t LINE_INTERSECTION_MIN_SENSORS = 4;
 const uint8_t LINE_INTERSECTION_CONFIRM_READINGS = 3;
-const unsigned long LINE_SEARCH_PRIMARY_MS = 300;
-const unsigned long LINE_SEARCH_OPPOSITE_MS = 600;
-const uint8_t LINE_SEARCH_OUTER_PWM = 180;
-const uint8_t LINE_SEARCH_INNER_PWM = 0;
+const uint8_t LINE_LOST_CONFIRM_READINGS = 3;
+const unsigned long RECOVERY_BRAKE_MS = 80;
+const unsigned long RECOVERY_BACKTRACK_MS = 250;
+const uint8_t RECOVERY_BACKTRACK_PWM = 165;
+const uint8_t RECOVERY_SEARCH_PWM = 170;
+const unsigned long RECOVERY_TOTAL_TIMEOUT_MS = 12000;
+const uint8_t RECOVERY_MAX_SCAN_CYCLES = 2;
+const unsigned long RECOVERY_SECOND_BACKTRACK_MS = 200;
+const float RECOVERY_PRIMARY_HEADING_DEG = 35.0f;
+const float RECOVERY_OPPOSITE_HEADING_DEG = 60.0f;
+const float RECOVERY_EXPANDED_HEADING_DEG = 85.0f;
+const float RECOVERY_HEADING_TOLERANCE_DEG = 2.0f;
+const unsigned long RECOVERY_FALLBACK_SWEEP_MS[4] = {
+  800,
+  1600,
+  2400,
+  2800
+};
+const uint8_t RECOVERY_TRACK_BASE_PWM = 180;
+const uint8_t RECOVERY_TRACK_PIVOT_PWM = 165;
+const uint8_t RECOVERY_TRACK_PROPORTIONAL_GAIN = 25;
+const uint8_t RECOVERY_TRACK_MAX_CORRECTION = 35;
+const uint8_t RECOVERY_MIN_MOVING_PWM = 160;
+const unsigned long RECOVERY_CONTACT_VERIFY_TIMEOUT_MS = 700;
+const unsigned long RECOVERY_CONTACT_LOSS_GRACE_MS = 250;
+const uint8_t RECOVERY_WIDE_VERIFY_READINGS = 10;
+const unsigned long RECOVERY_WIDE_VERIFY_TIMEOUT_MS = 300;
+const uint8_t RECOVERY_WIDE_FORWARD_PWM = 165;
+const unsigned long RECOVERY_LINE_LOCK_MS = 450;
+const unsigned long RECOVERY_LOCK_LOSS_GRACE_MS = 150;
+const unsigned long RECOVERY_SAMPLE_INTERVAL_MS = 10;
+const unsigned long RECOVERY_DIAGNOSTIC_INTERVAL_MS = 250;
 
 // Conservative starting values for physical intersection tuning. Each phase
 // has its own deadline so a maneuver can never turn or drive indefinitely.
@@ -192,10 +220,30 @@ enum LineFollowState {
   LINE_FOLLOW_NAVIGATION_FAILED
 };
 
-enum LineSearchPhase {
-  LINE_SEARCH_INACTIVE,
-  LINE_SEARCH_PRIMARY,
-  LINE_SEARCH_OPPOSITE
+enum LineRecoveryState {
+  LINE_RECOVERY_INACTIVE,
+  LINE_RECOVERY_LOST_CONFIRM,
+  LINE_RECOVERY_BRAKE,
+  LINE_RECOVERY_BACKTRACK,
+  LINE_RECOVERY_GYRO_SEARCH,
+  LINE_RECOVERY_CONTACT_TRACK,
+  LINE_RECOVERY_WIDE_BLACK_VERIFY,
+  LINE_RECOVERY_LINE_LOCK,
+  LINE_RECOVERY_RETURN_TO_ORIGIN,
+  LINE_RECOVERY_FAILED
+};
+
+enum LineRecoverySide {
+  LINE_RECOVERY_SIDE_NONE,
+  LINE_RECOVERY_SIDE_LEFT,
+  LINE_RECOVERY_SIDE_RIGHT
+};
+
+enum LineRecoveryContactMotion {
+  LINE_RECOVERY_CONTACT_STOPPED,
+  LINE_RECOVERY_CONTACT_DIFFERENTIAL,
+  LINE_RECOVERY_CONTACT_PIVOT_LEFT,
+  LINE_RECOVERY_CONTACT_PIVOT_RIGHT
 };
 
 enum IntersectionDirection {
@@ -245,9 +293,43 @@ static uint8_t latestLineActiveCount = 0;
 static float latestLinePositionError = 0.0f;
 static float lastValidLinePositionError = 0.0f;
 static uint8_t consecutiveIntersectionReadings = 0;
-static LineSearchPhase lineSearchPhase = LINE_SEARCH_INACTIVE;
-static bool lineSearchPrimaryLeft = false;
-static unsigned long lineSearchPhaseStartedMs = 0;
+static LineRecoveryState lineRecoveryState = LINE_RECOVERY_INACTIVE;
+static LineRecoverySide lastNonZeroLineSide = LINE_RECOVERY_SIDE_NONE;
+static LineRecoverySide previousFailedRecoveryFirstSide =
+  LINE_RECOVERY_SIDE_NONE;
+static bool recoveryAlternatingDefaultLeft = true;
+static uint8_t recoveryLostReadings = 0;
+static LineRecoverySide recoveryPrimarySide = LINE_RECOVERY_SIDE_NONE;
+static LineRecoverySide recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+static unsigned long recoveryStartedMs = 0;
+static unsigned long lastRecoverySampleMs = 0;
+static unsigned long recoveryPhaseStartedMs = 0;
+static unsigned long recoveryBacktrackDurationMs = 0;
+static uint8_t recoveryScanCycle = 0;
+static uint8_t recoverySearchStage = 0;
+static unsigned long recoverySearchStageStartedMs = 0;
+static float recoveryRelativeHeadingDeg = 0.0f;
+static float recoveryTargetHeadingDeg = 0.0f;
+static unsigned long recoveryLastGyroUpdateMs = 0;
+static bool recoveryGyroInitialized = false;
+static bool recoveryGyroAvailable = true;
+static LineRecoveryState recoveryInterruptedState = LINE_RECOVERY_INACTIVE;
+static unsigned long recoveryInterruptedPhaseRemainingMs = 0;
+static unsigned long recoveryInterruptedSearchElapsedMs = 0;
+static unsigned long recoveryContactStartedMs = 0;
+static unsigned long recoveryContactLastSeenMs = 0;
+static uint8_t recoveryFirstContactMask = 0;
+static uint8_t recoveryContactSeenMask = 0;
+static float recoveryBestAbsoluteError = 0.0f;
+static bool recoveryContactProgress = false;
+static LineRecoveryContactMotion recoveryLastContactMotion =
+  LINE_RECOVERY_CONTACT_STOPPED;
+static uint8_t recoveryLastContactLeftPwm = 0;
+static uint8_t recoveryLastContactRightPwm = 0;
+static uint8_t recoveryWideConsecutiveReadings = 0;
+static unsigned long recoveryLineLockStartedMs = 0;
+static bool recoveryLineLockSawInnerSensor = false;
+static unsigned long recoveryLastDiagnosticMs = 0;
 static unsigned long lastLineFollowUpdateMs = 0;
 static bool intersectionNavigationActive = false;
 static bool intersectionCleared = false;
@@ -820,9 +902,38 @@ static void printLineFollowStatus() {
 }
 
 static void resetLineSearch() {
-  lineSearchPhase = LINE_SEARCH_INACTIVE;
-  lineSearchPrimaryLeft = false;
-  lineSearchPhaseStartedMs = 0;
+  lineRecoveryState = LINE_RECOVERY_INACTIVE;
+  recoveryLostReadings = 0;
+  recoveryPrimarySide = LINE_RECOVERY_SIDE_NONE;
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  recoveryStartedMs = 0;
+  lastRecoverySampleMs = 0;
+  recoveryPhaseStartedMs = 0;
+  recoveryBacktrackDurationMs = 0;
+  recoveryScanCycle = 0;
+  recoverySearchStage = 0;
+  recoverySearchStageStartedMs = 0;
+  recoveryRelativeHeadingDeg = 0.0f;
+  recoveryTargetHeadingDeg = 0.0f;
+  recoveryLastGyroUpdateMs = 0;
+  recoveryGyroInitialized = false;
+  recoveryGyroAvailable = true;
+  recoveryInterruptedState = LINE_RECOVERY_INACTIVE;
+  recoveryInterruptedPhaseRemainingMs = 0;
+  recoveryInterruptedSearchElapsedMs = 0;
+  recoveryContactStartedMs = 0;
+  recoveryContactLastSeenMs = 0;
+  recoveryFirstContactMask = 0;
+  recoveryContactSeenMask = 0;
+  recoveryBestAbsoluteError = 0.0f;
+  recoveryContactProgress = false;
+  recoveryLastContactMotion = LINE_RECOVERY_CONTACT_STOPPED;
+  recoveryLastContactLeftPwm = 0;
+  recoveryLastContactRightPwm = 0;
+  recoveryWideConsecutiveReadings = 0;
+  recoveryLineLockStartedMs = 0;
+  recoveryLineLockSawInnerSensor = false;
+  recoveryLastDiagnosticMs = 0;
 }
 
 static void resetLineFollowConfirmation() {
@@ -900,6 +1011,11 @@ void startLineFollowing() {
     latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS
       ? latestLinePositionError
       : 0.0f;
+  if (lastValidLinePositionError < -0.25f) {
+    lastNonZeroLineSide = LINE_RECOVERY_SIDE_LEFT;
+  } else if (lastValidLinePositionError > 0.25f) {
+    lastNonZeroLineSide = LINE_RECOVERY_SIDE_RIGHT;
+  }
   lineFollowState = LINE_FOLLOW_ACQUIRING;
   lineFollowEnabled = true;
   lastLineFollowUpdateMs = 0;
@@ -958,6 +1074,11 @@ static void driveProportionalLineAt(
 
 static void applyProportionalLineControl() {
   lastValidLinePositionError = latestLinePositionError;
+  if (latestLinePositionError < -0.25f) {
+    lastNonZeroLineSide = LINE_RECOVERY_SIDE_LEFT;
+  } else if (latestLinePositionError > 0.25f) {
+    lastNonZeroLineSide = LINE_RECOVERY_SIDE_RIGHT;
+  }
   if (latestLinePositionError < -0.1f) {
     lineFollowState = LINE_FOLLOW_CORRECTING_LEFT;
   } else if (latestLinePositionError > 0.1f) {
@@ -971,6 +1092,689 @@ static void applyProportionalLineControl() {
     LINE_FOLLOW_PROPORTIONAL_GAIN,
     LINE_FOLLOW_MAX_CORRECTION
   );
+}
+
+static const char* lineRecoveryStateName() {
+  switch (lineRecoveryState) {
+    case LINE_RECOVERY_INACTIVE: return "INACTIVE";
+    case LINE_RECOVERY_LOST_CONFIRM: return "LOST_CONFIRM";
+    case LINE_RECOVERY_BRAKE: return "BRAKE";
+    case LINE_RECOVERY_BACKTRACK: return "BACKTRACK";
+    case LINE_RECOVERY_GYRO_SEARCH: return "GYRO_SEARCH";
+    case LINE_RECOVERY_CONTACT_TRACK: return "CONTACT_TRACK";
+    case LINE_RECOVERY_WIDE_BLACK_VERIFY: return "WIDE_BLACK_VERIFY";
+    case LINE_RECOVERY_LINE_LOCK: return "LINE_LOCK";
+    case LINE_RECOVERY_RETURN_TO_ORIGIN: return "RETURN_TO_ORIGIN";
+    case LINE_RECOVERY_FAILED: return "FAILED";
+  }
+  return "UNKNOWN";
+}
+
+static uint8_t currentLineContactMask() {
+  uint8_t mask = 0;
+  for (uint8_t i = 0; i < LINE_SENSOR_COUNT; i++) {
+    if (lineDetected[i]) mask |= (uint8_t)(1U << i);
+  }
+  return mask;
+}
+
+static LineRecoverySide oppositeRecoverySide(LineRecoverySide side) {
+  if (side == LINE_RECOVERY_SIDE_LEFT) return LINE_RECOVERY_SIDE_RIGHT;
+  if (side == LINE_RECOVERY_SIDE_RIGHT) return LINE_RECOVERY_SIDE_LEFT;
+  return LINE_RECOVERY_SIDE_NONE;
+}
+
+static LineRecoverySide chooseRecoveryPrimarySide() {
+  if (lastNonZeroLineSide != LINE_RECOVERY_SIDE_NONE) {
+    return lastNonZeroLineSide;
+  }
+  if (previousFailedRecoveryFirstSide != LINE_RECOVERY_SIDE_NONE) {
+    return oppositeRecoverySide(previousFailedRecoveryFirstSide);
+  }
+
+  LineRecoverySide selected = recoveryAlternatingDefaultLeft
+    ? LINE_RECOVERY_SIDE_LEFT
+    : LINE_RECOVERY_SIDE_RIGHT;
+  recoveryAlternatingDefaultLeft = !recoveryAlternatingDefaultLeft;
+  return selected;
+}
+
+static void printLineRecoveryDiagnostic(unsigned long now) {
+  if (
+    recoveryLastDiagnosticMs != 0 &&
+    now - recoveryLastDiagnosticMs < RECOVERY_DIAGNOSTIC_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  recoveryLastDiagnosticMs = now;
+  Serial.print("LINE|RECOVERY|STATE=");
+  Serial.print(lineRecoveryStateName());
+  Serial.print("|PATTERN=");
+  printLinePatternBits(latestLinePattern);
+  Serial.print("|ERROR=");
+  Serial.print(latestLinePositionError, 2);
+  Serial.print("|ANGLE=");
+  Serial.print(recoveryRelativeHeadingDeg, 1);
+  Serial.print("|CYCLE=");
+  Serial.println((unsigned int)recoveryScanCycle + 1U);
+}
+
+static void updateRecoveryHeading(unsigned long now) {
+  if (!recoveryGyroInitialized) return;
+
+  if (recoveryLastGyroUpdateMs == 0) {
+    recoveryLastGyroUpdateMs = now;
+    return;
+  }
+
+  float deltaSeconds = (now - recoveryLastGyroUpdateMs) / 1000.0f;
+  recoveryLastGyroUpdateMs = now;
+  if (
+    recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_NONE ||
+    !recoveryGyroAvailable
+  ) {
+    return;
+  }
+
+  sensors_event_t acceleration, gyro, temperature;
+  if (!mpu.getEvent(&acceleration, &gyro, &temperature)) {
+    recoveryGyroAvailable = false;
+    return;
+  }
+
+  float angularSpeedDegPerSecond =
+    (gyro.gyro.x - gyroBiasX) * (180.0f / PI);
+  if (abs(angularSpeedDegPerSecond) <= GYRO_THRESHOLD) return;
+
+  float deltaAngle = abs(angularSpeedDegPerSecond) * deltaSeconds;
+  if (recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_LEFT) {
+    recoveryRelativeHeadingDeg -= deltaAngle;
+  } else {
+    recoveryRelativeHeadingDeg += deltaAngle;
+  }
+}
+
+static void failLineRecovery() {
+  lineRecoveryState = LINE_RECOVERY_FAILED;
+  if (recoveryPrimarySide != LINE_RECOVERY_SIDE_NONE) {
+    previousFailedRecoveryFirstSide = recoveryPrimarySide;
+  }
+  stopLineFollowingForEvent(LINE_FOLLOW_LINE_LOST, "LINE_LOST");
+}
+
+static void captureInterruptedRecovery(unsigned long now) {
+  recoveryInterruptedState = lineRecoveryState;
+  recoveryInterruptedPhaseRemainingMs = 0;
+  recoveryInterruptedSearchElapsedMs = 0;
+
+  if (lineRecoveryState == LINE_RECOVERY_BRAKE) {
+    unsigned long elapsed = now - recoveryPhaseStartedMs;
+    recoveryInterruptedPhaseRemainingMs = elapsed >= RECOVERY_BRAKE_MS
+      ? 0
+      : RECOVERY_BRAKE_MS - elapsed;
+  } else if (lineRecoveryState == LINE_RECOVERY_BACKTRACK) {
+    unsigned long elapsed = now - recoveryPhaseStartedMs;
+    recoveryInterruptedPhaseRemainingMs =
+      elapsed >= recoveryBacktrackDurationMs
+        ? 0
+        : recoveryBacktrackDurationMs - elapsed;
+  } else if (
+    lineRecoveryState == LINE_RECOVERY_GYRO_SEARCH ||
+    lineRecoveryState == LINE_RECOVERY_RETURN_TO_ORIGIN
+  ) {
+    recoveryInterruptedSearchElapsedMs = now - recoverySearchStageStartedMs;
+  }
+}
+
+static void setRecoveryContactDifferential(uint8_t leftPwm, uint8_t rightPwm) {
+  recoveryLastContactMotion = LINE_RECOVERY_CONTACT_DIFFERENTIAL;
+  recoveryLastContactLeftPwm = leftPwm;
+  recoveryLastContactRightPwm = rightPwm;
+  driveForwardDifferential(leftPwm, rightPwm);
+}
+
+static void setRecoveryContactPivot(LineRecoverySide physicalSide) {
+  recoveryLastContactLeftPwm = RECOVERY_TRACK_PIVOT_PWM;
+  recoveryLastContactRightPwm = RECOVERY_TRACK_PIVOT_PWM;
+  recoveryCommandedTurnSide = physicalSide;
+  if (physicalSide == LINE_RECOVERY_SIDE_LEFT) {
+    recoveryLastContactMotion = LINE_RECOVERY_CONTACT_PIVOT_LEFT;
+    lineFollowState = LINE_FOLLOW_CORRECTING_LEFT;
+    // On this chassis the helper name is inverted relative to physical motion.
+    turnRightInPlaceAt(RECOVERY_TRACK_PIVOT_PWM);
+  } else {
+    recoveryLastContactMotion = LINE_RECOVERY_CONTACT_PIVOT_RIGHT;
+    lineFollowState = LINE_FOLLOW_CORRECTING_RIGHT;
+    // On this chassis the helper name is inverted relative to physical motion.
+    turnLeftInPlaceAt(RECOVERY_TRACK_PIVOT_PWM);
+  }
+}
+
+static void applyRecoveryContactSteering() {
+  uint8_t contactMask = currentLineContactMask();
+  if (contactMask == 0x01) {
+    setRecoveryContactPivot(LINE_RECOVERY_SIDE_LEFT);
+    return;
+  }
+  if (contactMask == 0x10) {
+    setRecoveryContactPivot(LINE_RECOVERY_SIDE_RIGHT);
+    return;
+  }
+
+  if (latestLinePositionError <= -1.5f) {
+    setRecoveryContactPivot(LINE_RECOVERY_SIDE_LEFT);
+    return;
+  }
+  if (latestLinePositionError >= 1.5f) {
+    setRecoveryContactPivot(LINE_RECOVERY_SIDE_RIGHT);
+    return;
+  }
+
+  int correction = (int)roundf(
+    latestLinePositionError * RECOVERY_TRACK_PROPORTIONAL_GAIN
+  );
+  correction = constrain(
+    correction,
+    -(int)RECOVERY_TRACK_MAX_CORRECTION,
+    (int)RECOVERY_TRACK_MAX_CORRECTION
+  );
+  int leftPwm = constrain((int)RECOVERY_TRACK_BASE_PWM + correction, 0, 255);
+  int rightPwm = constrain((int)RECOVERY_TRACK_BASE_PWM - correction, 0, 255);
+  if (leftPwm > 0 && leftPwm < RECOVERY_MIN_MOVING_PWM) {
+    leftPwm = RECOVERY_MIN_MOVING_PWM;
+  }
+  if (rightPwm > 0 && rightPwm < RECOVERY_MIN_MOVING_PWM) {
+    rightPwm = RECOVERY_MIN_MOVING_PWM;
+  }
+
+  recoveryCommandedTurnSide = latestLinePositionError < -0.1f
+    ? LINE_RECOVERY_SIDE_LEFT
+    : (
+      latestLinePositionError > 0.1f
+        ? LINE_RECOVERY_SIDE_RIGHT
+        : LINE_RECOVERY_SIDE_NONE
+    );
+  lineFollowState = latestLinePositionError < -0.1f
+    ? LINE_FOLLOW_CORRECTING_LEFT
+    : (
+      latestLinePositionError > 0.1f
+        ? LINE_FOLLOW_CORRECTING_RIGHT
+        : LINE_FOLLOW_CENTERED
+    );
+  setRecoveryContactDifferential((uint8_t)leftPwm, (uint8_t)rightPwm);
+}
+
+static void applyLastRecoveryContactSteering() {
+  switch (recoveryLastContactMotion) {
+    case LINE_RECOVERY_CONTACT_DIFFERENTIAL:
+      driveForwardDifferential(
+        recoveryLastContactLeftPwm,
+        recoveryLastContactRightPwm
+      );
+      break;
+    case LINE_RECOVERY_CONTACT_PIVOT_LEFT:
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_LEFT;
+      turnRightInPlaceAt(RECOVERY_TRACK_PIVOT_PWM);
+      break;
+    case LINE_RECOVERY_CONTACT_PIVOT_RIGHT:
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_RIGHT;
+      turnLeftInPlaceAt(RECOVERY_TRACK_PIVOT_PWM);
+      break;
+    case LINE_RECOVERY_CONTACT_STOPPED:
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+      stopMotorOutputs();
+      break;
+  }
+}
+
+static float recoverySearchTargetForStage(uint8_t stage) {
+  float primarySign = recoveryPrimarySide == LINE_RECOVERY_SIDE_LEFT
+    ? -1.0f
+    : 1.0f;
+  switch (stage) {
+    case 0: return primarySign * RECOVERY_PRIMARY_HEADING_DEG;
+    case 1: return -primarySign * RECOVERY_OPPOSITE_HEADING_DEG;
+    case 2: return primarySign * RECOVERY_EXPANDED_HEADING_DEG;
+    case 3: return -primarySign * RECOVERY_EXPANDED_HEADING_DEG;
+    default: return 0.0f;
+  }
+}
+
+static void commandRecoverySearchMotion() {
+  if (recoveryGyroAvailable) {
+    float remaining = recoveryTargetHeadingDeg - recoveryRelativeHeadingDeg;
+    if (abs(remaining) <= RECOVERY_HEADING_TOLERANCE_DEG) {
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+      stopMotorOutputs();
+      return;
+    }
+    recoveryCommandedTurnSide = remaining < 0.0f
+      ? LINE_RECOVERY_SIDE_LEFT
+      : LINE_RECOVERY_SIDE_RIGHT;
+  } else {
+    bool primaryStage =
+      recoverySearchStage == 0 ||
+      recoverySearchStage == 2 ||
+      recoverySearchStage >= 4;
+    recoveryCommandedTurnSide = primaryStage
+      ? recoveryPrimarySide
+      : oppositeRecoverySide(recoveryPrimarySide);
+  }
+
+  if (recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_LEFT) {
+    lineFollowState = LINE_FOLLOW_SEARCHING_LEFT;
+    // Physical LEFT uses the right-named helper on this motor wiring.
+    turnRightInPlaceAt(RECOVERY_SEARCH_PWM);
+  } else {
+    lineFollowState = LINE_FOLLOW_SEARCHING_RIGHT;
+    // Physical RIGHT uses the left-named helper on this motor wiring.
+    turnLeftInPlaceAt(RECOVERY_SEARCH_PWM);
+  }
+}
+
+static void startRecoverySearchStage(unsigned long now, uint8_t stage) {
+  recoverySearchStage = stage;
+  recoveryTargetHeadingDeg = recoverySearchTargetForStage(stage);
+  recoverySearchStageStartedMs = now;
+  recoveryLastGyroUpdateMs = now;
+  lineRecoveryState = stage >= 4
+    ? LINE_RECOVERY_RETURN_TO_ORIGIN
+    : LINE_RECOVERY_GYRO_SEARCH;
+  commandRecoverySearchMotion();
+}
+
+static void startRecoveryBacktrack(unsigned long now, unsigned long durationMs) {
+  lineRecoveryState = LINE_RECOVERY_BACKTRACK;
+  recoveryPhaseStartedMs = now;
+  recoveryBacktrackDurationMs = durationMs;
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  lineFollowState = LINE_FOLLOW_ACQUIRING;
+  driveBackwardAt(RECOVERY_BACKTRACK_PWM);
+}
+
+static void resumeInterruptedRecovery(unsigned long now) {
+  LineRecoveryState resumeState = recoveryInterruptedState;
+  unsigned long remainingMs = recoveryInterruptedPhaseRemainingMs;
+  unsigned long searchElapsedMs = recoveryInterruptedSearchElapsedMs;
+  recoveryInterruptedState = LINE_RECOVERY_INACTIVE;
+  recoveryInterruptedPhaseRemainingMs = 0;
+  recoveryInterruptedSearchElapsedMs = 0;
+  recoveryLastGyroUpdateMs = now;
+
+  switch (resumeState) {
+    case LINE_RECOVERY_LOST_CONFIRM:
+      lineRecoveryState = LINE_RECOVERY_LOST_CONFIRM;
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+      stopMotorOutputs();
+      break;
+    case LINE_RECOVERY_BRAKE:
+      lineRecoveryState = LINE_RECOVERY_BRAKE;
+      recoveryPhaseStartedMs = now - (RECOVERY_BRAKE_MS - remainingMs);
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+      stopMotorOutputs();
+      break;
+    case LINE_RECOVERY_BACKTRACK:
+      startRecoveryBacktrack(now, remainingMs);
+      break;
+    case LINE_RECOVERY_GYRO_SEARCH:
+    case LINE_RECOVERY_RETURN_TO_ORIGIN:
+      lineRecoveryState = resumeState;
+      recoverySearchStageStartedMs = now - searchElapsedMs;
+      commandRecoverySearchMotion();
+      break;
+    default:
+      if (recoveryPrimarySide != LINE_RECOVERY_SIDE_NONE) {
+        startRecoverySearchStage(now, recoverySearchStage);
+      } else {
+        lineRecoveryState = LINE_RECOVERY_LOST_CONFIRM;
+        recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+        stopMotorOutputs();
+      }
+      break;
+  }
+}
+
+static void startRecoveryContactTrack(unsigned long now, bool preserveResume) {
+  if (!preserveResume) captureInterruptedRecovery(now);
+  lineRecoveryState = LINE_RECOVERY_CONTACT_TRACK;
+  recoveryContactStartedMs = now;
+  recoveryContactLastSeenMs = now;
+  recoveryFirstContactMask = currentLineContactMask();
+  recoveryContactSeenMask = recoveryFirstContactMask;
+  recoveryBestAbsoluteError = abs(latestLinePositionError);
+  recoveryContactProgress = lineDetected[2];
+  applyRecoveryContactSteering();
+}
+
+static void startRecoveryWideBlackVerify(unsigned long now, bool preserveResume) {
+  if (!preserveResume) captureInterruptedRecovery(now);
+  lineRecoveryState = LINE_RECOVERY_WIDE_BLACK_VERIFY;
+  recoveryPhaseStartedMs = now;
+  recoveryWideConsecutiveReadings = lineDetected[2] ? 1 : 0;
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  stopMotorOutputs();
+  driveForwardAt(RECOVERY_WIDE_FORWARD_PWM);
+}
+
+static void startRecoveryLineLock(unsigned long now) {
+  lineRecoveryState = LINE_RECOVERY_LINE_LOCK;
+  recoveryLineLockStartedMs = now;
+  recoveryContactLastSeenMs = now;
+  recoveryLineLockSawInnerSensor =
+    lineDetected[1] || lineDetected[2] || lineDetected[3];
+  applyRecoveryContactSteering();
+}
+
+static void updateRecoveryContactEvidence() {
+  uint8_t currentMask = currentLineContactMask();
+  recoveryContactSeenMask |= currentMask;
+
+  uint8_t adjacentMask = 0;
+  for (uint8_t i = 0; i < LINE_SENSOR_COUNT; i++) {
+    if ((recoveryFirstContactMask & (uint8_t)(1U << i)) == 0) continue;
+    if (i > 0) adjacentMask |= (uint8_t)(1U << (i - 1));
+    if (i + 1 < LINE_SENSOR_COUNT) {
+      adjacentMask |= (uint8_t)(1U << (i + 1));
+    }
+  }
+  adjacentMask &= (uint8_t)~recoveryFirstContactMask;
+  if ((recoveryContactSeenMask & adjacentMask) != 0) {
+    recoveryContactProgress = true;
+  }
+
+  float absoluteError = abs(latestLinePositionError);
+  if (absoluteError + 0.05f < recoveryBestAbsoluteError) {
+    recoveryContactProgress = true;
+  }
+  if (absoluteError < recoveryBestAbsoluteError) {
+    recoveryBestAbsoluteError = absoluteError;
+  }
+  if (lineDetected[2]) recoveryContactProgress = true;
+  if (
+    (recoveryFirstContactMask & 0x01) != 0 &&
+    (recoveryContactSeenMask & 0x06) != 0
+  ) {
+    recoveryContactProgress = true;
+  }
+  if (
+    (recoveryFirstContactMask & 0x10) != 0 &&
+    (recoveryContactSeenMask & 0x0C) != 0
+  ) {
+    recoveryContactProgress = true;
+  }
+}
+
+static bool handleImmediateRecoveryContact(unsigned long now) {
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryWideBlackVerify(now, false);
+    return true;
+  }
+  if (latestLineActiveCount > 0) {
+    startRecoveryContactTrack(now, false);
+    return true;
+  }
+  return false;
+}
+
+static void updateRecoveryLostConfirmation(unsigned long now) {
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryWideBlackVerify(now, false);
+    return;
+  }
+  if (latestLineActiveCount > 0) {
+    resetLineSearch();
+    consecutiveIntersectionReadings = 0;
+    lastLineFollowUpdateMs = now;
+    applyProportionalLineControl();
+    return;
+  }
+
+  if (recoveryLostReadings < 255) recoveryLostReadings++;
+  if (recoveryLostReadings < LINE_LOST_CONFIRM_READINGS) return;
+
+  recoveryPrimarySide = chooseRecoveryPrimarySide();
+  recoveryRelativeHeadingDeg = 0.0f;
+  recoveryTargetHeadingDeg = 0.0f;
+  recoveryGyroInitialized = true;
+  recoveryGyroAvailable = true;
+  recoveryLastGyroUpdateMs = now;
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  recoveryScanCycle = 0;
+  recoverySearchStage = 0;
+  lineRecoveryState = LINE_RECOVERY_BRAKE;
+  recoveryPhaseStartedMs = now;
+  lineFollowState = LINE_FOLLOW_ACQUIRING;
+  stopMotorOutputs();
+}
+
+static void updateRecoveryBrake(unsigned long now) {
+  if (handleImmediateRecoveryContact(now)) return;
+  if (now - recoveryPhaseStartedMs >= RECOVERY_BRAKE_MS) {
+    startRecoveryBacktrack(now, RECOVERY_BACKTRACK_MS);
+  } else {
+    recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+    stopMotorOutputs();
+  }
+}
+
+static void updateRecoveryBacktrack(unsigned long now) {
+  if (handleImmediateRecoveryContact(now)) return;
+  if (now - recoveryPhaseStartedMs >= recoveryBacktrackDurationMs) {
+    startRecoverySearchStage(now, 0);
+  } else {
+    recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+    driveBackwardAt(RECOVERY_BACKTRACK_PWM);
+  }
+}
+
+static bool recoverySearchTargetReached(unsigned long now) {
+  if (recoveryGyroAvailable) {
+    float remaining = recoveryTargetHeadingDeg - recoveryRelativeHeadingDeg;
+    if (abs(remaining) <= RECOVERY_HEADING_TOLERANCE_DEG) return true;
+    if (
+      recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_LEFT &&
+      recoveryRelativeHeadingDeg <= recoveryTargetHeadingDeg
+    ) {
+      return true;
+    }
+    if (
+      recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_RIGHT &&
+      recoveryRelativeHeadingDeg >= recoveryTargetHeadingDeg
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  uint8_t fallbackIndex = recoverySearchStage < 4
+    ? recoverySearchStage
+    : 3;
+  return now - recoverySearchStageStartedMs >=
+    RECOVERY_FALLBACK_SWEEP_MS[fallbackIndex];
+}
+
+static void finishRecoveryScanCycle(unsigned long now) {
+  if (recoveryScanCycle + 1U < RECOVERY_MAX_SCAN_CYCLES) {
+    recoveryScanCycle++;
+    startRecoveryBacktrack(now, RECOVERY_SECOND_BACKTRACK_MS);
+  } else {
+    failLineRecovery();
+  }
+}
+
+static void updateRecoverySearch(unsigned long now) {
+  if (handleImmediateRecoveryContact(now)) return;
+
+  if (!recoverySearchTargetReached(now)) {
+    commandRecoverySearchMotion();
+    return;
+  }
+
+  stopMotorOutputs();
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  if (lineRecoveryState == LINE_RECOVERY_RETURN_TO_ORIGIN) {
+    finishRecoveryScanCycle(now);
+  } else if (recoverySearchStage < 3) {
+    startRecoverySearchStage(now, recoverySearchStage + 1U);
+  } else {
+    startRecoverySearchStage(now, 4);
+  }
+}
+
+static void updateRecoveryContactTrack(unsigned long now) {
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryWideBlackVerify(now, true);
+    return;
+  }
+
+  if (latestLineActiveCount == 0) {
+    if (
+      now - recoveryContactLastSeenMs > RECOVERY_CONTACT_LOSS_GRACE_MS ||
+      now - recoveryContactStartedMs >= RECOVERY_CONTACT_VERIFY_TIMEOUT_MS
+    ) {
+      resumeInterruptedRecovery(now);
+    } else {
+      applyLastRecoveryContactSteering();
+    }
+    return;
+  }
+
+  recoveryContactLastSeenMs = now;
+  updateRecoveryContactEvidence();
+  applyRecoveryContactSteering();
+  if (recoveryContactProgress) {
+    startRecoveryLineLock(now);
+  } else if (
+    now - recoveryContactStartedMs >= RECOVERY_CONTACT_VERIFY_TIMEOUT_MS
+  ) {
+    resumeInterruptedRecovery(now);
+  }
+}
+
+static void updateRecoveryWideBlackVerify(unsigned long now) {
+  if (latestLineActiveCount == 0) {
+    resumeInterruptedRecovery(now);
+    return;
+  }
+  if (latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryContactTrack(now, true);
+    return;
+  }
+
+  if (lineDetected[2]) {
+    if (recoveryWideConsecutiveReadings < 255) {
+      recoveryWideConsecutiveReadings++;
+    }
+    if (
+      recoveryWideConsecutiveReadings >= RECOVERY_WIDE_VERIFY_READINGS
+    ) {
+      stopLineFollowingForEvent(LINE_FOLLOW_INTERSECTION, "INTERSECTION");
+      return;
+    }
+  } else {
+    recoveryWideConsecutiveReadings = 0;
+  }
+
+  if (now - recoveryPhaseStartedMs >= RECOVERY_WIDE_VERIFY_TIMEOUT_MS) {
+    resumeInterruptedRecovery(now);
+    return;
+  }
+
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  driveForwardAt(RECOVERY_WIDE_FORWARD_PWM);
+}
+
+static void completeLineRecovery(unsigned long now) {
+  resetLineSearch();
+  consecutiveIntersectionReadings = 0;
+  lastLineFollowUpdateMs = now;
+  applyProportionalLineControl();
+}
+
+static void updateRecoveryLineLock(unsigned long now) {
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryWideBlackVerify(now, true);
+    return;
+  }
+
+  if (latestLineActiveCount == 0) {
+    // A brief dropout keeps the last steering command, but it does not count
+    // toward the required continuous low-speed lock interval.
+    recoveryLineLockStartedMs = now;
+    if (
+      now - recoveryContactLastSeenMs > RECOVERY_LOCK_LOSS_GRACE_MS
+    ) {
+      resumeInterruptedRecovery(now);
+    } else {
+      applyLastRecoveryContactSteering();
+    }
+    return;
+  }
+
+  recoveryContactLastSeenMs = now;
+  recoveryLineLockSawInnerSensor =
+    recoveryLineLockSawInnerSensor ||
+    lineDetected[1] || lineDetected[2] || lineDetected[3];
+  applyRecoveryContactSteering();
+  if (now - recoveryLineLockStartedMs >= RECOVERY_LINE_LOCK_MS) {
+    if (recoveryLineLockSawInnerSensor) {
+      completeLineRecovery(now);
+    } else {
+      resumeInterruptedRecovery(now);
+    }
+  }
+}
+
+static void updateLineRecovery(unsigned long now) {
+  updateRecoveryHeading(now);
+  printLineRecoveryDiagnostic(now);
+
+  if (
+    recoveryStartedMs != 0 &&
+    now - recoveryStartedMs >= RECOVERY_TOTAL_TIMEOUT_MS
+  ) {
+    failLineRecovery();
+    return;
+  }
+
+  switch (lineRecoveryState) {
+    case LINE_RECOVERY_LOST_CONFIRM:
+      updateRecoveryLostConfirmation(now);
+      break;
+    case LINE_RECOVERY_BRAKE:
+      updateRecoveryBrake(now);
+      break;
+    case LINE_RECOVERY_BACKTRACK:
+      updateRecoveryBacktrack(now);
+      break;
+    case LINE_RECOVERY_GYRO_SEARCH:
+    case LINE_RECOVERY_RETURN_TO_ORIGIN:
+      updateRecoverySearch(now);
+      break;
+    case LINE_RECOVERY_CONTACT_TRACK:
+      updateRecoveryContactTrack(now);
+      break;
+    case LINE_RECOVERY_WIDE_BLACK_VERIFY:
+      updateRecoveryWideBlackVerify(now);
+      break;
+    case LINE_RECOVERY_LINE_LOCK:
+      updateRecoveryLineLock(now);
+      break;
+    case LINE_RECOVERY_FAILED:
+      failLineRecovery();
+      break;
+    case LINE_RECOVERY_INACTIVE:
+      break;
+  }
+}
+
+static void startLineLostConfirmation(unsigned long now) {
+  resetLineSearch();
+  lineRecoveryState = LINE_RECOVERY_LOST_CONFIRM;
+  recoveryLostReadings = 1;
+  recoveryStartedMs = now;
+  lastRecoverySampleMs = now;
 }
 
 static void driveIntersectionManeuver() {
@@ -1784,6 +2588,18 @@ void updateLineFollowing() {
   if (!lineFollowEnabled) return;
 
   unsigned long now = millis();
+  if (lineRecoveryState != LINE_RECOVERY_INACTIVE) {
+    unsigned long recoveryIntervalMs =
+      lineRecoveryState == LINE_RECOVERY_LOST_CONFIRM
+        ? LINE_FOLLOW_INTERVAL_MS
+        : RECOVERY_SAMPLE_INTERVAL_MS;
+    if (now - lastRecoverySampleMs < recoveryIntervalMs) return;
+    lastRecoverySampleMs = now;
+    sampleLineSensors();
+    updateLineRecovery(now);
+    return;
+  }
+
   if (now - lastLineFollowUpdateMs < LINE_FOLLOW_INTERVAL_MS) return;
   lastLineFollowUpdateMs = now;
 
@@ -1803,41 +2619,10 @@ void updateLineFollowing() {
 
   consecutiveIntersectionReadings = 0;
   if (latestLineActiveCount == 0) {
-    if (lineSearchPhase == LINE_SEARCH_INACTIVE) {
-      lineSearchPrimaryLeft = lastValidLinePositionError < 0.0f;
-      lineSearchPhase = LINE_SEARCH_PRIMARY;
-      lineSearchPhaseStartedMs = now;
-    }
-
-    bool searchLeft = lineSearchPrimaryLeft;
-    if (lineSearchPhase == LINE_SEARCH_PRIMARY) {
-      if (now - lineSearchPhaseStartedMs >= LINE_SEARCH_PRIMARY_MS) {
-        lineSearchPhase = LINE_SEARCH_OPPOSITE;
-        lineSearchPhaseStartedMs = now;
-        searchLeft = !lineSearchPrimaryLeft;
-      }
-    } else {
-      searchLeft = !lineSearchPrimaryLeft;
-      if (now - lineSearchPhaseStartedMs >= LINE_SEARCH_OPPOSITE_MS) {
-        stopLineFollowingForEvent(LINE_FOLLOW_LINE_LOST, "LINE_LOST");
-        return;
-      }
-    }
-
-    // Both search phases are forward-only strong arcs; the opposite sweep is
-    // longer so it crosses the original heading before checking the far side.
-    if (searchLeft) {
-      lineFollowState = LINE_FOLLOW_SEARCHING_LEFT;
-      driveForwardDifferential(LINE_SEARCH_INNER_PWM, LINE_SEARCH_OUTER_PWM);
-    } else {
-      lineFollowState = LINE_FOLLOW_SEARCHING_RIGHT;
-      driveForwardDifferential(LINE_SEARCH_OUTER_PWM, LINE_SEARCH_INNER_PWM);
-    }
+    startLineLostConfirmation(now);
     return;
   }
 
-  // Any reacquisition cancels both search phases and restores the
-  // normal proportional controller on this same update.
   resetLineSearch();
   applyProportionalLineControl();
 }

@@ -309,6 +309,27 @@ def test_async_line_event_is_skipped_before_valid_response() -> None:
     assert connection.writes == [b"GET_LINE\n"]
 
 
+def test_async_line_recovery_diagnostic_is_skipped_before_line_reading() -> None:
+    connection = FakeSerialConnection(
+        [
+            (
+                b"LINE|RECOVERY|STATE=GYRO_SEARCH|PATTERN=11111|"
+                b"ERROR=0.00|ANGLE=-22.5|CYCLE=1\n"
+            ),
+            b"LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011\n",
+        ]
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.get_line_reading().endswith("PATTERN=11011")
+    assert connection.writes == [b"GET_LINE\n"]
+
+
 def test_malformed_line_response_is_rejected() -> None:
     connection = FakeSerialConnection(
         [b"LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11111\n"]
