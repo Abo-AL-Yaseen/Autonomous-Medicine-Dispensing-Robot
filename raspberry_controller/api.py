@@ -177,6 +177,7 @@ def create_app(
                 "/navigation/intersection/left",
                 "/navigation/intersection/right",
                 "/navigation/intersection/straight",
+                "/navigation/u-turn",
                 "/docs",
             ],
         }
@@ -317,6 +318,14 @@ def create_app(
             request,
             "straight",
             lambda controller: controller.intersection_straight(),
+        )
+
+    @application.post("/navigation/u-turn")
+    def u_turn(request: Request) -> dict[str, object]:
+        return _navigation_response(
+            request,
+            "u-turn",
+            lambda controller: controller.u_turn(),
         )
 
     return application

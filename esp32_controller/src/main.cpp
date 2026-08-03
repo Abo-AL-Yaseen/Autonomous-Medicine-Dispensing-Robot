@@ -78,24 +78,79 @@ const uint8_t LINE_FOLLOW_MAX_CORRECTION = 50;
 const unsigned long LINE_FOLLOW_INTERVAL_MS = 25;
 const uint8_t LINE_INTERSECTION_MIN_SENSORS = 4;
 const uint8_t LINE_INTERSECTION_CONFIRM_READINGS = 3;
-const unsigned long LINE_SEARCH_PRIMARY_MS = 300;
-const unsigned long LINE_SEARCH_OPPOSITE_MS = 600;
-const uint8_t LINE_SEARCH_OUTER_PWM = 180;
-const uint8_t LINE_SEARCH_INNER_PWM = 0;
+const uint8_t LINE_LOST_CONFIRM_READINGS = 3;
+const unsigned long RECOVERY_BRAKE_MS = 80;
+const unsigned long RECOVERY_BACKTRACK_MS = 250;
+const uint8_t RECOVERY_BACKTRACK_PWM = 165;
+const uint8_t RECOVERY_SEARCH_PWM = 170;
+const unsigned long RECOVERY_TOTAL_TIMEOUT_MS = 12000;
+const uint8_t RECOVERY_MAX_SCAN_CYCLES = 2;
+const unsigned long RECOVERY_SECOND_BACKTRACK_MS = 200;
+const float RECOVERY_PRIMARY_HEADING_DEG = 35.0f;
+const float RECOVERY_OPPOSITE_HEADING_DEG = 60.0f;
+const float RECOVERY_EXPANDED_HEADING_DEG = 85.0f;
+const float RECOVERY_HEADING_TOLERANCE_DEG = 2.0f;
+const unsigned long RECOVERY_FALLBACK_SWEEP_MS[4] = {
+  800,
+  1600,
+  2400,
+  2800
+};
+const uint8_t RECOVERY_TRACK_BASE_PWM = 180;
+const uint8_t RECOVERY_TRACK_PIVOT_PWM = 165;
+const uint8_t RECOVERY_TRACK_PROPORTIONAL_GAIN = 25;
+const uint8_t RECOVERY_TRACK_MAX_CORRECTION = 35;
+const uint8_t RECOVERY_MIN_MOVING_PWM = 160;
+const unsigned long RECOVERY_CONTACT_VERIFY_TIMEOUT_MS = 700;
+const unsigned long RECOVERY_CONTACT_LOSS_GRACE_MS = 250;
+const uint8_t RECOVERY_WIDE_VERIFY_READINGS = 10;
+const unsigned long RECOVERY_WIDE_VERIFY_TIMEOUT_MS = 300;
+const uint8_t RECOVERY_WIDE_FORWARD_PWM = 165;
+const unsigned long RECOVERY_LINE_LOCK_MS = 450;
+const unsigned long RECOVERY_LOCK_LOSS_GRACE_MS = 150;
+const unsigned long RECOVERY_SAMPLE_INTERVAL_MS = 10;
+const unsigned long RECOVERY_DIAGNOSTIC_INTERVAL_MS = 250;
 
 // Conservative starting values for physical intersection tuning. Each phase
 // has its own deadline so a maneuver can never turn or drive indefinitely.
 const uint8_t INTERSECTION_STRAIGHT_PWM = 180;
-const uint8_t INTERSECTION_CENTER_PWM = 160;
-const unsigned long INTERSECTION_CENTER_MS = 200;
-const uint8_t INTERSECTION_PIVOT_PWM = 180;
-const float INTERSECTION_TURN_TARGET_DEG = 88.0f;
-const float INTERSECTION_MIN_ACQUIRE_ANGLE_DEG = 60.0f;
-const unsigned long INTERSECTION_TURN_TIMEOUT_MS = 2500;
-const uint8_t INTERSECTION_ACQUIRE_PWM = 160;
+const uint8_t INTERSECTION_CENTER_PWM = 210;
+// Time-based estimate for the approximately 20 cm sensor-to-rotation-center
+// offset. Calibrate physically in 100 ms increments.
+const unsigned long INTERSECTION_CENTER_MS = 1750;
+const uint8_t INTERSECTION_PIVOT_SEARCH_PWM = 170;
+const float INTERSECTION_SENSOR_SEARCH_MIN_ANGLE_DEG = 50.0f;
+const float INTERSECTION_PIVOT_MAX_ANGLE_DEG = 320.0f;
+const unsigned long INTERSECTION_PIVOT_TIMEOUT_MS = 10500;
+const uint8_t INTERSECTION_SENSOR_ALIGN_PWM = 170;
+const unsigned long INTERSECTION_SENSOR_ALIGN_TIMEOUT_MS = 5000;
+const unsigned long INTERSECTION_SENSOR_LOSS_GRACE_MS = 500;
+const uint8_t INTERSECTION_WIDE_CLEAR_CONFIRM_READINGS = 3;
+const uint8_t INTERSECTION_SENSOR_CENTER_CONFIRM_READINGS = 5;
+const uint8_t INTERSECTION_LOCK_PWM = 110;
+const uint8_t INTERSECTION_LOCK_PROPORTIONAL_GAIN = 35;
+const uint8_t INTERSECTION_LOCK_MAX_CORRECTION = 70;
+const unsigned long INTERSECTION_LOCK_MS = 500;
+const unsigned long INTERSECTION_LOCK_TIMEOUT_MS = 2000;
+const uint8_t INTERSECTION_REACQUIRE_PWM = 140;
+const unsigned long INTERSECTION_REACQUIRE_MS = 1200;
 const unsigned long INTERSECTION_CLEAR_TIMEOUT_MS = 1500;
 const unsigned long INTERSECTION_ACQUIRE_TIMEOUT_MS = 2500;
 const uint8_t INTERSECTION_LINE_CONFIRM_READINGS = 3;
+
+// Initial bounded calibration for a manually requested U-turn. The fast
+// physical-right pivot must clear the original line before sensor reacquisition
+// is allowed, then the existing alignment and line-lock controllers take over.
+const uint8_t UTURN_PIVOT_PWM = 180;
+const float UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG = 90.0f;
+const float UTURN_MAX_ANGLE_DEG = 320.0f;
+const unsigned long UTURN_PIVOT_TIMEOUT_MS = 22000;
+const uint8_t UTURN_SENSOR_ALIGN_PWM = 160;
+const unsigned long UTURN_SENSOR_ALIGN_TIMEOUT_MS = 6000;
+const unsigned long UTURN_SENSOR_LOSS_GRACE_MS = 500;
+const unsigned long UTURN_TOTAL_TIMEOUT_MS = 35000;
+const uint8_t UTURN_ORIGINAL_LINE_CLEAR_READINGS = 3;
+const unsigned long UTURN_DIAGNOSTIC_INTERVAL_MS = 250;
 
 // MH Real Time Clock Module 2 / DS1302-style 3-wire RTC wiring:
 // VCC -> ESP32 3V3, GND -> GND, CLK -> GPIO33, DAT -> GPIO32, RST -> GPIO19.
@@ -165,17 +220,38 @@ enum LineFollowState {
   LINE_FOLLOW_NAVIGATION_FAILED
 };
 
-enum LineSearchPhase {
-  LINE_SEARCH_INACTIVE,
-  LINE_SEARCH_PRIMARY,
-  LINE_SEARCH_OPPOSITE
+enum LineRecoveryState {
+  LINE_RECOVERY_INACTIVE,
+  LINE_RECOVERY_LOST_CONFIRM,
+  LINE_RECOVERY_BRAKE,
+  LINE_RECOVERY_BACKTRACK,
+  LINE_RECOVERY_GYRO_SEARCH,
+  LINE_RECOVERY_CONTACT_TRACK,
+  LINE_RECOVERY_WIDE_BLACK_VERIFY,
+  LINE_RECOVERY_LINE_LOCK,
+  LINE_RECOVERY_RETURN_TO_ORIGIN,
+  LINE_RECOVERY_FAILED
+};
+
+enum LineRecoverySide {
+  LINE_RECOVERY_SIDE_NONE,
+  LINE_RECOVERY_SIDE_LEFT,
+  LINE_RECOVERY_SIDE_RIGHT
+};
+
+enum LineRecoveryContactMotion {
+  LINE_RECOVERY_CONTACT_STOPPED,
+  LINE_RECOVERY_CONTACT_DIFFERENTIAL,
+  LINE_RECOVERY_CONTACT_PIVOT_LEFT,
+  LINE_RECOVERY_CONTACT_PIVOT_RIGHT
 };
 
 enum IntersectionDirection {
   INTERSECTION_DIRECTION_NONE,
   INTERSECTION_DIRECTION_LEFT,
   INTERSECTION_DIRECTION_RIGHT,
-  INTERSECTION_DIRECTION_STRAIGHT
+  INTERSECTION_DIRECTION_STRAIGHT,
+  INTERSECTION_DIRECTION_U_TURN
 };
 
 enum IntersectionNavigationState {
@@ -183,9 +259,18 @@ enum IntersectionNavigationState {
   INTERSECTION_GOING_STRAIGHT,
   INTERSECTION_CENTERING_LEFT,
   INTERSECTION_CENTERING_RIGHT,
-  INTERSECTION_PIVOTING_LEFT,
-  INTERSECTION_PIVOTING_RIGHT,
-  INTERSECTION_ACQUIRING_LINE
+  INTERSECTION_PIVOT_SEARCH_LEFT,
+  INTERSECTION_PIVOT_SEARCH_RIGHT,
+  INTERSECTION_SENSOR_ALIGN_LEFT,
+  INTERSECTION_SENSOR_ALIGN_RIGHT,
+  INTERSECTION_LOCKING_LINE_LEFT,
+  INTERSECTION_LOCKING_LINE_RIGHT,
+  INTERSECTION_REACQUIRING_LEFT,
+  INTERSECTION_REACQUIRING_RIGHT,
+  INTERSECTION_ACQUIRING_LINE,
+  INTERSECTION_UTURN_PIVOT_SEARCH,
+  INTERSECTION_UTURN_SENSOR_ALIGN,
+  INTERSECTION_UTURN_LINE_LOCK
 };
 
 static bool autoModeEnabled = false;
@@ -208,9 +293,43 @@ static uint8_t latestLineActiveCount = 0;
 static float latestLinePositionError = 0.0f;
 static float lastValidLinePositionError = 0.0f;
 static uint8_t consecutiveIntersectionReadings = 0;
-static LineSearchPhase lineSearchPhase = LINE_SEARCH_INACTIVE;
-static bool lineSearchPrimaryLeft = false;
-static unsigned long lineSearchPhaseStartedMs = 0;
+static LineRecoveryState lineRecoveryState = LINE_RECOVERY_INACTIVE;
+static LineRecoverySide lastNonZeroLineSide = LINE_RECOVERY_SIDE_NONE;
+static LineRecoverySide previousFailedRecoveryFirstSide =
+  LINE_RECOVERY_SIDE_NONE;
+static bool recoveryAlternatingDefaultLeft = true;
+static uint8_t recoveryLostReadings = 0;
+static LineRecoverySide recoveryPrimarySide = LINE_RECOVERY_SIDE_NONE;
+static LineRecoverySide recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+static unsigned long recoveryStartedMs = 0;
+static unsigned long lastRecoverySampleMs = 0;
+static unsigned long recoveryPhaseStartedMs = 0;
+static unsigned long recoveryBacktrackDurationMs = 0;
+static uint8_t recoveryScanCycle = 0;
+static uint8_t recoverySearchStage = 0;
+static unsigned long recoverySearchStageStartedMs = 0;
+static float recoveryRelativeHeadingDeg = 0.0f;
+static float recoveryTargetHeadingDeg = 0.0f;
+static unsigned long recoveryLastGyroUpdateMs = 0;
+static bool recoveryGyroInitialized = false;
+static bool recoveryGyroAvailable = true;
+static LineRecoveryState recoveryInterruptedState = LINE_RECOVERY_INACTIVE;
+static unsigned long recoveryInterruptedPhaseRemainingMs = 0;
+static unsigned long recoveryInterruptedSearchElapsedMs = 0;
+static unsigned long recoveryContactStartedMs = 0;
+static unsigned long recoveryContactLastSeenMs = 0;
+static uint8_t recoveryFirstContactMask = 0;
+static uint8_t recoveryContactSeenMask = 0;
+static float recoveryBestAbsoluteError = 0.0f;
+static bool recoveryContactProgress = false;
+static LineRecoveryContactMotion recoveryLastContactMotion =
+  LINE_RECOVERY_CONTACT_STOPPED;
+static uint8_t recoveryLastContactLeftPwm = 0;
+static uint8_t recoveryLastContactRightPwm = 0;
+static uint8_t recoveryWideConsecutiveReadings = 0;
+static unsigned long recoveryLineLockStartedMs = 0;
+static bool recoveryLineLockSawInnerSensor = false;
+static unsigned long recoveryLastDiagnosticMs = 0;
 static unsigned long lastLineFollowUpdateMs = 0;
 static bool intersectionNavigationActive = false;
 static bool intersectionCleared = false;
@@ -221,6 +340,17 @@ static unsigned long intersectionPhaseStartedMs = 0;
 static uint8_t consecutiveOutgoingLineReadings = 0;
 static float intersectionTurnAngleDeg = 0.0f;
 static unsigned long intersectionLastGyroUpdateMs = 0;
+static bool intersectionAlignmentPivotLeft = false;
+static unsigned long intersectionLastLineSeenMs = 0;
+static bool intersectionWideBlackCleared = false;
+static uint8_t consecutiveIntersectionWideClearReadings = 0;
+static unsigned long intersectionLockStableStartedMs = 0;
+static float intersectionLastLockError = 0.0f;
+static unsigned long uTurnStartedMs = 0;
+static bool uturnOriginalLineCleared = false;
+static uint8_t uturnConsecutiveAllWhiteReadings = 0;
+static unsigned long uturnLastDiagnosticMs = 0;
+static unsigned long uturnPivotElapsedMs = 0;
 
 static bool irCurrentRawDetected = false;
 static bool irLastRawDetected = false;
@@ -231,6 +361,7 @@ static unsigned long irDebounceStartedMs = 0;
 const size_t SERIAL_COMMAND_BUFFER_SIZE = 64;
 const unsigned long SERIAL_PENDING_P_TIMEOUT_MS = 125;
 const unsigned long SERIAL_PENDING_S_TIMEOUT_MS = 20;
+const unsigned long SERIAL_PENDING_U_TIMEOUT_MS = 20;
 static char serialCommandBuffer[SERIAL_COMMAND_BUFFER_SIZE];
 static size_t serialCommandLength = 0;
 static bool serialCommandOverflow = false;
@@ -239,6 +370,8 @@ static bool serialPendingP = false;
 static unsigned long serialPendingPStartedMs = 0;
 static bool serialPendingS = false;
 static unsigned long serialPendingSStartedMs = 0;
+static bool serialPendingU = false;
+static unsigned long serialPendingUStartedMs = 0;
 
 enum SerialInputResult {
   SERIAL_INPUT_INCOMPLETE,
@@ -275,10 +408,11 @@ void handleTextCommand(const String& command);
 static bool isLegacyCommand(char command);
 static void disableLineFollowing(LineFollowState nextState);
 static void cancelIntersectionNavigation();
+static void startUturnNavigation();
 
 // Hardware keys execute immediately. Text commands remain newline-terminated,
-// while P/S are held briefly so PING and ST... text lines are not mistaken
-// for the pump or emergency-stop legacy keys.
+// while P/S/U are held briefly so PING, ST..., and U_TURN text lines are not
+// mistaken for the pump, emergency-stop, or ultrasonic legacy keys.
 static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
   while (Serial.available() > 0) {
     char incoming = (char)Serial.read();
@@ -361,6 +495,28 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
       return SERIAL_INPUT_LEGACY_READY;
     }
 
+    if (serialPendingU) {
+      if (incoming == '\r' || incoming == '\n') {
+        serialPendingU = false;
+        legacyCommand = 'U';
+        return SERIAL_INPUT_LEGACY_READY;
+      }
+
+      if (incoming == '_') {
+        serialPendingU = false;
+        serialTextMode = true;
+        serialCommandLength = 0;
+        serialCommandBuffer[serialCommandLength++] = 'U';
+        serialCommandBuffer[serialCommandLength++] = incoming;
+        continue;
+      }
+
+      // A non-text character following U preserves the ultrasonic shortcut.
+      serialPendingU = false;
+      legacyCommand = 'U';
+      return SERIAL_INPUT_LEGACY_READY;
+    }
+
     if (incoming == '\r' || incoming == '\n' || incoming == ' ' || incoming == '\t') {
       continue;
     }
@@ -374,6 +530,12 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
     if ((char)toupper((unsigned char)incoming) == 'S') {
       serialPendingS = true;
       serialPendingSStartedMs = millis();
+      continue;
+    }
+
+    if ((char)toupper((unsigned char)incoming) == 'U') {
+      serialPendingU = true;
+      serialPendingUStartedMs = millis();
       continue;
     }
 
@@ -396,6 +558,12 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
   if (serialPendingS && millis() - serialPendingSStartedMs >= SERIAL_PENDING_S_TIMEOUT_MS) {
     serialPendingS = false;
     legacyCommand = 'S';
+    return SERIAL_INPUT_LEGACY_READY;
+  }
+
+  if (serialPendingU && millis() - serialPendingUStartedMs >= SERIAL_PENDING_U_TIMEOUT_MS) {
+    serialPendingU = false;
+    legacyCommand = 'U';
     return SERIAL_INPUT_LEGACY_READY;
   }
 
@@ -436,6 +604,7 @@ static bool interruptionRequested() {
     char command = (char)toupper((unsigned char)receivedLine.charAt(0));
     bool startLineFollowCommand = receivedLine == "START_LINE_FOLLOW";
     bool stopLineFollowCommand = receivedLine == "STOP_LINE_FOLLOW";
+    bool uTurnCommand = receivedLine == "U_TURN";
     stopAllOutputs();
     cancelIntersectionNavigation();
     disableLineFollowing(LINE_FOLLOW_IDLE);
@@ -449,6 +618,9 @@ static bool interruptionRequested() {
     } else if (startLineFollowCommand) {
       startLineFollowing();
       lcdShowStatus("Line Follow", "Started");
+    } else if (uTurnCommand) {
+      lcdShowStatus("Action Active", "U-turn Rejected");
+      Serial.println("ERROR|MANEUVER_ACTIVE");
     } else {
       lcdShowStatus("Action Cancelled", "Outputs Off");
       Serial.print("Action cancelled by command \"");
@@ -676,6 +848,7 @@ static const char* intersectionDirectionName(IntersectionDirection direction) {
     case INTERSECTION_DIRECTION_LEFT: return "LEFT";
     case INTERSECTION_DIRECTION_RIGHT: return "RIGHT";
     case INTERSECTION_DIRECTION_STRAIGHT: return "STRAIGHT";
+    case INTERSECTION_DIRECTION_U_TURN: return "U_TURN";
     case INTERSECTION_DIRECTION_NONE: return "NONE";
   }
   return "NONE";
@@ -686,13 +859,23 @@ static const char* intersectionNavigationStateName() {
     case INTERSECTION_GOING_STRAIGHT: return "GOING_STRAIGHT";
     case INTERSECTION_CENTERING_LEFT: return "CENTERING_LEFT";
     case INTERSECTION_CENTERING_RIGHT: return "CENTERING_RIGHT";
-    case INTERSECTION_PIVOTING_LEFT: return "PIVOTING_LEFT";
-    case INTERSECTION_PIVOTING_RIGHT: return "PIVOTING_RIGHT";
+    case INTERSECTION_PIVOT_SEARCH_LEFT: return "PIVOT_SEARCH_LEFT";
+    case INTERSECTION_PIVOT_SEARCH_RIGHT: return "PIVOT_SEARCH_RIGHT";
+    case INTERSECTION_SENSOR_ALIGN_LEFT: return "SENSOR_ALIGN_LEFT";
+    case INTERSECTION_SENSOR_ALIGN_RIGHT: return "SENSOR_ALIGN_RIGHT";
+    case INTERSECTION_LOCKING_LINE_LEFT: return "LOCKING_LINE_LEFT";
+    case INTERSECTION_LOCKING_LINE_RIGHT: return "LOCKING_LINE_RIGHT";
+    case INTERSECTION_REACQUIRING_LEFT: return "REACQUIRING_LEFT";
+    case INTERSECTION_REACQUIRING_RIGHT: return "REACQUIRING_RIGHT";
+    case INTERSECTION_UTURN_PIVOT_SEARCH: return "UTURN_PIVOT_SEARCH";
+    case INTERSECTION_UTURN_SENSOR_ALIGN: return "UTURN_SENSOR_ALIGN";
+    case INTERSECTION_UTURN_LINE_LOCK: return "UTURN_LINE_LOCK";
     case INTERSECTION_ACQUIRING_LINE:
       switch (intersectionDirection) {
         case INTERSECTION_DIRECTION_LEFT: return "ACQUIRING_LEFT";
         case INTERSECTION_DIRECTION_RIGHT: return "ACQUIRING_RIGHT";
         case INTERSECTION_DIRECTION_STRAIGHT: return "ACQUIRING_STRAIGHT";
+        case INTERSECTION_DIRECTION_U_TURN: return "UTURN_PIVOT_SEARCH";
         case INTERSECTION_DIRECTION_NONE: return "ACQUIRING_LINE";
       }
     case INTERSECTION_NAVIGATION_INACTIVE: return "INACTIVE";
@@ -719,9 +902,38 @@ static void printLineFollowStatus() {
 }
 
 static void resetLineSearch() {
-  lineSearchPhase = LINE_SEARCH_INACTIVE;
-  lineSearchPrimaryLeft = false;
-  lineSearchPhaseStartedMs = 0;
+  lineRecoveryState = LINE_RECOVERY_INACTIVE;
+  recoveryLostReadings = 0;
+  recoveryPrimarySide = LINE_RECOVERY_SIDE_NONE;
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  recoveryStartedMs = 0;
+  lastRecoverySampleMs = 0;
+  recoveryPhaseStartedMs = 0;
+  recoveryBacktrackDurationMs = 0;
+  recoveryScanCycle = 0;
+  recoverySearchStage = 0;
+  recoverySearchStageStartedMs = 0;
+  recoveryRelativeHeadingDeg = 0.0f;
+  recoveryTargetHeadingDeg = 0.0f;
+  recoveryLastGyroUpdateMs = 0;
+  recoveryGyroInitialized = false;
+  recoveryGyroAvailable = true;
+  recoveryInterruptedState = LINE_RECOVERY_INACTIVE;
+  recoveryInterruptedPhaseRemainingMs = 0;
+  recoveryInterruptedSearchElapsedMs = 0;
+  recoveryContactStartedMs = 0;
+  recoveryContactLastSeenMs = 0;
+  recoveryFirstContactMask = 0;
+  recoveryContactSeenMask = 0;
+  recoveryBestAbsoluteError = 0.0f;
+  recoveryContactProgress = false;
+  recoveryLastContactMotion = LINE_RECOVERY_CONTACT_STOPPED;
+  recoveryLastContactLeftPwm = 0;
+  recoveryLastContactRightPwm = 0;
+  recoveryWideConsecutiveReadings = 0;
+  recoveryLineLockStartedMs = 0;
+  recoveryLineLockSawInnerSensor = false;
+  recoveryLastDiagnosticMs = 0;
 }
 
 static void resetLineFollowConfirmation() {
@@ -738,6 +950,17 @@ static void cancelIntersectionNavigation() {
   consecutiveOutgoingLineReadings = 0;
   intersectionTurnAngleDeg = 0.0f;
   intersectionLastGyroUpdateMs = 0;
+  intersectionAlignmentPivotLeft = false;
+  intersectionLastLineSeenMs = 0;
+  intersectionWideBlackCleared = false;
+  consecutiveIntersectionWideClearReadings = 0;
+  intersectionLockStableStartedMs = 0;
+  intersectionLastLockError = 0.0f;
+  uTurnStartedMs = 0;
+  uturnOriginalLineCleared = false;
+  uturnConsecutiveAllWhiteReadings = 0;
+  uturnLastDiagnosticMs = 0;
+  uturnPivotElapsedMs = 0;
 }
 
 static void disableLineFollowing(LineFollowState nextState) {
@@ -788,6 +1011,11 @@ void startLineFollowing() {
     latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS
       ? latestLinePositionError
       : 0.0f;
+  if (lastValidLinePositionError < -0.25f) {
+    lastNonZeroLineSide = LINE_RECOVERY_SIDE_LEFT;
+  } else if (lastValidLinePositionError > 0.25f) {
+    lastNonZeroLineSide = LINE_RECOVERY_SIDE_RIGHT;
+  }
   lineFollowState = LINE_FOLLOW_ACQUIRING;
   lineFollowEnabled = true;
   lastLineFollowUpdateMs = 0;
@@ -802,28 +1030,55 @@ void stopLineFollowing() {
   Serial.println("ACK|LINE_FOLLOW_STOPPED");
 }
 
-static void applyProportionalLineControl() {
-  lastValidLinePositionError = latestLinePositionError;
+static void driveProportionalErrorAt(
+  float positionError,
+  uint8_t basePwm,
+  uint8_t proportionalGain,
+  uint8_t maxCorrection
+) {
   int correction = (int)roundf(
-    latestLinePositionError * LINE_FOLLOW_PROPORTIONAL_GAIN
+    positionError * proportionalGain
   );
   correction = constrain(
     correction,
-    -(int)LINE_FOLLOW_MAX_CORRECTION,
-    (int)LINE_FOLLOW_MAX_CORRECTION
+    -(int)maxCorrection,
+    (int)maxCorrection
   );
 
   int leftPwm = constrain(
-    (int)LINE_FOLLOW_BASE_PWM + correction,
+    (int)basePwm + correction,
     0,
     255
   );
   int rightPwm = constrain(
-    (int)LINE_FOLLOW_BASE_PWM - correction,
+    (int)basePwm - correction,
     0,
     255
   );
 
+  driveForwardDifferential((uint8_t)leftPwm, (uint8_t)rightPwm);
+}
+
+static void driveProportionalLineAt(
+  uint8_t basePwm,
+  uint8_t proportionalGain,
+  uint8_t maxCorrection
+) {
+  driveProportionalErrorAt(
+    latestLinePositionError,
+    basePwm,
+    proportionalGain,
+    maxCorrection
+  );
+}
+
+static void applyProportionalLineControl() {
+  lastValidLinePositionError = latestLinePositionError;
+  if (latestLinePositionError < -0.25f) {
+    lastNonZeroLineSide = LINE_RECOVERY_SIDE_LEFT;
+  } else if (latestLinePositionError > 0.25f) {
+    lastNonZeroLineSide = LINE_RECOVERY_SIDE_RIGHT;
+  }
   if (latestLinePositionError < -0.1f) {
     lineFollowState = LINE_FOLLOW_CORRECTING_LEFT;
   } else if (latestLinePositionError > 0.1f) {
@@ -832,7 +1087,694 @@ static void applyProportionalLineControl() {
     lineFollowState = LINE_FOLLOW_CENTERED;
   }
 
-  driveForwardDifferential((uint8_t)leftPwm, (uint8_t)rightPwm);
+  driveProportionalLineAt(
+    LINE_FOLLOW_BASE_PWM,
+    LINE_FOLLOW_PROPORTIONAL_GAIN,
+    LINE_FOLLOW_MAX_CORRECTION
+  );
+}
+
+static const char* lineRecoveryStateName() {
+  switch (lineRecoveryState) {
+    case LINE_RECOVERY_INACTIVE: return "INACTIVE";
+    case LINE_RECOVERY_LOST_CONFIRM: return "LOST_CONFIRM";
+    case LINE_RECOVERY_BRAKE: return "BRAKE";
+    case LINE_RECOVERY_BACKTRACK: return "BACKTRACK";
+    case LINE_RECOVERY_GYRO_SEARCH: return "GYRO_SEARCH";
+    case LINE_RECOVERY_CONTACT_TRACK: return "CONTACT_TRACK";
+    case LINE_RECOVERY_WIDE_BLACK_VERIFY: return "WIDE_BLACK_VERIFY";
+    case LINE_RECOVERY_LINE_LOCK: return "LINE_LOCK";
+    case LINE_RECOVERY_RETURN_TO_ORIGIN: return "RETURN_TO_ORIGIN";
+    case LINE_RECOVERY_FAILED: return "FAILED";
+  }
+  return "UNKNOWN";
+}
+
+static uint8_t currentLineContactMask() {
+  uint8_t mask = 0;
+  for (uint8_t i = 0; i < LINE_SENSOR_COUNT; i++) {
+    if (lineDetected[i]) mask |= (uint8_t)(1U << i);
+  }
+  return mask;
+}
+
+static LineRecoverySide oppositeRecoverySide(LineRecoverySide side) {
+  if (side == LINE_RECOVERY_SIDE_LEFT) return LINE_RECOVERY_SIDE_RIGHT;
+  if (side == LINE_RECOVERY_SIDE_RIGHT) return LINE_RECOVERY_SIDE_LEFT;
+  return LINE_RECOVERY_SIDE_NONE;
+}
+
+static LineRecoverySide chooseRecoveryPrimarySide() {
+  if (lastNonZeroLineSide != LINE_RECOVERY_SIDE_NONE) {
+    return lastNonZeroLineSide;
+  }
+  if (previousFailedRecoveryFirstSide != LINE_RECOVERY_SIDE_NONE) {
+    return oppositeRecoverySide(previousFailedRecoveryFirstSide);
+  }
+
+  LineRecoverySide selected = recoveryAlternatingDefaultLeft
+    ? LINE_RECOVERY_SIDE_LEFT
+    : LINE_RECOVERY_SIDE_RIGHT;
+  recoveryAlternatingDefaultLeft = !recoveryAlternatingDefaultLeft;
+  return selected;
+}
+
+static void printLineRecoveryDiagnostic(unsigned long now) {
+  if (
+    recoveryLastDiagnosticMs != 0 &&
+    now - recoveryLastDiagnosticMs < RECOVERY_DIAGNOSTIC_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  recoveryLastDiagnosticMs = now;
+  Serial.print("LINE|RECOVERY|STATE=");
+  Serial.print(lineRecoveryStateName());
+  Serial.print("|PATTERN=");
+  printLinePatternBits(latestLinePattern);
+  Serial.print("|ERROR=");
+  Serial.print(latestLinePositionError, 2);
+  Serial.print("|ANGLE=");
+  Serial.print(recoveryRelativeHeadingDeg, 1);
+  Serial.print("|CYCLE=");
+  Serial.println((unsigned int)recoveryScanCycle + 1U);
+}
+
+static void updateRecoveryHeading(unsigned long now) {
+  if (!recoveryGyroInitialized) return;
+
+  if (recoveryLastGyroUpdateMs == 0) {
+    recoveryLastGyroUpdateMs = now;
+    return;
+  }
+
+  float deltaSeconds = (now - recoveryLastGyroUpdateMs) / 1000.0f;
+  recoveryLastGyroUpdateMs = now;
+  if (
+    recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_NONE ||
+    !recoveryGyroAvailable
+  ) {
+    return;
+  }
+
+  sensors_event_t acceleration, gyro, temperature;
+  if (!mpu.getEvent(&acceleration, &gyro, &temperature)) {
+    recoveryGyroAvailable = false;
+    return;
+  }
+
+  float angularSpeedDegPerSecond =
+    (gyro.gyro.x - gyroBiasX) * (180.0f / PI);
+  if (abs(angularSpeedDegPerSecond) <= GYRO_THRESHOLD) return;
+
+  float deltaAngle = abs(angularSpeedDegPerSecond) * deltaSeconds;
+  if (recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_LEFT) {
+    recoveryRelativeHeadingDeg -= deltaAngle;
+  } else {
+    recoveryRelativeHeadingDeg += deltaAngle;
+  }
+}
+
+static void failLineRecovery() {
+  lineRecoveryState = LINE_RECOVERY_FAILED;
+  if (recoveryPrimarySide != LINE_RECOVERY_SIDE_NONE) {
+    previousFailedRecoveryFirstSide = recoveryPrimarySide;
+  }
+  stopLineFollowingForEvent(LINE_FOLLOW_LINE_LOST, "LINE_LOST");
+}
+
+static void captureInterruptedRecovery(unsigned long now) {
+  recoveryInterruptedState = lineRecoveryState;
+  recoveryInterruptedPhaseRemainingMs = 0;
+  recoveryInterruptedSearchElapsedMs = 0;
+
+  if (lineRecoveryState == LINE_RECOVERY_BRAKE) {
+    unsigned long elapsed = now - recoveryPhaseStartedMs;
+    recoveryInterruptedPhaseRemainingMs = elapsed >= RECOVERY_BRAKE_MS
+      ? 0
+      : RECOVERY_BRAKE_MS - elapsed;
+  } else if (lineRecoveryState == LINE_RECOVERY_BACKTRACK) {
+    unsigned long elapsed = now - recoveryPhaseStartedMs;
+    recoveryInterruptedPhaseRemainingMs =
+      elapsed >= recoveryBacktrackDurationMs
+        ? 0
+        : recoveryBacktrackDurationMs - elapsed;
+  } else if (
+    lineRecoveryState == LINE_RECOVERY_GYRO_SEARCH ||
+    lineRecoveryState == LINE_RECOVERY_RETURN_TO_ORIGIN
+  ) {
+    recoveryInterruptedSearchElapsedMs = now - recoverySearchStageStartedMs;
+  }
+}
+
+static void setRecoveryContactDifferential(uint8_t leftPwm, uint8_t rightPwm) {
+  recoveryLastContactMotion = LINE_RECOVERY_CONTACT_DIFFERENTIAL;
+  recoveryLastContactLeftPwm = leftPwm;
+  recoveryLastContactRightPwm = rightPwm;
+  driveForwardDifferential(leftPwm, rightPwm);
+}
+
+static void setRecoveryContactPivot(LineRecoverySide physicalSide) {
+  recoveryLastContactLeftPwm = RECOVERY_TRACK_PIVOT_PWM;
+  recoveryLastContactRightPwm = RECOVERY_TRACK_PIVOT_PWM;
+  recoveryCommandedTurnSide = physicalSide;
+  if (physicalSide == LINE_RECOVERY_SIDE_LEFT) {
+    recoveryLastContactMotion = LINE_RECOVERY_CONTACT_PIVOT_LEFT;
+    lineFollowState = LINE_FOLLOW_CORRECTING_LEFT;
+    // On this chassis the helper name is inverted relative to physical motion.
+    turnRightInPlaceAt(RECOVERY_TRACK_PIVOT_PWM);
+  } else {
+    recoveryLastContactMotion = LINE_RECOVERY_CONTACT_PIVOT_RIGHT;
+    lineFollowState = LINE_FOLLOW_CORRECTING_RIGHT;
+    // On this chassis the helper name is inverted relative to physical motion.
+    turnLeftInPlaceAt(RECOVERY_TRACK_PIVOT_PWM);
+  }
+}
+
+static void applyRecoveryContactSteering() {
+  uint8_t contactMask = currentLineContactMask();
+  if (contactMask == 0x01) {
+    setRecoveryContactPivot(LINE_RECOVERY_SIDE_LEFT);
+    return;
+  }
+  if (contactMask == 0x10) {
+    setRecoveryContactPivot(LINE_RECOVERY_SIDE_RIGHT);
+    return;
+  }
+
+  if (latestLinePositionError <= -1.5f) {
+    setRecoveryContactPivot(LINE_RECOVERY_SIDE_LEFT);
+    return;
+  }
+  if (latestLinePositionError >= 1.5f) {
+    setRecoveryContactPivot(LINE_RECOVERY_SIDE_RIGHT);
+    return;
+  }
+
+  int correction = (int)roundf(
+    latestLinePositionError * RECOVERY_TRACK_PROPORTIONAL_GAIN
+  );
+  correction = constrain(
+    correction,
+    -(int)RECOVERY_TRACK_MAX_CORRECTION,
+    (int)RECOVERY_TRACK_MAX_CORRECTION
+  );
+  int leftPwm = constrain((int)RECOVERY_TRACK_BASE_PWM + correction, 0, 255);
+  int rightPwm = constrain((int)RECOVERY_TRACK_BASE_PWM - correction, 0, 255);
+  if (leftPwm > 0 && leftPwm < RECOVERY_MIN_MOVING_PWM) {
+    leftPwm = RECOVERY_MIN_MOVING_PWM;
+  }
+  if (rightPwm > 0 && rightPwm < RECOVERY_MIN_MOVING_PWM) {
+    rightPwm = RECOVERY_MIN_MOVING_PWM;
+  }
+
+  recoveryCommandedTurnSide = latestLinePositionError < -0.1f
+    ? LINE_RECOVERY_SIDE_LEFT
+    : (
+      latestLinePositionError > 0.1f
+        ? LINE_RECOVERY_SIDE_RIGHT
+        : LINE_RECOVERY_SIDE_NONE
+    );
+  lineFollowState = latestLinePositionError < -0.1f
+    ? LINE_FOLLOW_CORRECTING_LEFT
+    : (
+      latestLinePositionError > 0.1f
+        ? LINE_FOLLOW_CORRECTING_RIGHT
+        : LINE_FOLLOW_CENTERED
+    );
+  setRecoveryContactDifferential((uint8_t)leftPwm, (uint8_t)rightPwm);
+}
+
+static void applyLastRecoveryContactSteering() {
+  switch (recoveryLastContactMotion) {
+    case LINE_RECOVERY_CONTACT_DIFFERENTIAL:
+      driveForwardDifferential(
+        recoveryLastContactLeftPwm,
+        recoveryLastContactRightPwm
+      );
+      break;
+    case LINE_RECOVERY_CONTACT_PIVOT_LEFT:
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_LEFT;
+      turnRightInPlaceAt(RECOVERY_TRACK_PIVOT_PWM);
+      break;
+    case LINE_RECOVERY_CONTACT_PIVOT_RIGHT:
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_RIGHT;
+      turnLeftInPlaceAt(RECOVERY_TRACK_PIVOT_PWM);
+      break;
+    case LINE_RECOVERY_CONTACT_STOPPED:
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+      stopMotorOutputs();
+      break;
+  }
+}
+
+static float recoverySearchTargetForStage(uint8_t stage) {
+  float primarySign = recoveryPrimarySide == LINE_RECOVERY_SIDE_LEFT
+    ? -1.0f
+    : 1.0f;
+  switch (stage) {
+    case 0: return primarySign * RECOVERY_PRIMARY_HEADING_DEG;
+    case 1: return -primarySign * RECOVERY_OPPOSITE_HEADING_DEG;
+    case 2: return primarySign * RECOVERY_EXPANDED_HEADING_DEG;
+    case 3: return -primarySign * RECOVERY_EXPANDED_HEADING_DEG;
+    default: return 0.0f;
+  }
+}
+
+static void commandRecoverySearchMotion() {
+  if (recoveryGyroAvailable) {
+    float remaining = recoveryTargetHeadingDeg - recoveryRelativeHeadingDeg;
+    if (abs(remaining) <= RECOVERY_HEADING_TOLERANCE_DEG) {
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+      stopMotorOutputs();
+      return;
+    }
+    recoveryCommandedTurnSide = remaining < 0.0f
+      ? LINE_RECOVERY_SIDE_LEFT
+      : LINE_RECOVERY_SIDE_RIGHT;
+  } else {
+    bool primaryStage =
+      recoverySearchStage == 0 ||
+      recoverySearchStage == 2 ||
+      recoverySearchStage >= 4;
+    recoveryCommandedTurnSide = primaryStage
+      ? recoveryPrimarySide
+      : oppositeRecoverySide(recoveryPrimarySide);
+  }
+
+  if (recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_LEFT) {
+    lineFollowState = LINE_FOLLOW_SEARCHING_LEFT;
+    // Physical LEFT uses the right-named helper on this motor wiring.
+    turnRightInPlaceAt(RECOVERY_SEARCH_PWM);
+  } else {
+    lineFollowState = LINE_FOLLOW_SEARCHING_RIGHT;
+    // Physical RIGHT uses the left-named helper on this motor wiring.
+    turnLeftInPlaceAt(RECOVERY_SEARCH_PWM);
+  }
+}
+
+static void startRecoverySearchStage(unsigned long now, uint8_t stage) {
+  recoverySearchStage = stage;
+  recoveryTargetHeadingDeg = recoverySearchTargetForStage(stage);
+  recoverySearchStageStartedMs = now;
+  recoveryLastGyroUpdateMs = now;
+  lineRecoveryState = stage >= 4
+    ? LINE_RECOVERY_RETURN_TO_ORIGIN
+    : LINE_RECOVERY_GYRO_SEARCH;
+  commandRecoverySearchMotion();
+}
+
+static void startRecoveryBacktrack(unsigned long now, unsigned long durationMs) {
+  lineRecoveryState = LINE_RECOVERY_BACKTRACK;
+  recoveryPhaseStartedMs = now;
+  recoveryBacktrackDurationMs = durationMs;
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  lineFollowState = LINE_FOLLOW_ACQUIRING;
+  driveBackwardAt(RECOVERY_BACKTRACK_PWM);
+}
+
+static void resumeInterruptedRecovery(unsigned long now) {
+  LineRecoveryState resumeState = recoveryInterruptedState;
+  unsigned long remainingMs = recoveryInterruptedPhaseRemainingMs;
+  unsigned long searchElapsedMs = recoveryInterruptedSearchElapsedMs;
+  recoveryInterruptedState = LINE_RECOVERY_INACTIVE;
+  recoveryInterruptedPhaseRemainingMs = 0;
+  recoveryInterruptedSearchElapsedMs = 0;
+  recoveryLastGyroUpdateMs = now;
+
+  switch (resumeState) {
+    case LINE_RECOVERY_LOST_CONFIRM:
+      lineRecoveryState = LINE_RECOVERY_LOST_CONFIRM;
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+      stopMotorOutputs();
+      break;
+    case LINE_RECOVERY_BRAKE:
+      lineRecoveryState = LINE_RECOVERY_BRAKE;
+      recoveryPhaseStartedMs = now - (RECOVERY_BRAKE_MS - remainingMs);
+      recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+      stopMotorOutputs();
+      break;
+    case LINE_RECOVERY_BACKTRACK:
+      startRecoveryBacktrack(now, remainingMs);
+      break;
+    case LINE_RECOVERY_GYRO_SEARCH:
+    case LINE_RECOVERY_RETURN_TO_ORIGIN:
+      lineRecoveryState = resumeState;
+      recoverySearchStageStartedMs = now - searchElapsedMs;
+      commandRecoverySearchMotion();
+      break;
+    default:
+      if (recoveryPrimarySide != LINE_RECOVERY_SIDE_NONE) {
+        startRecoverySearchStage(now, recoverySearchStage);
+      } else {
+        lineRecoveryState = LINE_RECOVERY_LOST_CONFIRM;
+        recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+        stopMotorOutputs();
+      }
+      break;
+  }
+}
+
+static void startRecoveryContactTrack(unsigned long now, bool preserveResume) {
+  if (!preserveResume) captureInterruptedRecovery(now);
+  lineRecoveryState = LINE_RECOVERY_CONTACT_TRACK;
+  recoveryContactStartedMs = now;
+  recoveryContactLastSeenMs = now;
+  recoveryFirstContactMask = currentLineContactMask();
+  recoveryContactSeenMask = recoveryFirstContactMask;
+  recoveryBestAbsoluteError = abs(latestLinePositionError);
+  recoveryContactProgress = lineDetected[2];
+  applyRecoveryContactSteering();
+}
+
+static void startRecoveryWideBlackVerify(unsigned long now, bool preserveResume) {
+  if (!preserveResume) captureInterruptedRecovery(now);
+  lineRecoveryState = LINE_RECOVERY_WIDE_BLACK_VERIFY;
+  recoveryPhaseStartedMs = now;
+  recoveryWideConsecutiveReadings = lineDetected[2] ? 1 : 0;
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  stopMotorOutputs();
+  driveForwardAt(RECOVERY_WIDE_FORWARD_PWM);
+}
+
+static void startRecoveryLineLock(unsigned long now) {
+  lineRecoveryState = LINE_RECOVERY_LINE_LOCK;
+  recoveryLineLockStartedMs = now;
+  recoveryContactLastSeenMs = now;
+  recoveryLineLockSawInnerSensor =
+    lineDetected[1] || lineDetected[2] || lineDetected[3];
+  applyRecoveryContactSteering();
+}
+
+static void updateRecoveryContactEvidence() {
+  uint8_t currentMask = currentLineContactMask();
+  recoveryContactSeenMask |= currentMask;
+
+  uint8_t adjacentMask = 0;
+  for (uint8_t i = 0; i < LINE_SENSOR_COUNT; i++) {
+    if ((recoveryFirstContactMask & (uint8_t)(1U << i)) == 0) continue;
+    if (i > 0) adjacentMask |= (uint8_t)(1U << (i - 1));
+    if (i + 1 < LINE_SENSOR_COUNT) {
+      adjacentMask |= (uint8_t)(1U << (i + 1));
+    }
+  }
+  adjacentMask &= (uint8_t)~recoveryFirstContactMask;
+  if ((recoveryContactSeenMask & adjacentMask) != 0) {
+    recoveryContactProgress = true;
+  }
+
+  float absoluteError = abs(latestLinePositionError);
+  if (absoluteError + 0.05f < recoveryBestAbsoluteError) {
+    recoveryContactProgress = true;
+  }
+  if (absoluteError < recoveryBestAbsoluteError) {
+    recoveryBestAbsoluteError = absoluteError;
+  }
+  if (lineDetected[2]) recoveryContactProgress = true;
+  if (
+    (recoveryFirstContactMask & 0x01) != 0 &&
+    (recoveryContactSeenMask & 0x06) != 0
+  ) {
+    recoveryContactProgress = true;
+  }
+  if (
+    (recoveryFirstContactMask & 0x10) != 0 &&
+    (recoveryContactSeenMask & 0x0C) != 0
+  ) {
+    recoveryContactProgress = true;
+  }
+}
+
+static bool handleImmediateRecoveryContact(unsigned long now) {
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryWideBlackVerify(now, false);
+    return true;
+  }
+  if (latestLineActiveCount > 0) {
+    startRecoveryContactTrack(now, false);
+    return true;
+  }
+  return false;
+}
+
+static void updateRecoveryLostConfirmation(unsigned long now) {
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryWideBlackVerify(now, false);
+    return;
+  }
+  if (latestLineActiveCount > 0) {
+    resetLineSearch();
+    consecutiveIntersectionReadings = 0;
+    lastLineFollowUpdateMs = now;
+    applyProportionalLineControl();
+    return;
+  }
+
+  if (recoveryLostReadings < 255) recoveryLostReadings++;
+  if (recoveryLostReadings < LINE_LOST_CONFIRM_READINGS) return;
+
+  recoveryPrimarySide = chooseRecoveryPrimarySide();
+  recoveryRelativeHeadingDeg = 0.0f;
+  recoveryTargetHeadingDeg = 0.0f;
+  recoveryGyroInitialized = true;
+  recoveryGyroAvailable = true;
+  recoveryLastGyroUpdateMs = now;
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  recoveryScanCycle = 0;
+  recoverySearchStage = 0;
+  lineRecoveryState = LINE_RECOVERY_BRAKE;
+  recoveryPhaseStartedMs = now;
+  lineFollowState = LINE_FOLLOW_ACQUIRING;
+  stopMotorOutputs();
+}
+
+static void updateRecoveryBrake(unsigned long now) {
+  if (handleImmediateRecoveryContact(now)) return;
+  if (now - recoveryPhaseStartedMs >= RECOVERY_BRAKE_MS) {
+    startRecoveryBacktrack(now, RECOVERY_BACKTRACK_MS);
+  } else {
+    recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+    stopMotorOutputs();
+  }
+}
+
+static void updateRecoveryBacktrack(unsigned long now) {
+  if (handleImmediateRecoveryContact(now)) return;
+  if (now - recoveryPhaseStartedMs >= recoveryBacktrackDurationMs) {
+    startRecoverySearchStage(now, 0);
+  } else {
+    recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+    driveBackwardAt(RECOVERY_BACKTRACK_PWM);
+  }
+}
+
+static bool recoverySearchTargetReached(unsigned long now) {
+  if (recoveryGyroAvailable) {
+    float remaining = recoveryTargetHeadingDeg - recoveryRelativeHeadingDeg;
+    if (abs(remaining) <= RECOVERY_HEADING_TOLERANCE_DEG) return true;
+    if (
+      recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_LEFT &&
+      recoveryRelativeHeadingDeg <= recoveryTargetHeadingDeg
+    ) {
+      return true;
+    }
+    if (
+      recoveryCommandedTurnSide == LINE_RECOVERY_SIDE_RIGHT &&
+      recoveryRelativeHeadingDeg >= recoveryTargetHeadingDeg
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  uint8_t fallbackIndex = recoverySearchStage < 4
+    ? recoverySearchStage
+    : 3;
+  return now - recoverySearchStageStartedMs >=
+    RECOVERY_FALLBACK_SWEEP_MS[fallbackIndex];
+}
+
+static void finishRecoveryScanCycle(unsigned long now) {
+  if (recoveryScanCycle + 1U < RECOVERY_MAX_SCAN_CYCLES) {
+    recoveryScanCycle++;
+    startRecoveryBacktrack(now, RECOVERY_SECOND_BACKTRACK_MS);
+  } else {
+    failLineRecovery();
+  }
+}
+
+static void updateRecoverySearch(unsigned long now) {
+  if (handleImmediateRecoveryContact(now)) return;
+
+  if (!recoverySearchTargetReached(now)) {
+    commandRecoverySearchMotion();
+    return;
+  }
+
+  stopMotorOutputs();
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  if (lineRecoveryState == LINE_RECOVERY_RETURN_TO_ORIGIN) {
+    finishRecoveryScanCycle(now);
+  } else if (recoverySearchStage < 3) {
+    startRecoverySearchStage(now, recoverySearchStage + 1U);
+  } else {
+    startRecoverySearchStage(now, 4);
+  }
+}
+
+static void updateRecoveryContactTrack(unsigned long now) {
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryWideBlackVerify(now, true);
+    return;
+  }
+
+  if (latestLineActiveCount == 0) {
+    if (
+      now - recoveryContactLastSeenMs > RECOVERY_CONTACT_LOSS_GRACE_MS ||
+      now - recoveryContactStartedMs >= RECOVERY_CONTACT_VERIFY_TIMEOUT_MS
+    ) {
+      resumeInterruptedRecovery(now);
+    } else {
+      applyLastRecoveryContactSteering();
+    }
+    return;
+  }
+
+  recoveryContactLastSeenMs = now;
+  updateRecoveryContactEvidence();
+  applyRecoveryContactSteering();
+  if (recoveryContactProgress) {
+    startRecoveryLineLock(now);
+  } else if (
+    now - recoveryContactStartedMs >= RECOVERY_CONTACT_VERIFY_TIMEOUT_MS
+  ) {
+    resumeInterruptedRecovery(now);
+  }
+}
+
+static void updateRecoveryWideBlackVerify(unsigned long now) {
+  if (latestLineActiveCount == 0) {
+    resumeInterruptedRecovery(now);
+    return;
+  }
+  if (latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryContactTrack(now, true);
+    return;
+  }
+
+  if (lineDetected[2]) {
+    if (recoveryWideConsecutiveReadings < 255) {
+      recoveryWideConsecutiveReadings++;
+    }
+    if (
+      recoveryWideConsecutiveReadings >= RECOVERY_WIDE_VERIFY_READINGS
+    ) {
+      stopLineFollowingForEvent(LINE_FOLLOW_INTERSECTION, "INTERSECTION");
+      return;
+    }
+  } else {
+    recoveryWideConsecutiveReadings = 0;
+  }
+
+  if (now - recoveryPhaseStartedMs >= RECOVERY_WIDE_VERIFY_TIMEOUT_MS) {
+    resumeInterruptedRecovery(now);
+    return;
+  }
+
+  recoveryCommandedTurnSide = LINE_RECOVERY_SIDE_NONE;
+  driveForwardAt(RECOVERY_WIDE_FORWARD_PWM);
+}
+
+static void completeLineRecovery(unsigned long now) {
+  resetLineSearch();
+  consecutiveIntersectionReadings = 0;
+  lastLineFollowUpdateMs = now;
+  applyProportionalLineControl();
+}
+
+static void updateRecoveryLineLock(unsigned long now) {
+  if (latestLineActiveCount >= LINE_INTERSECTION_MIN_SENSORS) {
+    startRecoveryWideBlackVerify(now, true);
+    return;
+  }
+
+  if (latestLineActiveCount == 0) {
+    // A brief dropout keeps the last steering command, but it does not count
+    // toward the required continuous low-speed lock interval.
+    recoveryLineLockStartedMs = now;
+    if (
+      now - recoveryContactLastSeenMs > RECOVERY_LOCK_LOSS_GRACE_MS
+    ) {
+      resumeInterruptedRecovery(now);
+    } else {
+      applyLastRecoveryContactSteering();
+    }
+    return;
+  }
+
+  recoveryContactLastSeenMs = now;
+  recoveryLineLockSawInnerSensor =
+    recoveryLineLockSawInnerSensor ||
+    lineDetected[1] || lineDetected[2] || lineDetected[3];
+  applyRecoveryContactSteering();
+  if (now - recoveryLineLockStartedMs >= RECOVERY_LINE_LOCK_MS) {
+    if (recoveryLineLockSawInnerSensor) {
+      completeLineRecovery(now);
+    } else {
+      resumeInterruptedRecovery(now);
+    }
+  }
+}
+
+static void updateLineRecovery(unsigned long now) {
+  updateRecoveryHeading(now);
+  printLineRecoveryDiagnostic(now);
+
+  if (
+    recoveryStartedMs != 0 &&
+    now - recoveryStartedMs >= RECOVERY_TOTAL_TIMEOUT_MS
+  ) {
+    failLineRecovery();
+    return;
+  }
+
+  switch (lineRecoveryState) {
+    case LINE_RECOVERY_LOST_CONFIRM:
+      updateRecoveryLostConfirmation(now);
+      break;
+    case LINE_RECOVERY_BRAKE:
+      updateRecoveryBrake(now);
+      break;
+    case LINE_RECOVERY_BACKTRACK:
+      updateRecoveryBacktrack(now);
+      break;
+    case LINE_RECOVERY_GYRO_SEARCH:
+    case LINE_RECOVERY_RETURN_TO_ORIGIN:
+      updateRecoverySearch(now);
+      break;
+    case LINE_RECOVERY_CONTACT_TRACK:
+      updateRecoveryContactTrack(now);
+      break;
+    case LINE_RECOVERY_WIDE_BLACK_VERIFY:
+      updateRecoveryWideBlackVerify(now);
+      break;
+    case LINE_RECOVERY_LINE_LOCK:
+      updateRecoveryLineLock(now);
+      break;
+    case LINE_RECOVERY_FAILED:
+      failLineRecovery();
+      break;
+    case LINE_RECOVERY_INACTIVE:
+      break;
+  }
+}
+
+static void startLineLostConfirmation(unsigned long now) {
+  resetLineSearch();
+  lineRecoveryState = LINE_RECOVERY_LOST_CONFIRM;
+  recoveryLostReadings = 1;
+  recoveryStartedMs = now;
+  lastRecoverySampleMs = now;
 }
 
 static void driveIntersectionManeuver() {
@@ -847,23 +1789,49 @@ static void driveIntersectionManeuver() {
     case INTERSECTION_CENTERING_RIGHT:
       driveForwardAt(INTERSECTION_CENTER_PWM);
       break;
-    case INTERSECTION_PIVOTING_LEFT:
-      // Reuse the verified manual helper: left side backward, right forward.
-      turnLeftInPlaceAt(INTERSECTION_PIVOT_PWM);
+    case INTERSECTION_PIVOT_SEARCH_LEFT:
+      // Physical intersection LEFT is the opposite of the manual helper name.
+      turnRightInPlaceAt(INTERSECTION_PIVOT_SEARCH_PWM);
       break;
-    case INTERSECTION_PIVOTING_RIGHT:
-      // Reuse the verified manual helper: left side forward, right backward.
-      turnRightInPlaceAt(INTERSECTION_PIVOT_PWM);
+    case INTERSECTION_PIVOT_SEARCH_RIGHT:
+      // Physical intersection RIGHT is the opposite of the manual helper name.
+      turnLeftInPlaceAt(INTERSECTION_PIVOT_SEARCH_PWM);
       break;
-    case INTERSECTION_ACQUIRING_LINE:
-      if (intersectionDirection == INTERSECTION_DIRECTION_STRAIGHT) {
-        driveForwardDifferential(
-          95,
-          95
+    case INTERSECTION_UTURN_PIVOT_SEARCH:
+      // The first U-turn calibration consistently pivots physical RIGHT.
+      turnLeftInPlaceAt(UTURN_PIVOT_PWM);
+      break;
+    case INTERSECTION_SENSOR_ALIGN_LEFT:
+    case INTERSECTION_SENSOR_ALIGN_RIGHT:
+    case INTERSECTION_UTURN_SENSOR_ALIGN:
+      if (intersectionAlignmentPivotLeft) {
+        turnRightInPlaceAt(
+          intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+            ? UTURN_SENSOR_ALIGN_PWM
+            : INTERSECTION_SENSOR_ALIGN_PWM
         );
       } else {
-        driveForwardAt(95);
+        turnLeftInPlaceAt(
+          intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+            ? UTURN_SENSOR_ALIGN_PWM
+            : INTERSECTION_SENSOR_ALIGN_PWM
+        );
       }
+      break;
+    case INTERSECTION_LOCKING_LINE_LEFT:
+    case INTERSECTION_LOCKING_LINE_RIGHT:
+    case INTERSECTION_UTURN_LINE_LOCK:
+      driveForwardAt(INTERSECTION_LOCK_PWM);
+      break;
+    case INTERSECTION_REACQUIRING_LEFT:
+    case INTERSECTION_REACQUIRING_RIGHT:
+      driveForwardAt(INTERSECTION_REACQUIRE_PWM);
+      break;
+    case INTERSECTION_ACQUIRING_LINE:
+      driveForwardDifferential(
+        INTERSECTION_STRAIGHT_PWM,
+        INTERSECTION_STRAIGHT_PWM
+      );
       break;
     case INTERSECTION_NAVIGATION_INACTIVE:
       stopMotorOutputs();
@@ -872,6 +1840,7 @@ static void driveIntersectionManeuver() {
 }
 
 static void failIntersectionNavigation() {
+  bool uTurn = intersectionDirection == INTERSECTION_DIRECTION_U_TURN;
   const char* direction = intersectionDirectionName(intersectionDirection);
   intersectionNavigationActive = false;
   intersectionCleared = false;
@@ -879,16 +1848,32 @@ static void failIntersectionNavigation() {
   consecutiveOutgoingLineReadings = 0;
   intersectionTurnAngleDeg = 0.0f;
   intersectionLastGyroUpdateMs = 0;
+  intersectionAlignmentPivotLeft = false;
+  intersectionLastLineSeenMs = 0;
+  intersectionWideBlackCleared = false;
+  consecutiveIntersectionWideClearReadings = 0;
+  intersectionLockStableStartedMs = 0;
+  intersectionLastLockError = 0.0f;
+  uTurnStartedMs = 0;
+  uturnOriginalLineCleared = false;
+  uturnConsecutiveAllWhiteReadings = 0;
+  uturnLastDiagnosticMs = 0;
+  uturnPivotElapsedMs = 0;
   lineFollowEnabled = false;
   lineFollowState = LINE_FOLLOW_NAVIGATION_FAILED;
   manualMovementActive = false;
   stopMotorOutputs();
-  Serial.print("EVENT|INTERSECTION_FAILED|DIRECTION=");
-  Serial.println(direction);
+  if (uTurn) {
+    Serial.println("EVENT|U_TURN_FAILED");
+  } else {
+    Serial.print("EVENT|INTERSECTION_FAILED|DIRECTION=");
+    Serial.println(direction);
+  }
   intersectionDirection = INTERSECTION_DIRECTION_NONE;
 }
 
 static void completeIntersectionNavigation() {
+  bool uTurn = intersectionDirection == INTERSECTION_DIRECTION_U_TURN;
   const char* direction = intersectionDirectionName(intersectionDirection);
   intersectionNavigationActive = false;
   intersectionCleared = false;
@@ -897,17 +1882,70 @@ static void completeIntersectionNavigation() {
   consecutiveOutgoingLineReadings = 0;
   intersectionTurnAngleDeg = 0.0f;
   intersectionLastGyroUpdateMs = 0;
+  intersectionAlignmentPivotLeft = false;
+  intersectionLastLineSeenMs = 0;
+  intersectionWideBlackCleared = false;
+  consecutiveIntersectionWideClearReadings = 0;
+  intersectionLockStableStartedMs = 0;
+  intersectionLastLockError = 0.0f;
+  uTurnStartedMs = 0;
+  uturnOriginalLineCleared = false;
+  uturnConsecutiveAllWhiteReadings = 0;
+  uturnLastDiagnosticMs = 0;
+  uturnPivotElapsedMs = 0;
   resetLineFollowConfirmation();
   lineFollowEnabled = true;
-  lineFollowState = LINE_FOLLOW_CENTERED;
   manualMovementActive = false;
   lastLineFollowUpdateMs = millis();
-  driveForwardDifferential(95, 95);
-  Serial.print("EVENT|INTERSECTION_COMPLETE|DIRECTION=");
-  Serial.print(direction);
-  Serial.print("|PATTERN=");
+  applyProportionalLineControl();
+  if (uTurn) {
+    Serial.print("EVENT|U_TURN_COMPLETE|PATTERN=");
+  } else {
+    Serial.print("EVENT|INTERSECTION_COMPLETE|DIRECTION=");
+    Serial.print(direction);
+    Serial.print("|PATTERN=");
+  }
   printLinePatternBits(latestLinePattern);
   Serial.println();
+}
+
+static void startUturnNavigation() {
+  if (
+    intersectionNavigationActive ||
+    lineFollowEnabled ||
+    manualMovementActive ||
+    autoModeEnabled
+  ) {
+    Serial.println("ERROR|MANEUVER_ACTIVE");
+    return;
+  }
+
+  stopMotorOutputs();
+  sampleLineSensors();
+  intersectionDirection = INTERSECTION_DIRECTION_U_TURN;
+  intersectionCleared = false;
+  consecutiveOutgoingLineReadings = 0;
+  intersectionPhaseStartedMs = millis();
+  uTurnStartedMs = intersectionPhaseStartedMs;
+  intersectionTurnAngleDeg = 0.0f;
+  intersectionLastGyroUpdateMs = intersectionPhaseStartedMs;
+  intersectionAlignmentPivotLeft = false;
+  intersectionLastLineSeenMs = 0;
+  intersectionWideBlackCleared = false;
+  consecutiveIntersectionWideClearReadings = 0;
+  intersectionLockStableStartedMs = 0;
+  intersectionLastLockError = 0.0f;
+  uturnOriginalLineCleared = false;
+  uturnConsecutiveAllWhiteReadings = 0;
+  uturnLastDiagnosticMs = 0;
+  uturnPivotElapsedMs = 0;
+  lineFollowEnabled = false;
+  manualMovementActive = false;
+  resetLineFollowConfirmation();
+  intersectionNavigationState = INTERSECTION_UTURN_PIVOT_SEARCH;
+  intersectionNavigationActive = true;
+  Serial.println("ACK|U_TURN_STARTED");
+  driveIntersectionManeuver();
 }
 
 static void startIntersectionNavigation(IntersectionDirection direction) {
@@ -925,6 +1963,12 @@ static void startIntersectionNavigation(IntersectionDirection direction) {
   intersectionPhaseStartedMs = millis();
   intersectionTurnAngleDeg = 0.0f;
   intersectionLastGyroUpdateMs = 0;
+  intersectionAlignmentPivotLeft = direction == INTERSECTION_DIRECTION_LEFT;
+  intersectionLastLineSeenMs = 0;
+  intersectionWideBlackCleared = false;
+  consecutiveIntersectionWideClearReadings = 0;
+  intersectionLockStableStartedMs = 0;
+  intersectionLastLockError = 0.0f;
   lineFollowEnabled = false;
   manualMovementActive = false;
   resetLineFollowConfirmation();
@@ -942,6 +1986,9 @@ static void startIntersectionNavigation(IntersectionDirection direction) {
       intersectionNavigationState = INTERSECTION_GOING_STRAIGHT;
       Serial.println("ACK|INTERSECTION_STRAIGHT_STARTED");
       break;
+    case INTERSECTION_DIRECTION_U_TURN:
+      Serial.println("ERROR|NOT_AT_INTERSECTION");
+      return;
     case INTERSECTION_DIRECTION_NONE:
       Serial.println("ERROR|NOT_AT_INTERSECTION");
       return;
@@ -951,12 +1998,14 @@ static void startIntersectionNavigation(IntersectionDirection direction) {
   driveIntersectionManeuver();
 }
 
-static bool confirmOutgoingIntersectionLine() {
-  bool validOutgoingLine =
+static bool isValidOutgoingIntersectionLine() {
+  return
     latestLineActiveCount > 0 &&
-    latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS &&
-    (lineDetected[2] || lineDetected[3]);
-  if (validOutgoingLine) {
+    latestLineActiveCount < LINE_INTERSECTION_MIN_SENSORS;
+}
+
+static bool confirmOutgoingIntersectionLine() {
+  if (isValidOutgoingIntersectionLine()) {
     if (consecutiveOutgoingLineReadings < 255) {
       consecutiveOutgoingLineReadings++;
     }
@@ -1010,16 +2059,338 @@ static void startIntersectionPivot(unsigned long now) {
   consecutiveOutgoingLineReadings = 0;
   intersectionNavigationState =
     intersectionDirection == INTERSECTION_DIRECTION_LEFT
-      ? INTERSECTION_PIVOTING_LEFT
-      : INTERSECTION_PIVOTING_RIGHT;
+      ? INTERSECTION_PIVOT_SEARCH_LEFT
+      : INTERSECTION_PIVOT_SEARCH_RIGHT;
   driveIntersectionManeuver();
 }
 
-static void startTurningLineAcquisition(unsigned long now) {
+static void updateIntersectionWideBlackClearance() {
+  if (intersectionWideBlackCleared) return;
+
+  if (latestLineActiveCount <= 2) {
+    if (consecutiveIntersectionWideClearReadings < 255) {
+      consecutiveIntersectionWideClearReadings++;
+    }
+    if (
+      consecutiveIntersectionWideClearReadings >=
+      INTERSECTION_WIDE_CLEAR_CONFIRM_READINGS
+    ) {
+      intersectionWideBlackCleared = true;
+    }
+  } else {
+    consecutiveIntersectionWideClearReadings = 0;
+  }
+}
+
+static bool isExpectedTurnEdgeDetected() {
+  if (
+    !intersectionWideBlackCleared ||
+    latestLineActiveCount == 0 ||
+    latestLineActiveCount > 3 ||
+    lineDetected[2]
+  ) {
+    return false;
+  }
+
+  if (intersectionDirection == INTERSECTION_DIRECTION_LEFT) {
+    return lineDetected[0] || lineDetected[1]; // O1/O2, physical left.
+  }
+  return lineDetected[3] || lineDetected[4]; // O4/O5, physical right.
+}
+
+static bool isFallbackTurnLineDetected() {
+  return
+    intersectionWideBlackCleared &&
+    latestLineActiveCount > 0 &&
+    latestLineActiveCount <= 3;
+}
+
+static bool updateIntersectionTurnAngle(
+  unsigned long now,
+  bool pivotTowardPhysicalLeft
+) {
+  sensors_event_t acceleration, gyro, temperature;
+  if (!mpu.getEvent(&acceleration, &gyro, &temperature)) {
+    return false;
+  }
+
+  float deltaSeconds = (now - intersectionLastGyroUpdateMs) / 1000.0f;
+  intersectionLastGyroUpdateMs = now;
+  float angularSpeedDegPerSecond =
+    (gyro.gyro.x - gyroBiasX) * (180.0f / PI);
+  if (abs(angularSpeedDegPerSecond) <= GYRO_THRESHOLD) {
+    return true;
+  }
+
+  float deltaAngle = abs(angularSpeedDegPerSecond) * deltaSeconds;
+  bool originalPivotIsLeft =
+    intersectionDirection == INTERSECTION_DIRECTION_LEFT;
+  if (pivotTowardPhysicalLeft == originalPivotIsLeft) {
+    intersectionTurnAngleDeg += deltaAngle;
+  } else {
+    intersectionTurnAngleDeg = max(0.0f, intersectionTurnAngleDeg - deltaAngle);
+  }
+  return true;
+}
+
+static void startLowSpeedLineLock(unsigned long now) {
+  bool uTurn = intersectionDirection == INTERSECTION_DIRECTION_U_TURN;
+  if (!uTurn) {
+    stopMotorOutputs();
+  }
+  intersectionNavigationState = uTurn
+    ? INTERSECTION_UTURN_LINE_LOCK
+    : (
+      intersectionDirection == INTERSECTION_DIRECTION_LEFT
+        ? INTERSECTION_LOCKING_LINE_LEFT
+        : INTERSECTION_LOCKING_LINE_RIGHT
+    );
+  intersectionPhaseStartedMs = now;
+  intersectionLockStableStartedMs = now;
+  intersectionLastLineSeenMs = now;
+  intersectionLastLockError = latestLinePositionError;
+  consecutiveOutgoingLineReadings = 0;
+  driveProportionalLineAt(
+    INTERSECTION_LOCK_PWM,
+    INTERSECTION_LOCK_PROPORTIONAL_GAIN,
+    INTERSECTION_LOCK_MAX_CORRECTION
+  );
+}
+
+static void applySensorGuidedPivotAlignment(unsigned long now) {
+  bool anyBlackDetected = latestLineActiveCount > 0;
+  if (!anyBlackDetected) {
+    consecutiveOutgoingLineReadings = 0;
+    if (
+      now - intersectionLastLineSeenMs <=
+      (
+        intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+          ? UTURN_SENSOR_LOSS_GRACE_MS
+          : INTERSECTION_SENSOR_LOSS_GRACE_MS
+      )
+    ) {
+      // Continue the last low-speed pivot direction through brief line loss.
+      driveIntersectionManeuver();
+    } else {
+      // The outgoing line was already detected, so forward fallback is unsafe.
+      failIntersectionNavigation();
+    }
+    return;
+  }
+
+  intersectionLastLineSeenMs = now;
+  if (latestLineActiveCount >= 4) {
+    // A broad pattern can mean the board is parallel over the branch. Keep the
+    // current pivot direction until the pattern narrows; never complete here.
+    consecutiveOutgoingLineReadings = 0;
+    driveIntersectionManeuver();
+    return;
+  }
+
+  bool centerConfirmedBySensors =
+    lineDetected[2] &&
+    !lineDetected[0] &&
+    !lineDetected[4] &&
+    latestLineActiveCount >= 1 &&
+    latestLineActiveCount <= 3;
+  if (centerConfirmedBySensors) {
+    if (consecutiveOutgoingLineReadings < 255) {
+      consecutiveOutgoingLineReadings++;
+    }
+    if (
+      consecutiveOutgoingLineReadings >=
+      INTERSECTION_SENSOR_CENTER_CONFIRM_READINGS
+    ) {
+      startLowSpeedLineLock(now);
+      return;
+    }
+    // Hold the approximate heading while O3 confirmation accumulates.
+    stopMotorOutputs();
+    return;
+  }
+
+  consecutiveOutgoingLineReadings = 0;
+  bool blackOnLeft = lineDetected[0] || lineDetected[1];
+  bool blackOnRight = lineDetected[3] || lineDetected[4];
+  if (blackOnLeft && !blackOnRight) {
+    intersectionAlignmentPivotLeft = true;
+  } else if (blackOnRight && !blackOnLeft) {
+    intersectionAlignmentPivotLeft = false;
+  } else if (latestLinePositionError < -0.1f) {
+    intersectionAlignmentPivotLeft = true;
+  } else if (latestLinePositionError > 0.1f) {
+    intersectionAlignmentPivotLeft = false;
+  }
+  driveIntersectionManeuver();
+}
+
+static void startSensorGuidedPivotAlignment(unsigned long now) {
+  intersectionNavigationState =
+    intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+      ? INTERSECTION_UTURN_SENSOR_ALIGN
+      : (
+        intersectionDirection == INTERSECTION_DIRECTION_LEFT
+          ? INTERSECTION_SENSOR_ALIGN_LEFT
+          : INTERSECTION_SENSOR_ALIGN_RIGHT
+      );
+  intersectionPhaseStartedMs = now;
+  intersectionLastLineSeenMs = now;
+  intersectionLastGyroUpdateMs = now;
+  intersectionAlignmentPivotLeft =
+    intersectionDirection == INTERSECTION_DIRECTION_LEFT;
+  consecutiveOutgoingLineReadings = 0;
+  // The first expected edge reading changes the low-speed pivot immediately.
+  applySensorGuidedPivotAlignment(now);
+}
+
+static void startTurningForwardReacquisition(unsigned long now) {
   stopMotorOutputs();
-  intersectionNavigationState = INTERSECTION_ACQUIRING_LINE;
+  if (intersectionTurnAngleDeg > INTERSECTION_PIVOT_MAX_ANGLE_DEG) {
+    intersectionTurnAngleDeg = INTERSECTION_PIVOT_MAX_ANGLE_DEG;
+  }
+  intersectionNavigationState =
+    intersectionDirection == INTERSECTION_DIRECTION_LEFT
+      ? INTERSECTION_REACQUIRING_LEFT
+      : INTERSECTION_REACQUIRING_RIGHT;
   intersectionPhaseStartedMs = now;
   consecutiveOutgoingLineReadings = 0;
+  driveIntersectionManeuver();
+}
+
+static void updateSensorGuidedPivotAlignment(unsigned long now) {
+  unsigned long alignTimeoutMs =
+    intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+      ? UTURN_SENSOR_ALIGN_TIMEOUT_MS
+      : INTERSECTION_SENSOR_ALIGN_TIMEOUT_MS;
+  float maxAngleDeg =
+    intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+      ? UTURN_MAX_ANGLE_DEG
+      : INTERSECTION_PIVOT_MAX_ANGLE_DEG;
+  if (
+    now - intersectionPhaseStartedMs >=
+    alignTimeoutMs
+  ) {
+    failIntersectionNavigation();
+    return;
+  }
+
+  if (
+    !updateIntersectionTurnAngle(
+      now,
+      intersectionAlignmentPivotLeft
+    ) ||
+    intersectionTurnAngleDeg > maxAngleDeg
+  ) {
+    failIntersectionNavigation();
+    return;
+  }
+
+  applySensorGuidedPivotAlignment(now);
+}
+
+static bool isLineWithinInnerLockSensors() {
+  return
+    latestLineActiveCount > 0 &&
+    !lineDetected[0] &&
+    !lineDetected[4] &&
+    (lineDetected[1] || lineDetected[2] || lineDetected[3]);
+}
+
+static void returnLockToSensorGuidedPivot(unsigned long now) {
+  stopMotorOutputs();
+  intersectionNavigationState =
+    intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+      ? INTERSECTION_UTURN_SENSOR_ALIGN
+      : (
+        intersectionDirection == INTERSECTION_DIRECTION_LEFT
+          ? INTERSECTION_SENSOR_ALIGN_LEFT
+          : INTERSECTION_SENSOR_ALIGN_RIGHT
+      );
+  intersectionPhaseStartedMs = now;
+  intersectionLastGyroUpdateMs = now;
+  intersectionLastLineSeenMs = now;
+  intersectionLockStableStartedMs = 0;
+  consecutiveOutgoingLineReadings = 0;
+  driveIntersectionManeuver();
+}
+
+static void updateLowSpeedLineLock(unsigned long now) {
+  if (now - intersectionPhaseStartedMs >= INTERSECTION_LOCK_TIMEOUT_MS) {
+    failIntersectionNavigation();
+    return;
+  }
+
+  if (latestLineActiveCount == 0) {
+    intersectionLockStableStartedMs = 0;
+    if (
+      now - intersectionLastLineSeenMs <=
+      (
+        intersectionDirection == INTERSECTION_DIRECTION_U_TURN
+          ? UTURN_SENSOR_LOSS_GRACE_MS
+          : INTERSECTION_SENSOR_LOSS_GRACE_MS
+      )
+    ) {
+      // Keep the last low-speed correction output through a short dropout.
+      return;
+    }
+
+    // The branch was already found, so recover by pivoting rather than using
+    // the never-detected forward fallback.
+    returnLockToSensorGuidedPivot(now);
+    return;
+  }
+
+  intersectionLastLineSeenMs = now;
+  float controlError = latestLinePositionError;
+  if (abs(controlError) > 0.1f) {
+    intersectionLastLockError = controlError;
+  } else if (lineDetected[0] || lineDetected[4]) {
+    // A broad/ambiguous outer pattern must still produce a strong correction.
+    controlError = abs(intersectionLastLockError) > 0.1f
+      ? intersectionLastLockError
+      : (intersectionAlignmentPivotLeft ? -2.0f : 2.0f);
+  }
+
+  if (controlError < -0.1f) {
+    intersectionAlignmentPivotLeft = true;
+  } else if (controlError > 0.1f) {
+    intersectionAlignmentPivotLeft = false;
+  }
+
+  driveProportionalErrorAt(
+    controlError,
+    INTERSECTION_LOCK_PWM,
+    INTERSECTION_LOCK_PROPORTIONAL_GAIN,
+    INTERSECTION_LOCK_MAX_CORRECTION
+  );
+
+  if (isLineWithinInnerLockSensors()) {
+    if (intersectionLockStableStartedMs == 0) {
+      intersectionLockStableStartedMs = now;
+    }
+    if (now - intersectionLockStableStartedMs >= INTERSECTION_LOCK_MS) {
+      completeIntersectionNavigation();
+    }
+  } else {
+    // The line is still detected and correction continues, but the complete
+    // 500 ms inner-sensor stability interval must start again.
+    intersectionLockStableStartedMs = 0;
+  }
+}
+
+static void updateTurningForwardReacquisition(unsigned long now) {
+  if (now - intersectionPhaseStartedMs >= INTERSECTION_REACQUIRE_MS) {
+    failIntersectionNavigation();
+    return;
+  }
+
+  if (isFallbackTurnLineDetected()) {
+    startSensorGuidedPivotAlignment(now);
+    return;
+  }
+
+  // The fallback deliberately ignores both 11111 and 00000 until its bounded
+  // deadline, while normal intersection detection remains disabled.
   driveIntersectionManeuver();
 }
 
@@ -1028,8 +2399,8 @@ static void updateTurningIntersectionNavigation(unsigned long now) {
     intersectionNavigationState == INTERSECTION_CENTERING_LEFT ||
     intersectionNavigationState == INTERSECTION_CENTERING_RIGHT
   ) {
-    // Sensor readings are intentionally ignored while positioning the wheel
-    // center over the middle of the physical '+' intersection.
+    // All sensor patterns are intentionally ignored until the complete
+    // centering interval places the wheel axis near the middle of the '+'.
     if (now - intersectionPhaseStartedMs >= INTERSECTION_CENTER_MS) {
       startIntersectionPivot(now);
     } else {
@@ -1039,32 +2410,35 @@ static void updateTurningIntersectionNavigation(unsigned long now) {
   }
 
   if (
-    intersectionNavigationState == INTERSECTION_PIVOTING_LEFT ||
-    intersectionNavigationState == INTERSECTION_PIVOTING_RIGHT
+    intersectionNavigationState == INTERSECTION_PIVOT_SEARCH_LEFT ||
+    intersectionNavigationState == INTERSECTION_PIVOT_SEARCH_RIGHT
   ) {
-    // The starting all-black pattern and every early line crossing are ignored
-    // throughout the pivot. Only the calibrated gyro determines its end.
-    if (now - intersectionPhaseStartedMs >= INTERSECTION_TURN_TIMEOUT_MS) {
+    updateIntersectionWideBlackClearance();
+    // The starting all-black pattern and early line crossings are ignored
+    // until the calibrated minimum search angle has been reached.
+    if (now - intersectionPhaseStartedMs >= INTERSECTION_PIVOT_TIMEOUT_MS) {
+      startTurningForwardReacquisition(now);
+      return;
+    }
+
+    bool pivotTowardPhysicalLeft =
+      intersectionDirection == INTERSECTION_DIRECTION_LEFT;
+    if (!updateIntersectionTurnAngle(now, pivotTowardPhysicalLeft)) {
       failIntersectionNavigation();
       return;
     }
 
-    sensors_event_t acceleration, gyro, temperature;
-    if (!mpu.getEvent(&acceleration, &gyro, &temperature)) {
-      failIntersectionNavigation();
+    if (
+      intersectionTurnAngleDeg >=
+        INTERSECTION_SENSOR_SEARCH_MIN_ANGLE_DEG &&
+      isExpectedTurnEdgeDetected()
+    ) {
+      startSensorGuidedPivotAlignment(now);
       return;
     }
 
-    float deltaSeconds = (now - intersectionLastGyroUpdateMs) / 1000.0f;
-    intersectionLastGyroUpdateMs = now;
-    float angularSpeedDegPerSecond =
-      (gyro.gyro.x - gyroBiasX) * (180.0f / PI);
-    if (abs(angularSpeedDegPerSecond) > GYRO_THRESHOLD) {
-      intersectionTurnAngleDeg += abs(angularSpeedDegPerSecond) * deltaSeconds;
-    }
-
-    if (intersectionTurnAngleDeg >= INTERSECTION_TURN_TARGET_DEG) {
-      startTurningLineAcquisition(now);
+    if (intersectionTurnAngleDeg >= INTERSECTION_PIVOT_MAX_ANGLE_DEG) {
+      startTurningForwardReacquisition(now);
       return;
     }
 
@@ -1072,22 +2446,124 @@ static void updateTurningIntersectionNavigation(unsigned long now) {
     return;
   }
 
-  if (intersectionNavigationState == INTERSECTION_ACQUIRING_LINE) {
-    if (now - intersectionPhaseStartedMs >= INTERSECTION_ACQUIRE_TIMEOUT_MS) {
+  if (
+    intersectionNavigationState == INTERSECTION_SENSOR_ALIGN_LEFT ||
+    intersectionNavigationState == INTERSECTION_SENSOR_ALIGN_RIGHT
+  ) {
+    updateSensorGuidedPivotAlignment(now);
+    return;
+  }
+
+  if (
+    intersectionNavigationState == INTERSECTION_LOCKING_LINE_LEFT ||
+    intersectionNavigationState == INTERSECTION_LOCKING_LINE_RIGHT
+  ) {
+    updateLowSpeedLineLock(now);
+    return;
+  }
+
+  if (
+    intersectionNavigationState == INTERSECTION_REACQUIRING_LEFT ||
+    intersectionNavigationState == INTERSECTION_REACQUIRING_RIGHT
+  ) {
+    updateTurningForwardReacquisition(now);
+  }
+}
+
+static bool isValidUturnSearchPattern() {
+  return latestLineActiveCount >= 1 && latestLineActiveCount <= 3;
+}
+
+static void updateUturnOriginalLineClearance() {
+  if (uturnOriginalLineCleared) return;
+
+  if (latestLinePattern == 0x1F) {
+    if (uturnConsecutiveAllWhiteReadings < 255) {
+      uturnConsecutiveAllWhiteReadings++;
+    }
+    if (
+      uturnConsecutiveAllWhiteReadings >=
+      UTURN_ORIGINAL_LINE_CLEAR_READINGS
+    ) {
+      uturnOriginalLineCleared = true;
+    }
+  } else {
+    uturnConsecutiveAllWhiteReadings = 0;
+  }
+}
+
+static void printUturnDiagnostic(unsigned long now) {
+  if (
+    uturnLastDiagnosticMs != 0 &&
+    now - uturnLastDiagnosticMs < UTURN_DIAGNOSTIC_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  uturnLastDiagnosticMs = now;
+  Serial.print("UTURN_DIAG|STATE=");
+  Serial.print(intersectionNavigationStateName());
+  Serial.print("|ANGLE_DEG=");
+  Serial.print(intersectionTurnAngleDeg, 1);
+  Serial.print("|PATTERN=");
+  printLinePatternBits(latestLinePattern);
+  Serial.print("|ORIGINAL_LINE_CLEARED=");
+  Serial.print(uturnOriginalLineCleared ? 1 : 0);
+  Serial.print("|PIVOT_ELAPSED_MS=");
+  Serial.println(uturnPivotElapsedMs);
+}
+
+static void updateUturnNavigation(unsigned long now) {
+  if (now - uTurnStartedMs >= UTURN_TOTAL_TIMEOUT_MS) {
+    failIntersectionNavigation();
+    return;
+  }
+
+  if (intersectionNavigationState == INTERSECTION_UTURN_PIVOT_SEARCH) {
+    uturnPivotElapsedMs = now - intersectionPhaseStartedMs;
+    // The initial U-turn always pivots physical RIGHT. The original line must
+    // first clear for three all-white readings, and reacquisition remains
+    // disabled until the gyro reaches the minimum search angle.
+    if (!updateIntersectionTurnAngle(now, false)) {
       failIntersectionNavigation();
       return;
     }
 
-    // This explicit guard prevents the original incoming/straight line from
-    // being accepted before enough rotation, even if target tuning changes.
+    updateUturnOriginalLineClearance();
+    printUturnDiagnostic(now);
+
     if (
-      intersectionTurnAngleDeg >= INTERSECTION_MIN_ACQUIRE_ANGLE_DEG &&
-      confirmOutgoingIntersectionLine()
+      uturnOriginalLineCleared &&
+      intersectionTurnAngleDeg >= UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG &&
+      isValidUturnSearchPattern()
     ) {
+      startSensorGuidedPivotAlignment(now);
+      return;
+    }
+
+    if (uturnPivotElapsedMs >= UTURN_PIVOT_TIMEOUT_MS) {
+      failIntersectionNavigation();
+      return;
+    }
+
+    if (intersectionTurnAngleDeg >= UTURN_MAX_ANGLE_DEG) {
+      failIntersectionNavigation();
       return;
     }
 
     driveIntersectionManeuver();
+    return;
+  }
+
+  if (intersectionNavigationState == INTERSECTION_UTURN_SENSOR_ALIGN) {
+    printUturnDiagnostic(now);
+    updateSensorGuidedPivotAlignment(now);
+    return;
+  }
+
+  if (intersectionNavigationState == INTERSECTION_UTURN_LINE_LOCK) {
+    printUturnDiagnostic(now);
+    updateLowSpeedLineLock(now);
   }
 }
 
@@ -1099,7 +2575,9 @@ void updateIntersectionNavigation() {
   lastLineFollowUpdateMs = now;
   sampleLineSensors();
 
-  if (intersectionDirection == INTERSECTION_DIRECTION_STRAIGHT) {
+  if (intersectionDirection == INTERSECTION_DIRECTION_U_TURN) {
+    updateUturnNavigation(now);
+  } else if (intersectionDirection == INTERSECTION_DIRECTION_STRAIGHT) {
     updateStraightIntersectionNavigation(now);
   } else {
     updateTurningIntersectionNavigation(now);
@@ -1110,6 +2588,18 @@ void updateLineFollowing() {
   if (!lineFollowEnabled) return;
 
   unsigned long now = millis();
+  if (lineRecoveryState != LINE_RECOVERY_INACTIVE) {
+    unsigned long recoveryIntervalMs =
+      lineRecoveryState == LINE_RECOVERY_LOST_CONFIRM
+        ? LINE_FOLLOW_INTERVAL_MS
+        : RECOVERY_SAMPLE_INTERVAL_MS;
+    if (now - lastRecoverySampleMs < recoveryIntervalMs) return;
+    lastRecoverySampleMs = now;
+    sampleLineSensors();
+    updateLineRecovery(now);
+    return;
+  }
+
   if (now - lastLineFollowUpdateMs < LINE_FOLLOW_INTERVAL_MS) return;
   lastLineFollowUpdateMs = now;
 
@@ -1129,41 +2619,10 @@ void updateLineFollowing() {
 
   consecutiveIntersectionReadings = 0;
   if (latestLineActiveCount == 0) {
-    if (lineSearchPhase == LINE_SEARCH_INACTIVE) {
-      lineSearchPrimaryLeft = lastValidLinePositionError < 0.0f;
-      lineSearchPhase = LINE_SEARCH_PRIMARY;
-      lineSearchPhaseStartedMs = now;
-    }
-
-    bool searchLeft = lineSearchPrimaryLeft;
-    if (lineSearchPhase == LINE_SEARCH_PRIMARY) {
-      if (now - lineSearchPhaseStartedMs >= LINE_SEARCH_PRIMARY_MS) {
-        lineSearchPhase = LINE_SEARCH_OPPOSITE;
-        lineSearchPhaseStartedMs = now;
-        searchLeft = !lineSearchPrimaryLeft;
-      }
-    } else {
-      searchLeft = !lineSearchPrimaryLeft;
-      if (now - lineSearchPhaseStartedMs >= LINE_SEARCH_OPPOSITE_MS) {
-        stopLineFollowingForEvent(LINE_FOLLOW_LINE_LOST, "LINE_LOST");
-        return;
-      }
-    }
-
-    // Both search phases are forward-only strong arcs; the opposite sweep is
-    // longer so it crosses the original heading before checking the far side.
-    if (searchLeft) {
-      lineFollowState = LINE_FOLLOW_SEARCHING_LEFT;
-      driveForwardDifferential(LINE_SEARCH_INNER_PWM, LINE_SEARCH_OUTER_PWM);
-    } else {
-      lineFollowState = LINE_FOLLOW_SEARCHING_RIGHT;
-      driveForwardDifferential(LINE_SEARCH_OUTER_PWM, LINE_SEARCH_INNER_PWM);
-    }
+    startLineLostConfirmation(now);
     return;
   }
 
-  // Any reacquisition cancels both search phases and restores the
-  // normal proportional controller on this same update.
   resetLineSearch();
   applyProportionalLineControl();
 }
@@ -1862,6 +3321,7 @@ void printHelp() {
   Serial.println("INTERSECTION_LEFT : acquire left branch after intersection stop");
   Serial.println("INTERSECTION_RIGHT : acquire right branch after intersection stop");
   Serial.println("INTERSECTION_STRAIGHT : acquire straight branch after intersection stop");
+  Serial.println("U_TURN : start a bounded physical-right sensor-guided U-turn");
   Serial.println("Commands are case-insensitive.");
   Serial.println("==========================================");
 }
@@ -2100,6 +3560,8 @@ void handleTextCommand(const String& command) {
     startIntersectionNavigation(INTERSECTION_DIRECTION_RIGHT);
   } else if (normalizedCommand == "INTERSECTION_STRAIGHT") {
     startIntersectionNavigation(INTERSECTION_DIRECTION_STRAIGHT);
+  } else if (normalizedCommand == "U_TURN") {
+    startUturnNavigation();
   } else {
     Serial.println("ERROR|UNKNOWN_COMMAND");
   }

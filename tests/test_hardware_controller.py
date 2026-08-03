@@ -91,6 +91,11 @@ def test_movement_uses_only_esp32(
             "INTERSECTION_STRAIGHT",
             "ACK|INTERSECTION_STRAIGHT_STARTED",
         ),
+        (
+            "u_turn",
+            "U_TURN",
+            "ACK|U_TURN_STARTED",
+        ),
     ],
 )
 def test_navigation_uses_only_esp32_and_validates_exact_ack(
@@ -167,7 +172,73 @@ def test_navigation_uses_only_esp32_and_validates_exact_ack(
             "get_line_status",
             "GET_LINE_STATUS",
             "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=PIVOT_SEARCH_LEFT|PATTERN=11011",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=PIVOT_SEARCH_RIGHT|PATTERN=11111",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=SENSOR_ALIGN_LEFT|PATTERN=01111",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=SENSOR_ALIGN_RIGHT|PATTERN=11110",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=LOCKING_LINE_LEFT|PATTERN=10111",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=LOCKING_LINE_RIGHT|PATTERN=11101",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=REACQUIRING_LEFT|PATTERN=11111",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=REACQUIRING_RIGHT|PATTERN=00000",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
             "LINE_STATUS|MODE=NAVIGATION|STATE=ACQUIRING_RIGHT|PATTERN=11101",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=UTURN_PIVOT_SEARCH|PATTERN=11011",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=UTURN_SENSOR_ALIGN|PATTERN=01111",
+        ),
+        (
+            "get_line_status",
+            "GET_LINE_STATUS",
+            "VALID_LINE_STATUS",
+            "LINE_STATUS|MODE=NAVIGATION|STATE=UTURN_LINE_LOCK|PATTERN=11011",
         ),
         (
             "start_line_follow",
@@ -238,6 +309,27 @@ def test_async_line_event_is_skipped_before_valid_response() -> None:
     assert connection.writes == [b"GET_LINE\n"]
 
 
+def test_async_line_recovery_diagnostic_is_skipped_before_line_reading() -> None:
+    connection = FakeSerialConnection(
+        [
+            (
+                b"LINE|RECOVERY|STATE=GYRO_SEARCH|PATTERN=11111|"
+                b"ERROR=0.00|ANGLE=-22.5|CYCLE=1\n"
+            ),
+            b"LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011\n",
+        ]
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.get_line_reading().endswith("PATTERN=11011")
+    assert connection.writes == [b"GET_LINE\n"]
+
+
 def test_malformed_line_response_is_rejected() -> None:
     connection = FakeSerialConnection(
         [b"LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11111\n"]
@@ -268,6 +360,21 @@ def test_malformed_navigation_acknowledgement_is_rejected() -> None:
     assert connection.writes == [b"INTERSECTION_LEFT\n"]
 
 
+def test_malformed_u_turn_acknowledgement_is_rejected() -> None:
+    connection = FakeSerialConnection([b"ACK|U_TURN\n"])
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(UnexpectedSerialResponse):
+        controller.u_turn()
+
+    assert connection.writes == [b"U_TURN\n"]
+
+
 @pytest.mark.parametrize(
     "event",
     [
@@ -289,3 +396,23 @@ def test_async_navigation_event_does_not_corrupt_later_request(event: bytes) -> 
         == "ACK|INTERSECTION_STRAIGHT_STARTED"
     )
     assert connection.writes == [b"INTERSECTION_STRAIGHT\n"]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        b"EVENT|U_TURN_COMPLETE|PATTERN=11011\n",
+        b"EVENT|U_TURN_FAILED\n",
+    ],
+)
+def test_async_u_turn_event_does_not_corrupt_ack(event: bytes) -> None:
+    connection = FakeSerialConnection([event, b"ACK|U_TURN_STARTED\n"])
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.u_turn() == "ACK|U_TURN_STARTED"
+    assert connection.writes == [b"U_TURN\n"]

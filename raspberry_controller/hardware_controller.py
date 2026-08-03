@@ -212,6 +212,12 @@ class SerialController:
             if not response:
                 continue
 
+            # Recovery diagnostics are asynchronous telemetry. In particular,
+            # they intentionally share the LINE prefix used by GET_LINE and
+            # must not be mistaken for a malformed sensor response.
+            if response.startswith("LINE|RECOVERY|"):
+                continue
+
             last_non_empty_response = response
             if response.startswith("ERROR|"):
                 raise UnexpectedSerialResponse(
@@ -290,11 +296,26 @@ class RobotHardwareController:
         "CENTERING_RIGHT",
         "PIVOTING_LEFT",
         "PIVOTING_RIGHT",
+        "PIVOTING_SEARCH_LEFT",
+        "PIVOTING_SEARCH_RIGHT",
+        "ALIGNING_LEFT",
+        "ALIGNING_RIGHT",
+        "PIVOT_SEARCH_LEFT",
+        "PIVOT_SEARCH_RIGHT",
+        "SENSOR_ALIGN_LEFT",
+        "SENSOR_ALIGN_RIGHT",
+        "LOCKING_LINE_LEFT",
+        "LOCKING_LINE_RIGHT",
+        "REACQUIRING_LEFT",
+        "REACQUIRING_RIGHT",
         "TURNING_LEFT",
         "TURNING_RIGHT",
         "ACQUIRING_LEFT",
         "ACQUIRING_RIGHT",
         "ACQUIRING_STRAIGHT",
+        "UTURN_PIVOT_SEARCH",
+        "UTURN_SENSOR_ALIGN",
+        "UTURN_LINE_LOCK",
     }
 
     def __init__(
@@ -460,6 +481,16 @@ class RobotHardwareController:
             "INTERSECTION_STRAIGHT",
             "ACK|INTERSECTION_STRAIGHT_STARTED",
             response_prefix="ACK|INTERSECTION_",
+        )
+
+    def u_turn(self) -> str:
+        """Start the ESP32's bounded, sensor-guided physical U-turn."""
+
+        return self._request(
+            self.esp32,
+            "U_TURN",
+            "ACK|U_TURN_STARTED",
+            response_prefix="ACK|U_TURN",
         )
 
     def dispense(self, box_number: int, pill_count: int) -> dict[str, int]:
