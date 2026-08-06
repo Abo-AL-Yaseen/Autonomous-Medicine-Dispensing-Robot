@@ -12,6 +12,7 @@ from typing import TypeVar
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, StrictInt, model_validator
 
+from .database import SessionLocal, init_db
 from .hardware_controller import (
     ARDUINO_UNO_BAUD_RATE,
     ARDUINO_UNO_PORT,
@@ -21,6 +22,13 @@ from .hardware_controller import (
     RobotHardwareController,
     SerialController,
 )
+from .navigation.engine import NavigationService
+from .schemas.mission import (
+    MissionCreateRequest,
+    MissionStartRequest,
+    MissionStatusResponse,
+)
+from .services.mission_service import MissionService
 
 
 API_NAME = "Autonomous Medicine Dispensing Robot Hardware API"
@@ -121,6 +129,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        init_db()
+
         settings = HardwareSettings.from_environment()
         controller = controller_factory(settings)
         hardware_lock = threading.Lock()
@@ -153,6 +163,7 @@ def create_app(
         version=API_VERSION,
         lifespan=lifespan,
     )
+    application.state.mission_service = MissionService()
 
     @application.get("/")
     def api_information() -> dict[str, object]:
@@ -178,6 +189,11 @@ def create_app(
                 "/navigation/intersection/right",
                 "/navigation/intersection/straight",
                 "/navigation/u-turn",
+                "/missions",
+                "/missions/{id}",
+                "/missions/{id}/start",
+                "/missions/{id}/complete",
+                "/missions/{id}/cancel",
                 "/docs",
             ],
         }
@@ -327,6 +343,103 @@ def create_app(
             "u-turn",
             lambda controller: controller.u_turn(),
         )
+
+    @application.post("/missions")
+    def create_mission(payload: MissionCreateRequest, request: Request) -> dict[str, object]:
+        service: MissionService = request.app.state.mission_service
+        mission = service.create_mission(
+            room_id=payload.room_id,
+            medicine_id=payload.medicine_id,
+            quantity=payload.quantity,
+        )
+        return {
+            "id": mission.id,
+            "room_id": mission.room_id,
+            "medicine_id": mission.medicine_id,
+            "quantity": mission.quantity,
+            "status": mission.status.value,
+            "created_at": mission.created_at.isoformat(),
+            "completed_at": mission.completed_at.isoformat() if mission.completed_at else None,
+        }
+
+    @application.get("/missions")
+    def list_missions(request: Request) -> list[dict[str, object]]:
+        service: MissionService = request.app.state.mission_service
+        missions = service.get_missions()
+        return [
+            {
+                "id": mission.id,
+                "room_id": mission.room_id,
+                "medicine_id": mission.medicine_id,
+                "quantity": mission.quantity,
+                "status": mission.status.value,
+                "created_at": mission.created_at.isoformat(),
+                "completed_at": mission.completed_at.isoformat() if mission.completed_at else None,
+            }
+            for mission in missions
+        ]
+
+    @application.get("/missions/{mission_id}")
+    def get_mission(mission_id: int, request: Request) -> dict[str, object]:
+        service: MissionService = request.app.state.mission_service
+        mission = service.get_mission(mission_id)
+        if mission is None:
+            raise HTTPException(status_code=404, detail={"code": "MISSION_NOT_FOUND"})
+
+        return {
+            "id": mission.id,
+            "room_id": mission.room_id,
+            "medicine_id": mission.medicine_id,
+            "quantity": mission.quantity,
+            "status": mission.status.value,
+            "created_at": mission.created_at.isoformat(),
+            "completed_at": mission.completed_at.isoformat() if mission.completed_at else None,
+        }
+
+    @application.post("/missions/{mission_id}/start")
+    def start_mission(
+        mission_id: int,
+        payload: MissionStartRequest,
+        request: Request,
+    ) -> MissionStatusResponse:
+        service: MissionService = request.app.state.mission_service
+        try:
+            result = service.start_mission(
+                mission_id,
+                current_node=payload.current_node if payload.current_node is not None else 0,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"code": str(exc)}) from exc
+
+        return MissionStatusResponse(**result)
+
+    @application.post("/missions/{mission_id}/complete")
+    def complete_mission(mission_id: int, request: Request) -> dict[str, object]:
+        service: MissionService = request.app.state.mission_service
+        try:
+            mission = service.complete_mission(mission_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+
+        return {
+            "id": mission.id,
+            "status": mission.status.value,
+            "completed_at": mission.completed_at.isoformat() if mission.completed_at else None,
+        }
+
+    @application.post("/missions/{mission_id}/cancel")
+    def cancel_mission(mission_id: int, request: Request) -> dict[str, object]:
+        service: MissionService = request.app.state.mission_service
+        try:
+            mission = service.cancel_mission(mission_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail={"code": str(exc)}) from exc
+
+        return {
+            "id": mission.id,
+            "status": mission.status.value,
+            "completed_at": mission.completed_at.isoformat() if mission.completed_at else None,
+        }
 
     return application
 
