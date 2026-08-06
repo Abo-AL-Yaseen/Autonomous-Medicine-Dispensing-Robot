@@ -3,12 +3,16 @@ import {
     laravelApi,
     unwrapAxiosData,
 } from "@/src/config/api";
+import {
+  normalizeMission,
+  normalizeMissions,
+} from "@/src/services/apiAdapters";
 import { CreateMissionRequest, Mission } from "@/src/types";
 
 export const getMissions = async (): Promise<Mission[]> => {
   try {
-    const response = await laravelApi.get<Mission[]>("/missions");
-    return unwrapAxiosData(response);
+    const response = await laravelApi.get<unknown>("/missions");
+    return normalizeMissions(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(getApiErrorMessage(error, "Unable to load missions."));
   }
@@ -16,8 +20,8 @@ export const getMissions = async (): Promise<Mission[]> => {
 
 export const getMissionById = async (missionId: number): Promise<Mission> => {
   try {
-    const response = await laravelApi.get<Mission>(`/missions/${missionId}`);
-    return unwrapAxiosData(response);
+    const response = await laravelApi.get<unknown>(`/missions/${missionId}`);
+    return normalizeMission(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(
       getApiErrorMessage(error, `Unable to load mission ${missionId}.`),
@@ -29,8 +33,8 @@ export const createMission = async (
   payload: CreateMissionRequest,
 ): Promise<Mission> => {
   try {
-    const response = await laravelApi.post<Mission>("/missions", payload);
-    return unwrapAxiosData(response);
+    const response = await laravelApi.post<unknown>("/missions", payload);
+    return normalizeMission(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(getApiErrorMessage(error, "Unable to create mission."));
   }
@@ -38,14 +42,14 @@ export const createMission = async (
 
 export const updateMission = async (
   missionId: number,
-  payload: Partial<Mission>,
+  payload: Partial<CreateMissionRequest & Pick<Mission, "status">>,
 ): Promise<Mission> => {
   try {
-    const response = await laravelApi.patch<Mission>(
+    const response = await laravelApi.patch<unknown>(
       `/missions/${missionId}`,
       payload,
     );
-    return unwrapAxiosData(response);
+    return normalizeMission(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(
       getApiErrorMessage(error, `Unable to update mission ${missionId}.`),

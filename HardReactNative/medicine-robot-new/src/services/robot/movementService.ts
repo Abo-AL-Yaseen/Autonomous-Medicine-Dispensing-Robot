@@ -3,12 +3,13 @@ import {
     robotApi,
     unwrapAxiosData,
 } from "@/src/config/api";
+import { normalizeFastApiCommand } from "@/src/services/apiAdapters";
 import { MovementResponse } from "@/src/types";
 
 const movementRequest = async (endpoint: string): Promise<MovementResponse> => {
   try {
-    const response = await robotApi.post<MovementResponse>(endpoint);
-    return unwrapAxiosData(response);
+    const response = await robotApi.post<unknown>(endpoint);
+    return normalizeFastApiCommand(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(
       getApiErrorMessage(

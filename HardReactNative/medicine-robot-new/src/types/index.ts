@@ -6,53 +6,67 @@ export type MissionState =
   | "Completed";
 
 export type SelectorOption = string;
-export type RobotConnection = "Connected" | "Disconnected";
-export type RobotMode = "Autonomous" | "Manual" | "Line Follow";
+export type RobotConnection =
+  | "Connected"
+  | "Disconnected"
+  | "Request Failed";
+export type RobotMode =
+  | "Autonomous"
+  | "Manual"
+  | "Line Follow"
+  | "Unavailable";
 
 export interface Room {
   id: number;
+  number: string;
   name: string;
-  description?: string;
-  [key: string]: unknown;
+  description: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface Medicine {
   id: number;
   name: string;
-  dosage?: string;
-  stock?: number;
-  [key: string]: unknown;
+  description: string | null;
+  stock: number;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface Mission {
-  id?: number;
+  id: number;
   room_id: number;
   medicine_id: number;
+  room?: Room;
+  medicine?: Medicine;
   quantity: number;
-  status?: string;
-  created_at?: string;
-  updated_at?: string;
-  [key: string]: unknown;
+  status: string;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface RobotStatus {
   id?: number;
-  status?: string;
-  battery?: number | null;
-  connected?: boolean;
-  current_node?: string | null;
-  current_mission?: string | null;
-  mode?: string;
-  is_moving?: boolean;
-  line_following?: boolean;
-  updated_at?: string;
-  [key: string]: unknown;
+  status: string;
+  battery: number | null;
+  connected: boolean;
+  current_node: string | null;
+  current_mission_id: number | null;
+  last_seen?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
-export interface RobotHardwareStatus extends RobotStatus {
-  voltage?: number | null;
-  temperature?: number | null;
-  last_seen?: string;
+export interface RobotHardwareStatus {
+  api_reachable: boolean;
+  hardware_connected: boolean;
+  connection: RobotConnection;
+  status: string;
+  statuses: Record<string, string>;
+  mode: RobotMode;
+  battery: null;
+  error?: string;
 }
 
 export interface CreateMissionRequest {
@@ -69,31 +83,48 @@ export interface NavigationDecision {
   [key: string]: unknown;
 }
 
+export interface ApiSuccessResponse {
+  success: boolean;
+}
+
 export interface MovementResponse {
-  ok: boolean;
-  action: string;
-  message?: string;
-  [key: string]: unknown;
+  success: boolean;
+  response: string;
+  movement?: string;
 }
 
 export interface LineStatus {
-  active?: boolean;
-  status?: string;
-  sensors?: number[];
-  [key: string]: unknown;
+  success: boolean;
+  status: string;
 }
 
 export interface LineSensorResponse {
-  sensors: number[];
-  status?: string;
-  [key: string]: unknown;
+  success: boolean;
+  reading: string;
 }
 
 export interface HealthResponse {
-  ok?: boolean;
-  status?: string;
-  timestamp?: string;
-  [key: string]: unknown;
+  api_reachable: true;
+  hardware_connected: boolean;
+  connection: Exclude<RobotConnection, "Request Failed">;
+  status: string;
+}
+
+export interface RobotPingResponse {
+  success: boolean;
+  responses: Record<string, string>;
+}
+
+export interface CreateRoomRequest {
+  name: string;
+  number: string;
+  description?: string | null;
+}
+
+export interface CreateMedicineRequest {
+  name: string;
+  description?: string | null;
+  stock: number;
 }
 
 export interface RobotStatusData {

@@ -2,93 +2,71 @@ import { useEffect, useState } from "react";
 
 import { getLaravelRobotStatus } from "@/src/services/laravel/robotStatusService";
 import { getRobotHardwareStatus } from "@/src/services/robot/robotHardwareService";
+import type { RobotConnection, RobotMode } from "@/src/types";
+
+const errorMessage = (error: unknown, fallback: string): string =>
+  error instanceof Error && error.message ? error.message : fallback;
 
 export const useRobotStatus = () => {
   const [status, setStatus] = useState("Ready");
   const [battery, setBattery] = useState(0);
-  const [connection, setConnection] = useState("Disconnected");
-  const [mode, setMode] = useState("Autonomous");
+  const [connection, setConnection] =
+    useState<RobotConnection>("Disconnected");
+  const [mode, setMode] = useState<RobotMode>("Autonomous");
   const [location, setLocation] = useState("Waiting");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const loadStatus = async () => {
-      try {
-        setLoading(true);
-        const [laravelStatus, hardwareStatus] = await Promise.all([
-          getLaravelRobotStatus().catch(() => ({
-            status: "Unavailable",
-            battery: 0,
-            current_node: null,
-            current_mission: null,
-            mode: "Autonomous",
-          })),
-          getRobotHardwareStatus().catch(() => ({
-            status: "Disconnected",
-            battery: 0,
-            current_node: null,
-            current_mission: null,
-            mode: "Manual",
-          })),
-        ]);
+      setLoading(true);
 
-        const laravelState =
-          typeof laravelStatus.status === "string"
-            ? laravelStatus.status
-            : "Ready";
-        const hardwareState =
-          typeof hardwareStatus.status === "string"
-            ? hardwareStatus.status
-            : "Disconnected";
+      const [laravelResult, hardwareResult] = await Promise.allSettled([
+        getLaravelRobotStatus(),
+        getRobotHardwareStatus(),
+      ]);
+      const errors: string[] = [];
 
-        setStatus(laravelState || hardwareState || "Ready");
-        setBattery(
-          Number(hardwareStatus.battery ?? laravelStatus.battery ?? 0),
+      if (laravelResult.status === "fulfilled") {
+        const laravelStatus = laravelResult.value;
+        setStatus(laravelStatus.status);
+        setBattery(laravelStatus.battery ?? 0);
+        setLocation(laravelStatus.current_node ?? "Waiting");
+      } else {
+        errors.push(
+          errorMessage(
+            laravelResult.reason,
+            "Unable to load the Laravel robot status.",
+          ),
         );
-        setConnection(
-          hardwareStatus &&
-            (hardwareStatus as { connected?: boolean }).connected !== false
-            ? "Connected"
-            : "Disconnected",
-        );
-        const nextMode =
-          typeof (laravelStatus as { mode?: string }).mode === "string"
-            ? ((laravelStatus as { mode?: string }).mode ?? "Autonomous")
-            : typeof (hardwareStatus as { mode?: string }).mode === "string"
-              ? ((hardwareStatus as { mode?: string }).mode ?? "Autonomous")
-              : "Autonomous";
-
-        const nextLocationValue =
-          typeof (laravelStatus as { current_node?: string | null })
-            .current_node === "string" &&
-          (laravelStatus as { current_node?: string | null }).current_node
-            ? (laravelStatus as { current_node?: string | null }).current_node
-            : typeof (hardwareStatus as { current_node?: string | null })
-                  .current_node === "string" &&
-                (hardwareStatus as { current_node?: string | null })
-                  .current_node
-              ? (hardwareStatus as { current_node?: string | null })
-                  .current_node
-              : "Waiting";
-
-        const finalLocation = nextLocationValue ?? "Waiting";
-
-        setMode(nextMode);
-        setLocation(finalLocation);
-        setError(null);
-      } catch (loadError) {
-        const message =
-          loadError instanceof Error
-            ? loadError.message
-            : "Unable to load robot status.";
-        setError(message);
-      } finally {
-        setLoading(false);
       }
+
+      if (hardwareResult.status === "fulfilled") {
+        const hardwareStatus = hardwareResult.value;
+        setConnection(hardwareStatus.connection);
+        setMode(hardwareStatus.mode);
+
+        if (laravelResult.status === "rejected") {
+          setStatus(hardwareStatus.status);
+        }
+
+        if (hardwareStatus.error) errors.push(hardwareStatus.error);
+      } else {
+        setConnection("Request Failed");
+        setMode("Unavailable");
+        errors.push(
+          errorMessage(
+            hardwareResult.reason,
+            "Unable to load the FastAPI hardware status.",
+          ),
+        );
+      }
+
+      setError(errors.length > 0 ? errors.join(" ") : null);
+      setLoading(false);
     };
 
-    loadStatus();
+    void loadStatus();
   }, []);
 
   return { status, battery, connection, mode, location, loading, error };

@@ -3,12 +3,17 @@ import {
     laravelApi,
     unwrapAxiosData,
 } from "@/src/config/api";
-import { Room } from "@/src/types";
+import {
+  normalizeRoom,
+  normalizeRooms,
+  toLaravelRoomPayload,
+} from "@/src/services/apiAdapters";
+import { CreateRoomRequest, Room } from "@/src/types";
 
 export const getRooms = async (): Promise<Room[]> => {
   try {
-    const response = await laravelApi.get<Room[]>("/rooms");
-    return unwrapAxiosData(response);
+    const response = await laravelApi.get<unknown>("/rooms");
+    return normalizeRooms(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(getApiErrorMessage(error, "Unable to load rooms."));
   }
@@ -16,8 +21,8 @@ export const getRooms = async (): Promise<Room[]> => {
 
 export const getRoomById = async (roomId: number): Promise<Room> => {
   try {
-    const response = await laravelApi.get<Room>(`/rooms/${roomId}`);
-    return unwrapAxiosData(response);
+    const response = await laravelApi.get<unknown>(`/rooms/${roomId}`);
+    return normalizeRoom(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(
       getApiErrorMessage(error, `Unable to load room ${roomId}.`),
@@ -25,10 +30,13 @@ export const getRoomById = async (roomId: number): Promise<Room> => {
   }
 };
 
-export const createRoom = async (payload: Partial<Room>): Promise<Room> => {
+export const createRoom = async (payload: CreateRoomRequest): Promise<Room> => {
   try {
-    const response = await laravelApi.post<Room>("/rooms", payload);
-    return unwrapAxiosData(response);
+    const response = await laravelApi.post<unknown>(
+      "/rooms",
+      toLaravelRoomPayload(payload),
+    );
+    return normalizeRoom(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(getApiErrorMessage(error, "Unable to create room."));
   }

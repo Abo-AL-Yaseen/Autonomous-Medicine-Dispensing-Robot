@@ -18,12 +18,14 @@ import {
 } from "@/src/services/api";
 import { getRobotHardwareStatus } from "@/src/services/robot/robotHardwareService";
 import { theme } from "@/src/theme/theme";
+import type { MovementResponse, RobotConnection, RobotMode } from "@/src/types";
 
 export default function ManualControlScreen() {
   const [status, setStatus] = useState("Ready");
-  const [battery, setBattery] = useState(0);
-  const [connection, setConnection] = useState("Disconnected");
-  const [mode, setMode] = useState("Manual");
+  const [battery, setBattery] = useState<number | null>(null);
+  const [connection, setConnection] =
+    useState<RobotConnection>("Disconnected");
+  const [mode, setMode] = useState<RobotMode>("Manual");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -32,18 +34,18 @@ export default function ManualControlScreen() {
       try {
         setLoading(true);
         const data = await getRobotHardwareStatus();
-        setStatus(typeof data.status === "string" ? data.status : "Ready");
-        setBattery(Number(data.battery ?? 0));
-        setConnection(data.connected === false ? "Disconnected" : "Connected");
-        setMode(typeof data.mode === "string" ? data.mode : "Manual");
-        setError(null);
+        setStatus(data.status);
+        setBattery(data.battery);
+        setConnection(data.connection);
+        setMode(data.mode);
+        setError(data.error ?? null);
       } catch (e) {
         const message =
           e instanceof Error
             ? e.message
             : "Unable to load robot hardware status.";
         setError(message);
-        setConnection("Disconnected");
+        setConnection("Request Failed");
         setStatus("Unavailable");
       } finally {
         setLoading(false);
@@ -54,19 +56,21 @@ export default function ManualControlScreen() {
   }, []);
 
   const updateRobotState = async (
-    action: () => Promise<{ ok: boolean; action: string; message?: string }>,
+    action: () => Promise<MovementResponse>,
     nextStatus: string,
   ) => {
     try {
       setLoading(true);
       setError(null);
-      await action();
+      const result = await action();
+      if (!result.success) {
+        throw new Error("The robot API rejected the command.");
+      }
       setStatus(nextStatus);
       const hardware = await getRobotHardwareStatus();
-      setBattery(Number(hardware.battery ?? battery));
-      setConnection(
-        hardware.connected === false ? "Disconnected" : "Connected",
-      );
+      setConnection(hardware.connection);
+      setMode(hardware.mode);
+      setError(hardware.error ?? null);
     } catch (e) {
       const message =
         e instanceof Error ? e.message : "Movement command failed.";
@@ -133,7 +137,10 @@ export default function ManualControlScreen() {
 
         <View style={styles.statusGrid}>
           <StatusCard label="Robot Status" value={status} />
-          <StatusCard label="Battery" value={`${battery}%`} />
+          <StatusCard
+            label="Battery"
+            value={battery === null ? "N/A" : `${battery}%`}
+          />
           <StatusCard label="Connection" value={connection} />
           <StatusCard label="Mode" value={mode} />
         </View>

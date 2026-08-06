@@ -3,6 +3,7 @@ import {
     robotApi,
     unwrapAxiosData,
 } from "@/src/config/api";
+import { normalizeFastApiCommand } from "@/src/services/apiAdapters";
 import { LineSensorResponse, LineStatus, MovementResponse } from "@/src/types";
 
 export const getLineStatus = async (): Promise<LineStatus> => {
@@ -25,8 +26,8 @@ export const getLineSensors = async (): Promise<LineSensorResponse> => {
 
 export const startLineFollowing = async (): Promise<MovementResponse> => {
   try {
-    const response = await robotApi.post<MovementResponse>("/line/start");
-    return unwrapAxiosData(response);
+    const response = await robotApi.post<unknown>("/line/start");
+    return normalizeFastApiCommand(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(
       getApiErrorMessage(error, "Unable to start line following."),
@@ -36,8 +37,8 @@ export const startLineFollowing = async (): Promise<MovementResponse> => {
 
 export const stopLineFollowing = async (): Promise<MovementResponse> => {
   try {
-    const response = await robotApi.post<MovementResponse>("/line/stop");
-    return unwrapAxiosData(response);
+    const response = await robotApi.post<unknown>("/line/stop");
+    return normalizeFastApiCommand(unwrapAxiosData(response));
   } catch (error) {
     throw new Error(
       getApiErrorMessage(error, "Unable to stop line following."),

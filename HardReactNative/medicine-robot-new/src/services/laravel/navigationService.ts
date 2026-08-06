@@ -3,22 +3,25 @@ import {
     laravelApi,
     unwrapAxiosData,
 } from "@/src/config/api";
-import { NavigationDecision } from "@/src/types";
+import {
+  normalizeSuccessResponse,
+  requireMissionId,
+} from "@/src/services/apiAdapters";
+import { ApiSuccessResponse, NavigationDecision } from "@/src/types";
 
 export const startRobotNavigation = async (
   missionId: number,
-): Promise<{
-  mission_id?: number;
-  status?: string;
-  [key: string]: unknown;
-}> => {
+): Promise<ApiSuccessResponse> => {
   try {
-    const response = await laravelApi.post<{
-      mission_id?: number;
-      status?: string;
-      [key: string]: unknown;
-    }>("/robot/navigation/start", { mission_id: missionId });
-    return unwrapAxiosData(response);
+    const validMissionId = requireMissionId(missionId);
+    const response = await laravelApi.post<unknown>(
+      "/robot/navigation/start",
+      { mission_id: validMissionId },
+    );
+    return normalizeSuccessResponse(
+      unwrapAxiosData(response),
+      "navigation start",
+    );
   } catch (error) {
     throw new Error(
       getApiErrorMessage(error, "Unable to start robot navigation."),
@@ -44,13 +47,16 @@ export const sendNavigationDecision = async (
 
 export const sendNavigationArrival = async (
   payload: NavigationDecision,
-): Promise<NavigationDecision> => {
+): Promise<ApiSuccessResponse> => {
   try {
-    const response = await laravelApi.post<NavigationDecision>(
+    const response = await laravelApi.post<unknown>(
       "/robot/navigation/arrived",
       payload,
     );
-    return unwrapAxiosData(response);
+    return normalizeSuccessResponse(
+      unwrapAxiosData(response),
+      "navigation arrival",
+    );
   } catch (error) {
     throw new Error(getApiErrorMessage(error, "Unable to confirm arrival."));
   }

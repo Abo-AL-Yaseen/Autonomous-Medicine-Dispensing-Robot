@@ -34,10 +34,11 @@ export default function DeliveryScreen() {
       try {
         setLoadingRooms(true);
         setLoadingMedicines(true);
+        setError(null);
 
         const [loadedRooms, loadedMedicines] = await Promise.all([
-          getRooms().catch(() => []),
-          getMedicines().catch(() => []),
+          getRooms(),
+          getMedicines(),
         ]);
 
         setRooms(loadedRooms);
@@ -50,8 +51,28 @@ export default function DeliveryScreen() {
         if (loadedMedicines.length > 0) {
           setSelectedMedicine(String(loadedMedicines[0].id));
         }
-      } catch {
-        setError("Unable to load rooms and medicines.");
+
+        if (loadedRooms.length === 0 && loadedMedicines.length === 0) {
+          setError("No rooms or medicines exist.");
+        } else if (loadedRooms.length === 0) {
+          setError("No rooms exist.");
+        } else if (loadedMedicines.length === 0) {
+          setError("No medicines exist.");
+        }
+      } catch (loadError) {
+        const message =
+          loadError instanceof Error && loadError.message
+            ? loadError.message
+            : "Unable to load rooms and medicines.";
+        setRooms([]);
+        setMedicines([]);
+        setSelectedRoom("0");
+        setSelectedMedicine("0");
+        setError(
+          message.startsWith("Invalid ")
+            ? `Invalid response received: ${message}`
+            : `Backend request failed: ${message}`,
+        );
       } finally {
         setLoadingRooms(false);
         setLoadingMedicines(false);
@@ -152,7 +173,13 @@ export default function DeliveryScreen() {
           <PrimaryButton
             label="Start Delivery"
             onPress={handleStartDelivery}
-            disabled={creatingMission || loadingRooms || loadingMedicines}
+            disabled={
+              creatingMission ||
+              loadingRooms ||
+              loadingMedicines ||
+              rooms.length === 0 ||
+              medicines.length === 0
+            }
             loading={creatingMission}
           />
           {error ? <Text style={styles.errorText}>{error}</Text> : null}
