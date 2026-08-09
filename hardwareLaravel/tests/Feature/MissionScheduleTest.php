@@ -20,7 +20,10 @@ class MissionScheduleTest extends TestCase
     {
         parent::setUp();
 
-        config(['services.robot_api.timezone' => 'Asia/Hebron']);
+        config([
+            'services.robot_api.timezone' => 'Asia/Hebron',
+            'services.robot_api.mission_claim_lease_seconds' => 60,
+        ]);
     }
 
     public function test_suite_uses_isolated_in_memory_database(): void
@@ -28,6 +31,14 @@ class MissionScheduleTest extends TestCase
         $this->assertSame(
             ':memory:',
             config('database.connections.sqlite.database'),
+        );
+    }
+
+    public function test_claim_lease_defaults_to_sixty_seconds(): void
+    {
+        $this->assertSame(
+            60,
+            config('services.robot_api.mission_claim_lease_seconds'),
         );
     }
 
@@ -95,6 +106,194 @@ class MissionScheduleTest extends TestCase
         $this->assertNull($secondClaim);
         $this->assertSame('pending', $mission->fresh()->status);
         $this->assertNotNull($mission->fresh()->schedule_claimed_at);
+    }
+
+    public function test_claim_api_does_not_claim_a_future_mission(): void
+    {
+        $this->createMission('pending', '2026-08-09 18:01:00');
+
+        $this->claimDue('2026-08-09 21:00:00')
+            ->assertOk()
+            ->assertExactJson([
+                'success' => true,
+                'claimed' => false,
+                'mission' => null,
+            ]);
+    }
+
+    public function test_claim_api_claims_an_exact_time_mission_once(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 18:00:00');
+
+        $first = $this->claimDue('2026-08-09 21:00:00');
+        $second = $this->claimDue('2026-08-09 21:00:00');
+
+        $first
+            ->assertOk()
+            ->assertJsonPath('claimed', true)
+            ->assertJsonPath('mission.id', $mission->id)
+            ->assertJsonPath('mission.status', 'pending')
+            ->assertJsonPath(
+                'mission.schedule_claimed_at',
+                '2026-08-09T18:00:00+00:00',
+            );
+        $second
+            ->assertOk()
+            ->assertJsonPath('claimed', false)
+            ->assertJsonPath('mission', null);
+        $this->assertSame('pending', $mission->fresh()->status);
+    }
+
+    public function test_claim_api_claims_an_overdue_pending_mission(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 17:00:00');
+
+        $this->claimDue('2026-08-09 21:00:00')
+            ->assertOk()
+            ->assertJsonPath('mission.id', $mission->id);
+    }
+
+    public function test_claim_api_claims_the_oldest_due_mission_first(): void
+    {
+        $newer = $this->createMission('pending', '2026-08-09 17:30:00');
+        $older = $this->createMission('pending', '2026-08-09 17:00:00');
+
+        $this->claimDue('2026-08-09 21:00:00')
+            ->assertOk()
+            ->assertJsonPath('mission.id', $older->id);
+        $this->assertNull($newer->fresh()->schedule_claimed_at);
+    }
+
+    public function test_claim_api_ignores_unscheduled_and_non_pending_missions(): void
+    {
+        $this->createMission('pending', null);
+        $this->createMission('in_progress', '2026-08-09 17:00:00');
+        $this->createMission('completed', '2026-08-09 17:00:00');
+
+        $this->claimDue('2026-08-09 21:00:00')
+            ->assertOk()
+            ->assertJsonPath('claimed', false);
+    }
+
+    public function test_claim_api_ignores_an_already_claimed_mission(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 17:00:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 17:59:30',
+            'UTC',
+        );
+        $mission->save();
+
+        $this->claimDue('2026-08-09 21:00:00')
+            ->assertOk()
+            ->assertJsonPath('claimed', false);
+    }
+
+    public function test_fresh_claim_is_not_reclaimable_before_lease_expiry(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 17:00:00');
+        $claimedAt = CarbonImmutable::parse('2026-08-09 18:00:00', 'UTC');
+
+        $this->assertSame(
+            $mission->id,
+            $this->service()->claimNextDue($claimedAt)?->id,
+        );
+        $this->assertNull(
+            $this->service()->claimNextDue($claimedAt->addSeconds(59)),
+        );
+        $this->assertTrue(
+            $mission->fresh()->schedule_claimed_at->equalTo($claimedAt),
+        );
+    }
+
+    public function test_stale_claim_is_reclaimed_and_refreshes_same_mission(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 17:00:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 17:59:00',
+            'UTC',
+        );
+        $mission->save();
+        $reclaimTime = CarbonImmutable::parse('2026-08-09 18:00:00', 'UTC');
+
+        $reclaimed = $this->service()->claimNextDue($reclaimTime);
+
+        $this->assertSame($mission->id, $reclaimed?->id);
+        $this->assertTrue(
+            $mission->fresh()->schedule_claimed_at->equalTo($reclaimTime),
+        );
+        $this->assertSame('pending', $mission->fresh()->status);
+    }
+
+    public function test_completed_mission_with_stale_claim_is_never_reclaimable(): void
+    {
+        $mission = $this->createMission('completed', '2026-08-09 17:00:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 16:00:00',
+            'UTC',
+        );
+        $mission->save();
+
+        $this->assertNull($this->service()->claimNextDue(
+            CarbonImmutable::parse('2026-08-09 18:00:00', 'UTC'),
+        ));
+    }
+
+    public function test_in_progress_mission_with_stale_claim_is_never_reclaimable(): void
+    {
+        $mission = $this->createMission('in_progress', '2026-08-09 17:00:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 16:00:00',
+            'UTC',
+        );
+        $mission->save();
+
+        $this->assertNull($this->service()->claimNextDue(
+            CarbonImmutable::parse('2026-08-09 18:00:00', 'UTC'),
+        ));
+    }
+
+    public function test_future_mission_with_stale_claim_is_not_reclaimable(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 18:01:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 16:00:00',
+            'UTC',
+        );
+        $mission->save();
+
+        $this->assertNull($this->service()->claimNextDue(
+            CarbonImmutable::parse('2026-08-09 18:00:00', 'UTC'),
+        ));
+    }
+
+    public function test_stale_claim_can_only_be_reclaimed_once_per_lease_window(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 17:00:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 16:00:00',
+            'UTC',
+        );
+        $mission->save();
+        $rtcTime = CarbonImmutable::parse('2026-08-09 18:00:00', 'UTC');
+
+        $first = $this->service()->claimNextDue($rtcTime);
+        $second = $this->service()->claimNextDue($rtcTime);
+
+        $this->assertSame($mission->id, $first?->id);
+        $this->assertNull($second);
+        $this->assertTrue(
+            $mission->fresh()->schedule_claimed_at->equalTo($rtcTime),
+        );
+    }
+
+    public function test_claim_api_requires_the_configured_timezone(): void
+    {
+        $this->postJson('/api/missions/claim-due', [
+            'robot_datetime' => '2026-08-09 21:00:00',
+            'timezone' => 'UTC',
+        ])->assertUnprocessable()
+            ->assertJsonValidationErrors('timezone');
     }
 
     public function test_mission_api_interprets_palestine_schedule_and_stores_utc(): void
@@ -181,6 +380,14 @@ class MissionScheduleTest extends TestCase
     private function scheduleTime(): MissionScheduleTime
     {
         return app(MissionScheduleTime::class);
+    }
+
+    private function claimDue(string $robotDateTime)
+    {
+        return $this->postJson('/api/missions/claim-due', [
+            'robot_datetime' => $robotDateTime,
+            'timezone' => 'Asia/Hebron',
+        ]);
     }
 
     private function createMission(string $status, ?string $scheduledAt): Mission

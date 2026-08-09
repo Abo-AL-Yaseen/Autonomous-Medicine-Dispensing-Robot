@@ -40,6 +40,7 @@ return [
         'connect_timeout' => (float) env('ROBOT_API_CONNECT_TIMEOUT', 1),
         'timeout' => (float) env('ROBOT_API_TIMEOUT', 2),
         'timezone' => env('ROBOT_TIMEZONE', 'Asia/Hebron'),
+        'mission_claim_lease_seconds' => (int) env('MISSION_CLAIM_LEASE_SECONDS', 60),
     ],
 
 ];

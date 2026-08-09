@@ -8,6 +8,7 @@ from math import ceil
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TypeVar
 
 from fastapi import FastAPI, HTTPException, Request
@@ -30,6 +31,14 @@ from .schemas.mission import (
     MissionStatusResponse,
 )
 from .services.mission_service import MissionService
+from .services.laravel_api_client import LaravelApiClient
+from .services.mission_executor import MissionExecutor
+from .services.mission_scheduler import (
+    LaravelMissionClient,
+    MissionScheduler,
+    MissionSchedulerLoop,
+    SchedulerSettings,
+)
 
 
 API_NAME = "Autonomous Medicine Dispensing Robot Hardware API"
@@ -42,6 +51,7 @@ DEFAULT_ROBOT_TIMEZONE = "Asia/Hebron"
 
 ResultType = TypeVar("ResultType")
 ControllerFactory = Callable[["HardwareSettings"], RobotHardwareController]
+LaravelClientFactory = Callable[[SchedulerSettings], LaravelMissionClient]
 
 
 @dataclass(frozen=True)
@@ -164,8 +174,18 @@ def build_hardware_controller(settings: HardwareSettings) -> RobotHardwareContro
     return RobotHardwareController(esp32=esp32, arduino_uno=arduino_uno)
 
 
+def build_laravel_client(settings: SchedulerSettings) -> LaravelApiClient:
+    """Create the HTTP-only client for Laravel mission claiming."""
+
+    return LaravelApiClient(
+        settings.laravel_api_url,
+        settings.laravel_api_timeout_seconds,
+    )
+
+
 def create_app(
     controller_factory: ControllerFactory = build_hardware_controller,
+    laravel_client_factory: LaravelClientFactory = build_laravel_client,
 ) -> FastAPI:
     """Create an API application, optionally with an injected test controller."""
 
@@ -174,13 +194,41 @@ def create_app(
         init_db()
 
         settings = HardwareSettings.from_environment()
+        scheduler_settings = SchedulerSettings.from_environment()
         controller = controller_factory(settings)
         hardware_lock = threading.Lock()
+        laravel_client = laravel_client_factory(scheduler_settings)
+        executor = MissionExecutor()
 
         application.state.hardware_controller = controller
         application.state.hardware_lock = hardware_lock
         application.state.hardware_connected = False
         application.state.hardware_settings = settings
+
+        def hardware_available() -> bool:
+            return bool(application.state.hardware_connected)
+
+        def read_rtc() -> datetime:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.get_rtc_datetime()
+
+        scheduler = MissionScheduler(
+            hardware_available=hardware_available,
+            read_rtc=read_rtc,
+            laravel_client=laravel_client,
+            executor=executor,
+            timezone_name=settings.robot_timezone,
+        )
+        scheduler_loop = MissionSchedulerLoop(
+            scheduler,
+            enabled=scheduler_settings.enabled,
+            interval_seconds=scheduler_settings.interval_seconds,
+        )
+        application.state.mission_executor = executor
+        application.state.mission_scheduler = scheduler
+        application.state.mission_scheduler_loop = scheduler_loop
 
         try:
             with hardware_lock:
@@ -190,22 +238,30 @@ def create_app(
             # Keep /health available even when hardware is disconnected.
             application.state.hardware_connected = False
 
+        scheduler_loop.start()
+
         try:
             yield
         finally:
+            scheduler_loop.stop()
             try:
-                with hardware_lock:
-                    controller.close()
-            except HardwareControllerError:
-                pass
+                laravel_client.close()
             finally:
-                application.state.hardware_connected = False
+                try:
+                    with hardware_lock:
+                        controller.close()
+                except HardwareControllerError:
+                    pass
+                finally:
+                    application.state.hardware_connected = False
 
     application = FastAPI(
         title=API_NAME,
         version=API_VERSION,
         lifespan=lifespan,
     )
+    # Legacy SQLAlchemy mission routes remain available for compatibility only.
+    # The new scheduler/executor path never reads or writes hospital.db.
     application.state.mission_service = MissionService()
 
     @application.get("/")
@@ -219,6 +275,8 @@ def create_app(
                 "/ping",
                 "/status",
                 "/rtc",
+                "/scheduler/status",
+                "/scheduler/tick",
                 "/dispense",
                 "/water/dispense",
                 "/movement/forward",
@@ -278,6 +336,23 @@ def create_app(
             "datetime": rtc_datetime.isoformat(timespec="seconds"),
             "source": "DS1302",
             "timezone": settings.robot_timezone,
+        }
+
+    @application.get("/scheduler/status")
+    def scheduler_status(request: Request) -> dict[str, object]:
+        scheduler_loop: MissionSchedulerLoop = (
+            request.app.state.mission_scheduler_loop
+        )
+        return scheduler_loop.status()
+
+    @application.post("/scheduler/tick")
+    def scheduler_tick(request: Request) -> dict[str, object]:
+        scheduler: MissionScheduler = request.app.state.mission_scheduler
+        executor: MissionExecutor = request.app.state.mission_executor
+        result = scheduler.tick()
+        return {
+            **result.as_dict(),
+            "executor": executor.status(),
         }
 
     @application.post("/dispense")

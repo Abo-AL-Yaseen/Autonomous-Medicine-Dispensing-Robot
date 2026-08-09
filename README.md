@@ -33,6 +33,11 @@ The API reads these optional environment variables:
 | `READ_TIMEOUT` | `2.0` seconds |
 | `ROBOT_TIMEZONE` | `Asia/Hebron` (the DS1302 Palestine wall-clock timezone) |
 | `WATER_FLOW_ML_PER_SECOND` | `0` (disabled until physically calibrated) |
+| `LARAVEL_API_URL` | `http://127.0.0.1:8000/api` |
+| `LARAVEL_API_TIMEOUT_SECONDS` | `2.0` seconds |
+| `MISSION_SCHEDULER_ENABLED` | `false` |
+| `MISSION_SCHEDULER_INTERVAL_SECONDS` | `5.0` seconds |
+| `MISSION_CLAIM_LEASE_SECONDS` | `60` seconds (Laravel stale-claim recovery) |
 
 ## Validation
 
@@ -76,6 +81,97 @@ offset metadata. Those fields represent Palestine wall-clock time. Raspberry Pi
 and Laravel must therefore interpret them with the `Asia/Hebron` timezone
 database rules. Daylight-saving conversion belongs in software and must never
 be implemented as a fixed offset in the ESP32 firmware.
+
+## Scheduled mission claiming
+
+The scheduler uses this one-way source-of-truth path:
+
+```text
+DS1302 → ESP32 GET_RTC → Raspberry MissionScheduler → HTTP → Laravel missions
+```
+
+Each eligible scheduler tick verifies that hardware is available, reads the
+DS1302 wall-clock, and posts it to Laravel's
+`POST /api/missions/claim-due` endpoint:
+
+```json
+{
+  "robot_datetime": "2026-08-09 21:40:00",
+  "timezone": "Asia/Hebron"
+}
+```
+
+Before either the hardware check or RTC read, the scheduler requires the
+`MissionExecutor` to be `IDLE`. Any ready or future busy state returns
+`EXECUTOR_BUSY` without reading the RTC or calling Laravel. If Laravel claims a
+mission but the executor boundary unexpectedly rejects it, the scheduler keeps
+that mission in memory and retries the same acceptance before permitting a new
+claim; `/scheduler/status` exposes its ID as
+`pending_acceptance_mission_id`.
+
+When no mission is due, Laravel returns:
+
+```json
+{
+  "success": true,
+  "claimed": false,
+  "mission": null
+}
+```
+
+When a mission is claimed, `claimed` is `true` and `mission` is the normal
+Laravel mission resource, including its nested room and medicine. For example:
+
+```json
+{
+  "success": true,
+  "claimed": true,
+  "mission": {
+    "id": 8,
+    "room": { "id": 1 },
+    "medicine": { "id": 2 },
+    "quantity": 4,
+    "status": "pending",
+    "schedule_claimed_at": "2026-08-09T18:40:00+00:00"
+  }
+}
+```
+
+Laravel atomically fills `schedule_claimed_at` for the oldest eligible pending
+mission and leaves its status as `pending`. The Raspberry `MissionExecutor` then
+holds only the runtime fields required for the software state
+`READY_FOR_EXECUTION`. It does not move, navigate, use the camera, dispense
+medicine, dispense water, or mark a mission complete.
+
+`schedule_claimed_at` is a Laravel-managed lease rather than a permanent claim.
+A pending, due mission becomes claimable again when its claim timestamp is at
+least `MISSION_CLAIM_LEASE_SECONDS` older than the current DS1302-derived UTC
+comparison time. An in-process executor acceptance failure retries the held
+mission first; after a process crash or power loss, Laravel refreshes the stale
+lease and returns that same mission ID. Missions that are not pending or not yet
+due are never recovered through the lease.
+
+The background loop is disabled by default. When
+`MISSION_SCHEDULER_ENABLED=true`, one thread per FastAPI process calls `tick()`
+at the configured interval and stops during application shutdown. Never use
+Uvicorn `--reload` or multiple workers with it: each process owns its own
+hardware connection and scheduler loop, which could create competing RTC reads
+and claim requests.
+
+Safe development endpoints are available even when the periodic loop is off:
+
+- `GET /scheduler/status` reports whether the loop is enabled/running, executor
+  state, held mission ID, and the most recent tick result.
+- `POST /scheduler/tick` performs one claim-only cycle. It contains no movement
+  or dispensing behavior.
+
+### Legacy Raspberry database
+
+`raspberry_controller/hospital.db`, the SQLAlchemy `MissionService`, and the old
+FastAPI `/missions` routes remain for compatibility with earlier navigation and
+camera code. They are legacy and disconnected from the new scheduler/executor.
+The scheduler never imports that service, copies a Laravel mission into SQLite,
+or queries `hospital.db`; Laravel is the only scheduled-mission database.
 
 ## Calibrated water API
 

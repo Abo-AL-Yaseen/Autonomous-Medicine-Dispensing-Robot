@@ -1,7 +1,9 @@
 <?php
 
 use App\Http\Controllers\Api\MedicineController;
+use App\Http\Controllers\Api\MissionClaimController;
 use App\Http\Controllers\Api\MissionController;
+use App\Http\Controllers\Api\RobotNavigationController;
 use App\Http\Controllers\Api\RobotStatusController;
 use App\Http\Controllers\Api\RoomController;
 use Illuminate\Http\Request;
@@ -11,6 +13,7 @@ Route::middleware('api')->group(function () {
     Route::apiResource('rooms', RoomController::class);
     Route::apiResource('medicines', MedicineController::class);
 
+    Route::post('missions/claim-due', MissionClaimController::class);
     Route::get('missions', [MissionController::class, 'index']);
     Route::get('missions/{mission}', [MissionController::class, 'show']);
     Route::post('missions', [MissionController::class, 'store']);
@@ -20,9 +23,9 @@ Route::middleware('api')->group(function () {
     Route::get('robot/status', [RobotStatusController::class, 'index']);
     Route::patch('robot/status', [RobotStatusController::class, 'update']);
 
-    Route::post('robot/navigation/start', [\App\Http\Controllers\Api\RobotNavigationController::class, 'start']);
-    Route::post('robot/navigation/decision', [\App\Http\Controllers\Api\RobotNavigationController::class, 'decision']);
-    Route::post('robot/navigation/arrived', [\App\Http\Controllers\Api\RobotNavigationController::class, 'arrived']);
+    Route::post('robot/navigation/start', [RobotNavigationController::class, 'start']);
+    Route::post('robot/navigation/decision', [RobotNavigationController::class, 'decision']);
+    Route::post('robot/navigation/arrived', [RobotNavigationController::class, 'arrived']);
 });
 
 Route::get('/user', function (Request $request) {

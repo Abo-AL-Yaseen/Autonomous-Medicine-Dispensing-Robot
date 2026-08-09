@@ -16,6 +16,8 @@ from raspberry_controller.api import (
     create_app,
 )
 from raspberry_controller.hardware_controller import SerialConnectionError
+from raspberry_controller.services.laravel_api_client import ClaimedMission
+from raspberry_controller.services.mission_scheduler import SchedulerSettings
 
 
 class FakeHardwareController:
@@ -149,9 +151,32 @@ class FakeHardwareController:
             raise self.hardware_error
 
 
+class FakeLaravelClient:
+    def __init__(self) -> None:
+        self.claimed_mission: ClaimedMission | None = None
+        self.calls: list[tuple[datetime, str]] = []
+        self.closed = False
+
+    def claim_due_mission(
+        self,
+        robot_datetime: datetime,
+        timezone_name: str,
+    ) -> ClaimedMission | None:
+        self.calls.append((robot_datetime, timezone_name))
+        return self.claimed_mission
+
+    def close(self) -> None:
+        self.closed = True
+
+
 @pytest.fixture
 def fake_hardware() -> FakeHardwareController:
     return FakeHardwareController()
+
+
+@pytest.fixture
+def fake_laravel() -> FakeLaravelClient:
+    return FakeLaravelClient()
 
 
 def test_robot_timezone_defaults_to_asia_hebron(
@@ -165,10 +190,12 @@ def test_robot_timezone_defaults_to_asia_hebron(
 @pytest.fixture
 def client(
     fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[TestClient]:
     monkeypatch.setenv("WATER_FLOW_ML_PER_SECOND", "50")
     monkeypatch.setenv("ROBOT_TIMEZONE", "Asia/Hebron")
+    monkeypatch.setenv("MISSION_SCHEDULER_ENABLED", "false")
 
     def fake_factory(settings: HardwareSettings) -> FakeHardwareController:
         assert settings.esp32_port.startswith("/dev/serial/by-id/")
@@ -177,11 +204,19 @@ def client(
         assert settings.robot_timezone == "Asia/Hebron"
         return fake_hardware
 
-    application = create_app(controller_factory=fake_factory)
+    def fake_laravel_factory(settings: SchedulerSettings) -> FakeLaravelClient:
+        assert settings.enabled is False
+        return fake_laravel
+
+    application = create_app(
+        controller_factory=fake_factory,
+        laravel_client_factory=fake_laravel_factory,
+    )
     with TestClient(application) as test_client:
         yield test_client
 
     assert fake_hardware.closed is True
+    assert fake_laravel.closed is True
 
 
 def test_root_lists_api_information(client: TestClient) -> None:
@@ -193,6 +228,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert body["version"] == "1.0.0"
     assert "/dispense" in body["endpoints"]
     assert "/rtc" in body["endpoints"]
+    assert "/scheduler/status" in body["endpoints"]
+    assert "/scheduler/tick" in body["endpoints"]
     assert "/water/dispense" in body["endpoints"]
     assert "/movement/stop" in body["endpoints"]
     assert "/line/start" in body["endpoints"]
@@ -256,6 +293,85 @@ def test_rtc_hardware_unavailable_is_safe(
     assert response.status_code == 503
     assert response.json() == {"detail": {"code": "HARDWARE_UNAVAILABLE"}}
     assert fake_hardware.rtc_calls == 0
+
+
+def test_scheduler_status_is_idle_and_disabled_by_default(
+    client: TestClient,
+) -> None:
+    response = client.get("/scheduler/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": False,
+        "running": False,
+        "state": "IDLE",
+        "mission_id": None,
+        "room_id": None,
+        "medicine_id": None,
+        "quantity": None,
+        "pending_acceptance_mission_id": None,
+        "last_tick_at": None,
+        "last_result": None,
+    }
+
+
+def test_manual_scheduler_tick_is_safe_when_no_mission_is_due(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    response = client.post("/scheduler/tick")
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "NO_DUE_MISSION"
+    assert response.json()["executor"]["state"] == "IDLE"
+    assert fake_hardware.rtc_calls == 1
+    assert fake_laravel.calls == [
+        (datetime(2026, 8, 9, 20, 30, 0), "Asia/Hebron")
+    ]
+    assert fake_hardware.movement_calls == []
+    assert fake_hardware.dispense_calls == []
+    assert fake_hardware.water_calls == []
+
+
+def test_manual_scheduler_tick_only_prepares_claimed_mission(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    fake_laravel.claimed_mission = ClaimedMission(8, 1, 2, 4)
+
+    response = client.post("/scheduler/tick")
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "READY_FOR_EXECUTION"
+    assert response.json()["executor"] == {
+        "state": "READY_FOR_EXECUTION",
+        "mission_id": 8,
+        "room_id": 1,
+        "medicine_id": 2,
+        "quantity": 4,
+    }
+    assert fake_hardware.movement_calls == []
+    assert fake_hardware.line_calls == []
+    assert fake_hardware.navigation_calls == []
+    assert fake_hardware.dispense_calls == []
+    assert fake_hardware.water_calls == []
+
+
+def test_manual_scheduler_tick_does_not_claim_without_hardware(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    client.app.state.hardware_connected = False
+
+    response = client.post("/scheduler/tick")
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "HARDWARE_UNAVAILABLE"
+    assert fake_hardware.rtc_calls == 0
+    assert fake_laravel.calls == []
 
 
 def test_dispense_rejects_both_boxes_zero(client: TestClient) -> None:

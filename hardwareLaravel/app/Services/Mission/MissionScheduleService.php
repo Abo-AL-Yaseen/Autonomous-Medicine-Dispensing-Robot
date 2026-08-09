@@ -5,7 +5,9 @@ namespace App\Services\Mission;
 use App\Models\Mission;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 
 class MissionScheduleService
 {
@@ -14,17 +16,17 @@ class MissionScheduleService
      */
     public function isDue(Mission $mission, CarbonInterface $rtcTime): bool
     {
+        $rtcUtc = CarbonImmutable::instance($rtcTime)->utc();
+
         if (
             $mission->status !== 'pending'
             || $mission->scheduled_at === null
-            || $mission->schedule_claimed_at !== null
         ) {
             return false;
         }
 
-        return $mission->scheduled_at->utc()->lessThanOrEqualTo(
-            CarbonImmutable::instance($rtcTime)->utc(),
-        );
+        return $mission->scheduled_at->utc()->lessThanOrEqualTo($rtcUtc)
+            && $this->claimIsAvailable($mission, $rtcUtc);
     }
 
     /**
@@ -33,13 +35,18 @@ class MissionScheduleService
     public function claimNextDue(CarbonInterface $rtcTime): ?Mission
     {
         $rtcUtc = CarbonImmutable::instance($rtcTime)->utc();
+        $staleBefore = $rtcUtc->subSeconds($this->claimLeaseSeconds());
 
-        return DB::transaction(function () use ($rtcUtc): ?Mission {
+        return DB::transaction(function () use ($rtcUtc, $staleBefore): ?Mission {
             $mission = Mission::query()
                 ->where('status', 'pending')
                 ->whereNotNull('scheduled_at')
-                ->whereNull('schedule_claimed_at')
                 ->where('scheduled_at', '<=', $rtcUtc)
+                ->where(function (Builder $query) use ($staleBefore): void {
+                    $query
+                        ->whereNull('schedule_claimed_at')
+                        ->orWhere('schedule_claimed_at', '<=', $staleBefore);
+                })
                 ->orderBy('scheduled_at')
                 ->orderBy('id')
                 ->lockForUpdate()
@@ -49,10 +56,58 @@ class MissionScheduleService
                 return null;
             }
 
-            $mission->schedule_claimed_at = $rtcUtc;
-            $mission->save();
+            $observedClaimedAt = $mission->schedule_claimed_at?->utc();
+
+            // The conditional update is the final compare-and-set guard. If a
+            // competing transaction claimed this row first, this caller gets
+            // no mission even on databases where row locks are limited.
+            $claimQuery = Mission::query()
+                ->whereKey($mission->getKey())
+                ->where('status', 'pending')
+                ->whereNotNull('scheduled_at')
+                ->where('scheduled_at', '<=', $rtcUtc);
+
+            if ($observedClaimedAt === null) {
+                $claimQuery->whereNull('schedule_claimed_at');
+            } else {
+                $claimQuery
+                    ->where('schedule_claimed_at', $observedClaimedAt)
+                    ->where('schedule_claimed_at', '<=', $staleBefore);
+            }
+
+            $claimed = $claimQuery->update(['schedule_claimed_at' => $rtcUtc]);
+
+            if ($claimed !== 1) {
+                return null;
+            }
 
             return $mission->fresh(['room', 'medicine']);
         });
+    }
+
+    private function claimIsAvailable(
+        Mission $mission,
+        CarbonImmutable $rtcUtc,
+    ): bool {
+        if ($mission->schedule_claimed_at === null) {
+            return true;
+        }
+
+        return $mission->schedule_claimed_at->utc()->lessThanOrEqualTo(
+            $rtcUtc->subSeconds($this->claimLeaseSeconds()),
+        );
+    }
+
+    private function claimLeaseSeconds(): int
+    {
+        $seconds = (int) config('services.robot_api.mission_claim_lease_seconds');
+
+        if ($seconds <= 0) {
+            throw new InvalidArgumentException(
+                'MISSION_CLAIM_LEASE_SECONDS must be positive.',
+            );
+        }
+
+        return $seconds;
     }
 }
