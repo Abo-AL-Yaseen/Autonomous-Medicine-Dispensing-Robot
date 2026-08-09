@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
 
-from raspberry_controller.api import HardwareSettings, create_app
+from raspberry_controller.api import (
+    HardwareSettings,
+    WaterCalibrationError,
+    calculate_water_duration_ms,
+    create_app,
+)
 from raspberry_controller.hardware_controller import SerialConnectionError
 
 
@@ -21,6 +28,8 @@ class FakeHardwareController:
         self.movement_calls: list[str] = []
         self.line_calls: list[str] = []
         self.navigation_calls: list[str] = []
+        self.rtc_calls = 0
+        self.water_calls: list[int] = []
         self.hardware_error: Exception | None = None
 
     def connect(self) -> None:
@@ -46,6 +55,16 @@ class FakeHardwareController:
             "requested_pills": pill_count,
             "dispensed_pills": pill_count,
         }
+
+    def get_rtc_datetime(self) -> datetime:
+        self._raise_hardware_error()
+        self.rtc_calls += 1
+        return datetime(2026, 8, 9, 20, 30, 0)
+
+    def dispense_water(self, duration_ms: int) -> dict[str, int]:
+        self._raise_hardware_error()
+        self.water_calls.append(duration_ms)
+        return {"duration_ms": duration_ms}
 
     def forward(self) -> str:
         return self._record_movement("forward", "ACK|FORWARD")
@@ -135,11 +154,27 @@ def fake_hardware() -> FakeHardwareController:
     return FakeHardwareController()
 
 
+def test_robot_timezone_defaults_to_asia_hebron(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ROBOT_TIMEZONE", raising=False)
+
+    assert HardwareSettings.from_environment().robot_timezone == "Asia/Hebron"
+
+
 @pytest.fixture
-def client(fake_hardware: FakeHardwareController) -> Iterator[TestClient]:
+def client(
+    fake_hardware: FakeHardwareController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[TestClient]:
+    monkeypatch.setenv("WATER_FLOW_ML_PER_SECOND", "50")
+    monkeypatch.setenv("ROBOT_TIMEZONE", "Asia/Hebron")
+
     def fake_factory(settings: HardwareSettings) -> FakeHardwareController:
         assert settings.esp32_port.startswith("/dev/serial/by-id/")
         assert settings.arduino_port.startswith("/dev/serial/by-id/")
+        assert settings.water_flow_ml_per_second == 50
+        assert settings.robot_timezone == "Asia/Hebron"
         return fake_hardware
 
     application = create_app(controller_factory=fake_factory)
@@ -157,6 +192,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert body["name"] == "Autonomous Medicine Dispensing Robot Hardware API"
     assert body["version"] == "1.0.0"
     assert "/dispense" in body["endpoints"]
+    assert "/rtc" in body["endpoints"]
+    assert "/water/dispense" in body["endpoints"]
     assert "/movement/stop" in body["endpoints"]
     assert "/line/start" in body["endpoints"]
     assert "/line/stop" in body["endpoints"]
@@ -194,6 +231,31 @@ def test_status_returns_both_board_statuses(client: TestClient) -> None:
             "ARDUINO_UNO": "STATUS|IDLE",
         },
     }
+
+
+def test_rtc_returns_ds1302_datetime(client: TestClient) -> None:
+    response = client.get("/rtc")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "datetime": "2026-08-09T20:30:00",
+        "source": "DS1302",
+        "timezone": "Asia/Hebron",
+    }
+
+
+def test_rtc_hardware_unavailable_is_safe(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    client.app.state.hardware_connected = False
+
+    response = client.get("/rtc")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "HARDWARE_UNAVAILABLE"}}
+    assert fake_hardware.rtc_calls == 0
 
 
 def test_dispense_rejects_both_boxes_zero(client: TestClient) -> None:
@@ -267,6 +329,88 @@ def test_combined_request_dispenses_box_one_first(
     assert response.status_code == 200
     assert response.json()["success"] is True
     assert fake_hardware.dispense_calls == [(1, 1), (2, 2)]
+
+
+def test_dispense_hardware_unavailable_sends_no_command(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    client.app.state.hardware_connected = False
+
+    response = client.post("/dispense", json={"box1": 1, "box2": 0})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "HARDWARE_UNAVAILABLE"}}
+    assert fake_hardware.dispense_calls == []
+
+
+@pytest.mark.parametrize("amount_ml", [0, -1, 1001])
+def test_water_dispense_rejects_invalid_amount(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    amount_ml: int,
+) -> None:
+    response = client.post("/water/dispense", json={"amount_ml": amount_ml})
+
+    assert response.status_code == 422
+    assert fake_hardware.water_calls == []
+
+
+def test_water_conversion_uses_configured_flow_rate() -> None:
+    assert calculate_water_duration_ms(100, 50.0) == 2000
+
+
+def test_water_conversion_requires_physical_calibration() -> None:
+    with pytest.raises(WaterCalibrationError):
+        calculate_water_duration_ms(100, 0)
+
+
+def test_water_endpoint_requires_physical_calibration(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    client.app.state.hardware_settings = replace(
+        client.app.state.hardware_settings,
+        water_flow_ml_per_second=0,
+    )
+
+    response = client.post("/water/dispense", json={"amount_ml": 100})
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "WATER_FLOW_NOT_CALIBRATED"}
+    }
+    assert fake_hardware.water_calls == []
+
+
+def test_water_dispense_uses_calibrated_duration(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.post("/water/dispense", json={"amount_ml": 100})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "requested_amount_ml": 100,
+        "delivery_basis": "calibrated_time",
+        "calibration_ml_per_second": 50.0,
+        "duration_ms": 2000,
+    }
+    assert fake_hardware.water_calls == [2000]
+
+
+def test_water_hardware_unavailable_sends_no_command(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    client.app.state.hardware_connected = False
+
+    response = client.post("/water/dispense", json={"amount_ml": 100})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "HARDWARE_UNAVAILABLE"}}
+    assert fake_hardware.water_calls == []
 
 
 def test_hardware_error_returns_service_unavailable(

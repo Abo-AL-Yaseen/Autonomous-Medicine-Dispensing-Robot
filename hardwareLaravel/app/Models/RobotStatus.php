@@ -10,6 +10,8 @@ class RobotStatus extends Model
 {
     use HasFactory;
 
+    protected $table = 'robot_status';
+
     protected $fillable = [
         'battery',
         'current_node_id',

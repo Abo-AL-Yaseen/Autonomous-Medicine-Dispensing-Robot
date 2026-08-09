@@ -6,6 +6,9 @@ export const laravelApiBaseUrl =
 export const robotApiBaseUrl =
   process.env.EXPO_PUBLIC_ROBOT_API_URL ?? "http://YOUR_PRIVATE_IP:8000";
 
+export const robotTimezone =
+  process.env.EXPO_PUBLIC_ROBOT_TIMEZONE ?? "Asia/Hebron";
+
 export const laravelApi = create({
   baseURL: laravelApiBaseUrl,
   timeout: 15000,
@@ -40,6 +43,20 @@ const getResponseMessage = (responseData: unknown): string | null => {
 
   return null;
 };
+
+const getResponseCode = (responseData: unknown): string | null => {
+  if (!isRecord(responseData)) return null;
+  if (typeof responseData.code === "string") return responseData.code;
+
+  if (isRecord(responseData.detail) && typeof responseData.detail.code === "string") {
+    return responseData.detail.code;
+  }
+
+  return null;
+};
+
+export const getApiErrorCode = (error: unknown): string | null =>
+  isAxiosError(error) ? getResponseCode(error.response?.data) : null;
 
 export const getApiErrorMessage = (
   error: unknown,

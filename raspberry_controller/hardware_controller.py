@@ -7,6 +7,7 @@ import errno
 import os
 import sys
 import time
+from datetime import datetime
 from typing import Any, Callable, Sequence
 
 
@@ -178,6 +179,7 @@ class SerialController:
         *,
         validator: Callable[[str], bool] | None = None,
         response_prefix: str | None = None,
+        overall_timeout: float | None = None,
     ) -> str:
         """Scan serial lines until an expected response or overall timeout."""
 
@@ -187,7 +189,10 @@ class SerialController:
             raise ValueError("at least one expected response is required")
 
         expected_text = ",".join(expected_responses)
-        deadline = time.monotonic() + self.read_timeout
+        timeout = self.read_timeout if overall_timeout is None else overall_timeout
+        if timeout <= 0:
+            raise ValueError("overall_timeout must be positive")
+        deadline = time.monotonic() + timeout
         last_non_empty_response: str | None = None
 
         while True:
@@ -317,6 +322,8 @@ class RobotHardwareController:
         "UTURN_SENSOR_ALIGN",
         "UTURN_LINE_LOCK",
     }
+    WATER_MIN_DURATION_MS = 100
+    WATER_MAX_DURATION_MS = 60000
 
     def __init__(
         self,
@@ -493,6 +500,48 @@ class RobotHardwareController:
             response_prefix="ACK|U_TURN",
         )
 
+    def get_rtc_datetime(self) -> datetime:
+        """Read and strictly parse the DS1302 wall-clock response."""
+
+        response = self._request(
+            self.esp32,
+            "GET_RTC",
+            "VALID_RTC_RESPONSE",
+            validator=self._is_valid_rtc_response,
+            response_prefix="RTC|",
+        )
+        return self.parse_rtc_response(response)
+
+    def dispense_water(self, duration_ms: int) -> dict[str, int]:
+        """Run the ESP32 pump for one bounded, acknowledged duration."""
+
+        if (
+            isinstance(duration_ms, bool)
+            or not isinstance(duration_ms, int)
+            or duration_ms < self.WATER_MIN_DURATION_MS
+            or duration_ms > self.WATER_MAX_DURATION_MS
+        ):
+            raise ValueError(
+                "duration_ms must be between "
+                f"{self.WATER_MIN_DURATION_MS} and {self.WATER_MAX_DURATION_MS}"
+            )
+
+        command = f"WATER_DISPENSE|MS={duration_ms}"
+        acknowledgement = f"ACK|WATER|DURATION_MS={duration_ms}"
+        completion = f"DONE|WATER|DURATION_MS={duration_ms}"
+        self.esp32.send_command(command)
+        self.esp32.wait_for_response(
+            acknowledgement,
+            response_prefix="ACK|WATER|",
+        )
+        self.esp32.wait_for_response(
+            completion,
+            response_prefix="DONE|WATER|",
+            overall_timeout=(duration_ms / 1000) + self.esp32.read_timeout,
+        )
+
+        return {"duration_ms": duration_ms}
+
     def dispense(self, box_number: int, pill_count: int) -> dict[str, int]:
         """Dispense pills sequentially, requiring an ACK and DONE for each pill."""
 
@@ -585,6 +634,42 @@ class RobotHardwareController:
 
         pattern_part = parts[6]
         return pattern_part == f"PATTERN={''.join(sensor_values)}"
+
+    @staticmethod
+    def parse_rtc_response(response: str) -> datetime:
+        """Parse the exact ESP32 GET_RTC contract or raise ValueError."""
+
+        parts = response.split("|")
+        expected_keys = ("YYYY", "MM", "DD", "HH", "MIN", "SEC")
+        expected_widths = (4, 2, 2, 2, 2, 2)
+        if len(parts) != 7 or parts[0] != "RTC":
+            raise ValueError("invalid RTC response structure")
+
+        values: list[int] = []
+        for part, key, width in zip(parts[1:], expected_keys, expected_widths):
+            prefix = f"{key}="
+            raw_value = part.removeprefix(prefix)
+            if (
+                not part.startswith(prefix)
+                or len(raw_value) != width
+                or not raw_value.isascii()
+                or not raw_value.isdigit()
+            ):
+                raise ValueError(f"invalid RTC field {key}")
+            values.append(int(raw_value))
+
+        try:
+            return datetime(*values)
+        except ValueError as exc:
+            raise ValueError("invalid RTC date or time") from exc
+
+    @classmethod
+    def _is_valid_rtc_response(cls, response: str) -> bool:
+        try:
+            cls.parse_rtc_response(response)
+        except ValueError:
+            return False
+        return True
 
     @classmethod
     def _is_valid_line_status(cls, response: str) -> bool:

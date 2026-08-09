@@ -14,6 +14,7 @@ class MedicineResource extends JsonResource
             'name' => $this->name,
             'description' => $this->description,
             'stock_quantity' => $this->stock_quantity,
+            'dispenser_box' => $this->dispenser_box,
             'created_at' => $this->created_at,
             'updated_at' => $this->updated_at,
         ];

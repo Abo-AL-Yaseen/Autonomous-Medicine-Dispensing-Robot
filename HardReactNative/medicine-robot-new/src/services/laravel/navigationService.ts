@@ -1,9 +1,11 @@
 import {
+    getApiErrorCode,
     getApiErrorMessage,
     laravelApi,
     unwrapAxiosData,
 } from "@/src/config/api";
 import {
+  normalizeNavigationStartErrorMessage,
   normalizeSuccessResponse,
   requireMissionId,
 } from "@/src/services/apiAdapters";
@@ -23,8 +25,12 @@ export const startRobotNavigation = async (
       "navigation start",
     );
   } catch (error) {
+    const fallback = getApiErrorMessage(
+      error,
+      "Unable to start robot navigation.",
+    );
     throw new Error(
-      getApiErrorMessage(error, "Unable to start robot navigation."),
+      normalizeNavigationStartErrorMessage(getApiErrorCode(error), fallback),
     );
   }
 };

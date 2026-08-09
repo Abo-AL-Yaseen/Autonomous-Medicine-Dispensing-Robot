@@ -2,8 +2,17 @@
 
 This repository contains the ESP32, Arduino UNO, and Raspberry Pi hardware-control
 components for the autonomous medicine dispensing robot. The Raspberry Pi exposes
-the tested USB serial controllers through a small synchronous FastAPI service. A
-NestJS backend will call this API in a later project phase.
+the tested USB serial controllers through a small synchronous FastAPI service.
+Laravel remains the source of truth for medicines, schedules, and missions.
+
+## Scheduling timezone contract
+
+The mobile app sends `scheduled_at` as a timezone-naive Palestine wall-clock
+string in exactly `YYYY-MM-DD HH:mm:ss` format. Laravel interprets that value
+once with `Asia/Hebron`, then converts it to UTC for storage. Mission API
+responses serialize `scheduled_at` as an offset-aware UTC ISO 8601 timestamp;
+the mobile app converts that instant back to `Asia/Hebron` for display. Do not
+send a mixture of wall-clock strings and ISO timestamps with offsets.
 
 ## Raspberry Pi setup
 
@@ -22,6 +31,8 @@ The API reads these optional environment variables:
 | `ESP32_STARTUP_DELAY` | `2.0` seconds |
 | `ARDUINO_STARTUP_DELAY` | `2.0` seconds |
 | `READ_TIMEOUT` | `2.0` seconds |
+| `ROBOT_TIMEZONE` | `Asia/Hebron` (the DS1302 Palestine wall-clock timezone) |
+| `WATER_FLOW_ML_PER_SECOND` | `0` (disabled until physically calibrated) |
 
 ## Validation
 
@@ -47,6 +58,33 @@ python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000
 ```
 
 Swagger documentation is available at `http://<raspberry-pi-address>:8000/docs`.
+
+## DS1302 RTC API
+
+The Raspberry Pi reads the ESP32 using this exact read-only serial command:
+
+```text
+GET_RTC
+RTC|YYYY=2026|MM=08|DD=09|HH=20|MIN=30|SEC=00
+```
+
+`GET /rtc` returns the parsed wall-clock value, `source: DS1302`, and the
+configured `ROBOT_TIMEZONE`. It never changes the RTC time.
+
+The DS1302 stores calendar and clock fields only; it has no timezone or UTC
+offset metadata. Those fields represent Palestine wall-clock time. Raspberry Pi
+and Laravel must therefore interpret them with the `Asia/Hebron` timezone
+database rules. Daylight-saving conversion belongs in software and must never
+be implemented as a fixed offset in the ESP32 firmware.
+
+## Calibrated water API
+
+`POST /water/dispense` accepts `{"amount_ml": 100}`. The API converts the
+requested amount to a bounded pump duration using `WATER_FLOW_ML_PER_SECOND`,
+then sends one structured ESP32 command such as `WATER_DISPENSE|MS=2000`.
+The default flow is zero, so water dispensing remains disabled until a measured
+workshop calibration is configured. This is time-based delivery, not a flow
+sensor measurement.
 
 ## Manual movement API
 

@@ -19,6 +19,7 @@ class UpdateMissionRequest extends FormRequest
             'medicine_id' => ['sometimes', 'required', 'integer', 'exists:medicines,id'],
             'quantity' => ['sometimes', 'required', 'integer', 'min:1'],
             'status' => ['sometimes', 'required', Rule::in(['pending', 'running', 'completed', 'cancelled'])],
+            'scheduled_at' => ['sometimes', 'nullable', 'date_format:Y-m-d H:i:s'],
         ];
     }
 }

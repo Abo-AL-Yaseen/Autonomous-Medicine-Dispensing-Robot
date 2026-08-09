@@ -19,6 +19,7 @@ class MissionResource extends JsonResource
             ],
             'quantity' => $this->quantity,
             'status' => $this->status,
+            'scheduled_at' => $this->scheduled_at?->utc()->toIso8601String(),
             'created_at' => $this->created_at,
             'updated_at' => $this->updated_at,
         ];

@@ -35,4 +35,11 @@ return [
         ],
     ],
 
+    'robot_api' => [
+        'url' => env('ROBOT_API_URL', 'http://127.0.0.1:8001'),
+        'connect_timeout' => (float) env('ROBOT_API_CONNECT_TIMEOUT', 1),
+        'timeout' => (float) env('ROBOT_API_TIMEOUT', 2),
+        'timezone' => env('ROBOT_TIMEZONE', 'Asia/Hebron'),
+    ],
+
 ];

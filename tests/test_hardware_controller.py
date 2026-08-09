@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from datetime import datetime
 
 import pytest
 
 from raspberry_controller.hardware_controller import (
+    HardwareControllerError,
     RobotHardwareController,
     SerialController,
     UnexpectedSerialResponse,
@@ -20,6 +22,7 @@ class RecordingSerialController:
         self.commands: list[str] = []
         self.expected_responses: list[str | Sequence[str]] = []
         self.responses = responses or {}
+        self.read_timeout = 0.05
 
     def send_command(self, command: str) -> None:
         self.commands.append(command)
@@ -30,6 +33,7 @@ class RecordingSerialController:
         *,
         validator: Callable[[str], bool] | None = None,
         response_prefix: str | None = None,
+        overall_timeout: float | None = None,
     ) -> str:
         self.expected_responses.append(expected)
         response = self.responses.get(self.commands[-1])
@@ -40,6 +44,63 @@ class RecordingSerialController:
         if response_prefix is not None:
             assert response.startswith(response_prefix)
         return response
+
+
+def test_get_rtc_uses_machine_readable_contract() -> None:
+    response = "RTC|YYYY=2026|MM=08|DD=09|HH=20|MIN=30|SEC=00"
+    esp32 = RecordingSerialController({"GET_RTC": response})
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    rtc_datetime = controller.get_rtc_datetime()
+
+    assert rtc_datetime == datetime(2026, 8, 9, 20, 30, 0)
+    assert rtc_datetime.tzinfo is None
+    assert esp32.commands == ["GET_RTC"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "RTC|YYYY=2026|MM=08|DD=09|HH=20|MIN=30",
+        "RTC|YYYY=2026|MM=13|DD=09|HH=20|MIN=30|SEC=00",
+        "RTC|YYYY=2026|MM=08|DD=09|HH=20|MIN=xx|SEC=00",
+        "RTC Time: 2026/08/09 20:30:00",
+    ],
+)
+def test_malformed_rtc_response_is_rejected(response: str) -> None:
+    connection = FakeSerialConnection([(response + "\n").encode("ascii")])
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(HardwareControllerError):
+        controller.get_rtc_datetime()
+
+    assert connection.writes == [b"GET_RTC\n"]
+
+
+def test_water_dispense_sends_one_bounded_duration_command() -> None:
+    connection = FakeSerialConnection(
+        [
+            b"ACK|WATER|DURATION_MS=2000\n",
+            b"DONE|WATER|DURATION_MS=2000\n",
+        ]
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.dispense_water(2000) == {"duration_ms": 2000}
+    assert connection.writes == [b"WATER_DISPENSE|MS=2000\n"]
 
 
 @pytest.mark.parametrize(

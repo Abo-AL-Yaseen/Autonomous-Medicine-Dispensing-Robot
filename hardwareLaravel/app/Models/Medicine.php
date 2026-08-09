@@ -14,10 +14,12 @@ class Medicine extends Model
         'name',
         'description',
         'stock_quantity',
+        'dispenser_box',
     ];
 
     protected $casts = [
         'stock_quantity' => 'integer',
+        'dispenser_box' => 'integer',
     ];
 
     public function missions(): HasMany

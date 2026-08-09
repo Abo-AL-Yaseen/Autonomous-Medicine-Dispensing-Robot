@@ -19,6 +19,7 @@ class StoreMissionRequest extends FormRequest
             'medicine_id' => ['required', 'integer', 'exists:medicines,id'],
             'quantity' => ['required', 'integer', 'min:1'],
             'status' => ['nullable', Rule::in(['pending', 'running', 'completed', 'cancelled'])],
+            'scheduled_at' => ['nullable', 'date_format:Y-m-d H:i:s'],
         ];
     }
 }

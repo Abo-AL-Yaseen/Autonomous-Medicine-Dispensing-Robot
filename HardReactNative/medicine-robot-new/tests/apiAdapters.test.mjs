@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { getApiErrorCode } from "../src/config/api.ts";
 import {
+  buildMedicineDispensePayload,
+  buildRobotScheduleDateTime,
+  normalizeFastApiDispense,
   normalizeFastApiHealth,
   normalizeFastApiStatus,
+  normalizeFastApiWaterDispense,
+  normalizeHardwareActionErrorMessage,
   normalizeMedicine,
   normalizeMission,
+  normalizeNavigationStartErrorMessage,
   normalizeRoom,
   normalizeRooms,
   normalizeSuccessResponse,
@@ -13,6 +20,13 @@ import {
   resolveRobotHardwareStatus,
   unwrapLaravelResource,
 } from "../src/services/apiAdapters.ts";
+import {
+  createPickerWallClockSelection,
+  formatApiScheduleSummary,
+  formatScheduleDateValue,
+  formatScheduleTimeValue,
+  isRobotScheduleInPast,
+} from "../src/services/scheduleDateTime.ts";
 
 const laravelRoom = {
   id: 7,
@@ -57,6 +71,7 @@ test("normalizes Laravel medicine quantity and optional fields", () => {
 
   assert.equal(medicine.stock, 25);
   assert.equal(medicine.description, "100 mg tablets");
+  assert.equal(medicine.dispenser_box, null);
   assert.equal("dosage" in medicine, false);
 });
 
@@ -166,5 +181,200 @@ test("normalizes Laravel navigation success responses", () => {
   assert.deepEqual(
     normalizeSuccessResponse({ success: true }, "navigation start"),
     { success: true },
+  );
+});
+
+test("normalizes navigation start readiness error codes", () => {
+  assert.equal(
+    normalizeNavigationStartErrorMessage(
+      "HARDWARE_UNAVAILABLE",
+      "fallback",
+    ),
+    "Robot hardware is disconnected.",
+  );
+  assert.equal(
+    normalizeNavigationStartErrorMessage(
+      "ROBOT_API_UNAVAILABLE",
+      "fallback",
+    ),
+    "Robot service is unavailable.",
+  );
+  assert.equal(
+    normalizeNavigationStartErrorMessage(
+      "INVALID_ROBOT_API_RESPONSE",
+      "fallback",
+    ),
+    "Robot service returned an invalid response.",
+  );
+});
+
+test("extracts a Laravel navigation start error code", () => {
+  assert.equal(
+    getApiErrorCode({
+      isAxiosError: true,
+      response: { data: { code: "HARDWARE_UNAVAILABLE" } },
+    }),
+    "HARDWARE_UNAVAILABLE",
+  );
+});
+
+test("keeps the fallback for an unknown navigation start error code", () => {
+  assert.equal(
+    normalizeNavigationStartErrorMessage("UNKNOWN", "fallback"),
+    "fallback",
+  );
+});
+
+test("builds the FastAPI dispense request from the medicine box mapping", () => {
+  assert.deepEqual(buildMedicineDispensePayload(1, 2), {
+    box1: 2,
+    box2: 0,
+  });
+  assert.deepEqual(buildMedicineDispensePayload(2, 3), {
+    box1: 0,
+    box2: 3,
+  });
+});
+
+test("rejects missing or invalid medicine box mappings", () => {
+  assert.throws(
+    () => buildMedicineDispensePayload(null, 1),
+    /valid dispenser box/i,
+  );
+  assert.throws(
+    () => buildMedicineDispensePayload(3, 1),
+    /valid dispenser box/i,
+  );
+});
+
+test("normalizes a successful manual medicine dispense response", () => {
+  const result = normalizeFastApiDispense({
+    success: true,
+    requested: { box1: 2, box2: 0 },
+    results: {
+      box1: {
+        box_number: 1,
+        requested_pills: 2,
+        dispensed_pills: 2,
+      },
+    },
+  });
+
+  assert.equal(result.results.box1.dispensed_pills, 2);
+});
+
+test("normalizes a calibrated water dispense response", () => {
+  const result = normalizeFastApiWaterDispense({
+    success: true,
+    requested_amount_ml: 100,
+    delivery_basis: "calibrated_time",
+    calibration_ml_per_second: 50,
+    duration_ms: 2000,
+  });
+
+  assert.equal(result.duration_ms, 2000);
+  assert.equal(result.delivery_basis, "calibrated_time");
+});
+
+test("maps disconnected hardware actions to a clear message", () => {
+  assert.equal(
+    normalizeHardwareActionErrorMessage(
+      "HARDWARE_UNAVAILABLE",
+      "fallback",
+    ),
+    "Hardware Disconnected.",
+  );
+});
+
+test("builds robot wall-clock schedule text without reading phone time", () => {
+  assert.equal(
+    buildRobotScheduleDateTime("2026-08-09", "20:30"),
+    "2026-08-09 20:30:00",
+  );
+  assert.throws(
+    () => buildRobotScheduleDateTime("2026-02-30", "20:30"),
+    /valid scheduled date/i,
+  );
+});
+
+test("formats picker selections as the existing Laravel schedule format", () => {
+  const dateSelection = createPickerWallClockSelection(
+    new Date("2026-08-09T10:00:00.000Z"),
+    120,
+  );
+  const timeSelection = createPickerWallClockSelection(
+    new Date("2026-08-09T18:52:00.000Z"),
+    120,
+  );
+  const date = formatScheduleDateValue(dateSelection);
+  const time = formatScheduleTimeValue(timeSelection);
+
+  assert.equal(date, "2026-08-09");
+  assert.equal(time, "20:52");
+  assert.equal(
+    buildRobotScheduleDateTime(date, time),
+    "2026-08-09 20:52:00",
+  );
+});
+
+test("does not apply the Palestine timezone twice to picker wall-clock fields", () => {
+  const nativeSelection = createPickerWallClockSelection(
+    new Date("2026-08-09T18:52:00.000Z"),
+    120,
+  );
+  const oldReinterpretedTime = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Hebron",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(nativeSelection.value);
+
+  assert.equal(oldReinterpretedTime, "21:52");
+  assert.equal(formatScheduleTimeValue(nativeSelection), "20:52");
+});
+
+test("displays a UTC API timestamp in Palestine local time", () => {
+  assert.equal(
+    formatApiScheduleSummary(
+      "2026-08-09T17:52:00+00:00",
+      "Asia/Hebron",
+      "en-US",
+    ),
+    "Aug 9, 2026 • 8:52 PM",
+  );
+});
+
+test("rejects an elapsed minute using Asia/Hebron robot time", () => {
+  const dateSelection = createPickerWallClockSelection(
+    new Date("2026-08-09T09:00:00.000Z"),
+    180,
+  );
+  const elapsedTime = createPickerWallClockSelection(
+    new Date("2026-08-09T17:30:00.000Z"),
+    180,
+  );
+  const futureTime = createPickerWallClockSelection(
+    new Date("2026-08-09T17:32:00.000Z"),
+    180,
+  );
+  const now = new Date("2026-08-09T17:31:15.000Z");
+
+  assert.equal(
+    isRobotScheduleInPast(
+      dateSelection,
+      elapsedTime,
+      "Asia/Hebron",
+      now,
+    ),
+    true,
+  );
+  assert.equal(
+    isRobotScheduleInPast(
+      dateSelection,
+      futureTime,
+      "Asia/Hebron",
+      now,
+    ),
+    false,
   );
 });

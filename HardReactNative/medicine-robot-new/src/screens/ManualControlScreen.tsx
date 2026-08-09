@@ -4,10 +4,14 @@ import { Text } from "react-native-paper";
 
 import RobotIcon from "@/src/assets/RobotIcon";
 import { DirectionPad } from "@/src/components/DirectionPad";
+import { MedicineSelector } from "@/src/components/MedicineSelector";
 import { PrimaryButton } from "@/src/components/PrimaryButton";
+import { QuantitySelector } from "@/src/components/QuantitySelector";
 import { StatusCard } from "@/src/components/StatusCard";
 import {
     emergencyStop,
+    dispenseSelectedMedicine,
+    dispenseSelectedWater,
     moveBackward,
     moveForward,
     startLineFollow,
@@ -16,9 +20,15 @@ import {
     turnLeft,
     turnRight,
 } from "@/src/services/api";
+import { getMedicines } from "@/src/services/laravel/medicineService";
 import { getRobotHardwareStatus } from "@/src/services/robot/robotHardwareService";
 import { theme } from "@/src/theme/theme";
-import type { MovementResponse, RobotConnection, RobotMode } from "@/src/types";
+import type {
+  Medicine,
+  MovementResponse,
+  RobotConnection,
+  RobotMode,
+} from "@/src/types";
 
 export default function ManualControlScreen() {
   const [status, setStatus] = useState("Ready");
@@ -28,17 +38,34 @@ export default function ManualControlScreen() {
   const [mode, setMode] = useState<RobotMode>("Manual");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [medicines, setMedicines] = useState<Medicine[]>([]);
+  const [selectedMedicine, setSelectedMedicine] = useState("0");
+  const [medicineQuantity, setMedicineQuantity] = useState(1);
+  const [waterAmountMl, setWaterAmountMl] = useState(100);
 
   useEffect(() => {
     const loadHardwareState = async () => {
       try {
         setLoading(true);
-        const data = await getRobotHardwareStatus();
+        const [data, loadedMedicines] = await Promise.all([
+          getRobotHardwareStatus(),
+          getMedicines(),
+        ]);
+        const mappedMedicines = loadedMedicines.filter(
+          (medicine) => medicine.dispenser_box !== null,
+        );
         setStatus(data.status);
         setBattery(data.battery);
         setConnection(data.connection);
         setMode(data.mode);
         setError(data.error ?? null);
+        setMedicines(mappedMedicines);
+        setSelectedMedicine(
+          mappedMedicines.length > 0 ? String(mappedMedicines[0].id) : "0",
+        );
+        if (mappedMedicines.length === 0 && data.error === undefined) {
+          setError("No medicine is assigned to a dispenser box.");
+        }
       } catch (e) {
         const message =
           e instanceof Error
@@ -76,6 +103,70 @@ export default function ManualControlScreen() {
         e instanceof Error ? e.message : "Movement command failed.";
       setError(message);
       Alert.alert("Robot Communication Error", message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const requireConnectedHardware = (): boolean => {
+    if (connection === "Connected") {
+      return true;
+    }
+
+    const message =
+      connection === "Disconnected"
+        ? "Hardware Disconnected."
+        : "Robot service is unavailable.";
+    setError(message);
+    Alert.alert("Robot Communication Error", message);
+    return false;
+  };
+
+  const handleDispenseMedicine = async () => {
+    if (!requireConnectedHardware()) return;
+
+    const medicine = medicines.find(
+      (item) => String(item.id) === selectedMedicine,
+    );
+    if (!medicine) {
+      setError("Select a mapped medicine before dispensing.");
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+      await dispenseSelectedMedicine(medicine, medicineQuantity);
+      setStatus("Medicine Dispensed");
+      Alert.alert(
+        "Medicine Dispensed",
+        `${medicineQuantity} × ${medicine.name} completed.`,
+      );
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Dispensing failed.";
+      setError(message);
+      Alert.alert("Dispensing Error", message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDispenseWater = async () => {
+    if (!requireConnectedHardware()) return;
+
+    try {
+      setLoading(true);
+      setError(null);
+      await dispenseSelectedWater(waterAmountMl);
+      setStatus("Water Dispensed");
+      Alert.alert(
+        "Water Dispensed",
+        `${waterAmountMl} ml requested using calibrated pump timing.`,
+      );
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Water dispensing failed.";
+      setError(message);
+      Alert.alert("Water Dispensing Error", message);
     } finally {
       setLoading(false);
     }
@@ -133,6 +224,55 @@ export default function ManualControlScreen() {
           />
         </View>
 
+        <View style={styles.controlSection}>
+          <Text style={styles.sectionTitle}>Medicine Control</Text>
+          <MedicineSelector
+            value={selectedMedicine}
+            onValueChange={setSelectedMedicine}
+            medicines={medicines}
+            loading={loading}
+          />
+          <QuantitySelector
+            label="Medicine quantity"
+            value={medicineQuantity}
+            onDecrease={() =>
+              setMedicineQuantity((current) => Math.max(1, current - 1))
+            }
+            onIncrease={() =>
+              setMedicineQuantity((current) => Math.min(10, current + 1))
+            }
+          />
+          <PrimaryButton
+            label="Dispense Medicine"
+            onPress={handleDispenseMedicine}
+            disabled={loading || medicines.length === 0}
+            loading={loading}
+          />
+        </View>
+
+        <View style={styles.controlSection}>
+          <Text style={styles.sectionTitle}>Water Control</Text>
+          <Text style={styles.calibrationHint}>
+            Amount uses the configured measured flow calibration.
+          </Text>
+          <QuantitySelector
+            label="Water amount (ml)"
+            value={waterAmountMl}
+            onDecrease={() =>
+              setWaterAmountMl((current) => Math.max(50, current - 50))
+            }
+            onIncrease={() =>
+              setWaterAmountMl((current) => Math.min(1000, current + 50))
+            }
+          />
+          <PrimaryButton
+            label="Dispense Water"
+            onPress={handleDispenseWater}
+            disabled={loading}
+            loading={loading}
+          />
+        </View>
+
         {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
         <View style={styles.statusGrid}>
@@ -184,5 +324,23 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     color: "#C62828",
     fontWeight: "600",
+  },
+  controlSection: {
+    marginBottom: 28,
+    padding: 18,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.card,
+  },
+  sectionTitle: {
+    color: theme.colors.textPrimary,
+    fontSize: 22,
+    fontWeight: "700",
+    marginBottom: 16,
+  },
+  calibrationHint: {
+    color: theme.colors.textSecondary,
+    marginBottom: 16,
   },
 });

@@ -5,19 +5,21 @@ import { Text } from "react-native-paper";
 import { theme } from "@/src/theme/theme";
 
 interface QuantitySelectorProps {
+  label?: string;
   value: number;
   onDecrease: () => void;
   onIncrease: () => void;
 }
 
 export function QuantitySelector({
+  label = "Quantity selector",
   value,
   onDecrease,
   onIncrease,
 }: QuantitySelectorProps) {
   return (
     <View style={styles.wrapper}>
-      <Text style={styles.label}>Quantity selector</Text>
+      <Text style={styles.label}>{label}</Text>
       <View style={styles.row}>
         <Pressable onPress={onDecrease} style={styles.button}>
           <Text style={styles.buttonText}>−</Text>

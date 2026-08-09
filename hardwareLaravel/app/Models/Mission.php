@@ -16,10 +16,14 @@ class Mission extends Model
         'medicine_id',
         'quantity',
         'status',
+        'scheduled_at',
+        'schedule_claimed_at',
     ];
 
     protected $casts = [
         'quantity' => 'integer',
+        'scheduled_at' => 'datetime',
+        'schedule_claimed_at' => 'datetime',
     ];
 
     public function room(): BelongsTo

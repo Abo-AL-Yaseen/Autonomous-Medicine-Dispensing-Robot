@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from math import ceil
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ API_VERSION = "1.0.0"
 DEFAULT_ESP32_STARTUP_DELAY = 2.0
 DEFAULT_ARDUINO_STARTUP_DELAY = 2.0
 DEFAULT_READ_TIMEOUT = 2.0
+DEFAULT_WATER_FLOW_ML_PER_SECOND = 0.0
+DEFAULT_ROBOT_TIMEZONE = "Asia/Hebron"
 
 ResultType = TypeVar("ResultType")
 ControllerFactory = Callable[["HardwareSettings"], RobotHardwareController]
@@ -50,6 +53,8 @@ class HardwareSettings:
     esp32_startup_delay: float
     arduino_startup_delay: float
     read_timeout: float
+    water_flow_ml_per_second: float
+    robot_timezone: str
 
     @classmethod
     def from_environment(cls) -> "HardwareSettings":
@@ -71,6 +76,12 @@ class HardwareSettings:
                 DEFAULT_READ_TIMEOUT,
                 allow_zero=False,
             ),
+            water_flow_ml_per_second=_read_float_setting(
+                "WATER_FLOW_ML_PER_SECOND",
+                DEFAULT_WATER_FLOW_ML_PER_SECOND,
+                allow_zero=True,
+            ),
+            robot_timezone=os.getenv("ROBOT_TIMEZONE", DEFAULT_ROBOT_TIMEZONE),
         )
 
 
@@ -85,6 +96,20 @@ class DispenseRequest(BaseModel):
         if self.box1 == 0 and self.box2 == 0:
             raise ValueError("at least one box must request a pill")
         return self
+
+
+class WaterDispenseRequest(BaseModel):
+    """Requested water amount; delivery remains calibrated-time based."""
+
+    amount_ml: StrictInt = Field(ge=1, le=1000)
+
+
+class WaterCalibrationError(ValueError):
+    """Raised when no measured pump flow calibration is configured."""
+
+
+class WaterDurationError(ValueError):
+    """Raised when calibration would exceed the firmware safety window."""
 
 
 def _read_float_setting(name: str, default: float, *, allow_zero: bool) -> float:
@@ -102,6 +127,23 @@ def _read_float_setting(name: str, default: float, *, allow_zero: bool) -> float
         comparison = "non-negative" if allow_zero else "positive"
         raise ValueError(f"{name} must be {comparison}")
     return value
+
+
+def calculate_water_duration_ms(amount_ml: int, flow_ml_per_second: float) -> int:
+    """Convert requested ml to a bounded pump duration using measured calibration."""
+
+    if flow_ml_per_second <= 0:
+        raise WaterCalibrationError("water flow calibration is not configured")
+
+    duration_ms = ceil((amount_ml / flow_ml_per_second) * 1000)
+    if not (
+        RobotHardwareController.WATER_MIN_DURATION_MS
+        <= duration_ms
+        <= RobotHardwareController.WATER_MAX_DURATION_MS
+    ):
+        raise WaterDurationError("calculated pump duration is outside safe limits")
+
+    return duration_ms
 
 
 def build_hardware_controller(settings: HardwareSettings) -> RobotHardwareController:
@@ -138,6 +180,7 @@ def create_app(
         application.state.hardware_controller = controller
         application.state.hardware_lock = hardware_lock
         application.state.hardware_connected = False
+        application.state.hardware_settings = settings
 
         try:
             with hardware_lock:
@@ -175,7 +218,9 @@ def create_app(
                 "/health",
                 "/ping",
                 "/status",
+                "/rtc",
                 "/dispense",
+                "/water/dispense",
                 "/movement/forward",
                 "/movement/backward",
                 "/movement/left",
@@ -221,6 +266,20 @@ def create_app(
         )
         return {"success": True, "statuses": statuses}
 
+    @application.get("/rtc")
+    def rtc(request: Request) -> dict[str, object]:
+        rtc_datetime = _run_hardware_operation(
+            request,
+            lambda controller: controller.get_rtc_datetime(),
+        )
+        settings: HardwareSettings = request.app.state.hardware_settings
+        return {
+            "success": True,
+            "datetime": rtc_datetime.isoformat(timespec="seconds"),
+            "source": "DS1302",
+            "timezone": settings.robot_timezone,
+        }
+
     @application.post("/dispense")
     def dispense(payload: DispenseRequest, request: Request) -> dict[str, object]:
         def dispense_requested_boxes(
@@ -238,6 +297,31 @@ def create_app(
             "success": True,
             "requested": {"box1": payload.box1, "box2": payload.box2},
             "results": results,
+        }
+
+    @application.post("/water/dispense")
+    def dispense_water(
+        payload: WaterDispenseRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        settings: HardwareSettings = request.app.state.hardware_settings
+
+        def dispense_calibrated_water(
+            controller: RobotHardwareController,
+        ) -> dict[str, int]:
+            duration_ms = calculate_water_duration_ms(
+                payload.amount_ml,
+                settings.water_flow_ml_per_second,
+            )
+            return controller.dispense_water(duration_ms)
+
+        result = _run_hardware_operation(request, dispense_calibrated_water)
+        return {
+            "success": True,
+            "requested_amount_ml": payload.amount_ml,
+            "delivery_basis": "calibrated_time",
+            "calibration_ml_per_second": settings.water_flow_ml_per_second,
+            "duration_ms": result["duration_ms"],
         }
 
     @application.post("/movement/forward")
@@ -479,6 +563,16 @@ def _run_hardware_operation(
     try:
         with hardware_lock:
             return operation(controller)
+    except WaterCalibrationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "WATER_FLOW_NOT_CALIBRATED"},
+        ) from exc
+    except WaterDurationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "WATER_DURATION_OUT_OF_RANGE"},
+        ) from exc
     except HardwareControllerError as exc:
         raise HTTPException(
             status_code=503,

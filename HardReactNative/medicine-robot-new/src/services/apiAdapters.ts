@@ -2,6 +2,8 @@ import type {
   ApiSuccessResponse,
   HealthResponse,
   Medicine,
+  MedicineDispensePayload,
+  MedicineDispenseResponse,
   Mission,
   MovementResponse,
   RobotHardwareStatus,
@@ -9,6 +11,7 @@ import type {
   RobotPingResponse,
   RobotStatus,
   Room,
+  WaterDispenseResponse,
 } from "../types";
 
 type UnknownRecord = Record<string, unknown>;
@@ -122,6 +125,16 @@ export const normalizeMedicine = (payload: unknown): Medicine => {
     unwrapLaravelResource(payload, "medicine"),
     "medicine",
   );
+  const dispenserBox =
+    value.dispenser_box === undefined || value.dispenser_box === null
+      ? null
+      : requireInteger(value.dispenser_box, "medicine", "dispenser_box");
+  if (dispenserBox !== null && dispenserBox !== 1 && dispenserBox !== 2) {
+    return invalidResponse(
+      "medicine",
+      "expected 'dispenser_box' to be 1, 2, or null.",
+    );
+  }
 
   return {
     id: requireInteger(value.id, "medicine", "id"),
@@ -130,6 +143,7 @@ export const normalizeMedicine = (payload: unknown): Medicine => {
       optionalNullableString(value.description, "medicine", "description") ??
       null,
     stock: requireInteger(value.stock_quantity, "medicine", "stock_quantity", 0),
+    dispenser_box: dispenserBox,
     created_at: optionalNullableString(
       value.created_at,
       "medicine",
@@ -183,6 +197,9 @@ export const normalizeMission = (payload: unknown): Mission => {
         : undefined,
     quantity: requireInteger(value.quantity, "mission", "quantity"),
     status: requireString(value.status, "mission", "status"),
+    scheduled_at:
+      optionalNullableString(value.scheduled_at, "mission", "scheduled_at") ??
+      null,
     created_at: optionalNullableString(
       value.created_at,
       "mission",
@@ -402,6 +419,136 @@ export const normalizeFastApiCommand = (
   };
 };
 
+export const buildMedicineDispensePayload = (
+  dispenserBox: unknown,
+  quantity: unknown,
+): MedicineDispensePayload => {
+  if (dispenserBox !== 1 && dispenserBox !== 2) {
+    throw new Error("Medicine is not assigned to a valid dispenser box.");
+  }
+  if (!Number.isSafeInteger(quantity) || Number(quantity) < 1 || Number(quantity) > 10) {
+    throw new Error("Medicine quantity must be between 1 and 10.");
+  }
+
+  return dispenserBox === 1
+    ? { box1: Number(quantity), box2: 0 }
+    : { box1: 0, box2: Number(quantity) };
+};
+
+export const normalizeFastApiDispense = (
+  payload: unknown,
+): MedicineDispenseResponse => {
+  const value = requireRecord(payload, "FastAPI dispense");
+  const requested = requireRecord(value.requested, "FastAPI dispense requested");
+  const rawResults = requireRecord(value.results, "FastAPI dispense results");
+  const results = Object.fromEntries(
+    Object.entries(rawResults).map(([key, rawResult]) => {
+      const result = requireRecord(rawResult, `FastAPI dispense ${key}`);
+      return [
+        key,
+        {
+          box_number: requireInteger(result.box_number, `FastAPI dispense ${key}`, "box_number"),
+          requested_pills: requireInteger(result.requested_pills, `FastAPI dispense ${key}`, "requested_pills"),
+          dispensed_pills: requireInteger(result.dispensed_pills, `FastAPI dispense ${key}`, "dispensed_pills"),
+        },
+      ];
+    }),
+  );
+
+  return {
+    success: requireBoolean(value.success, "FastAPI dispense", "success"),
+    requested: {
+      box1: requireInteger(requested.box1, "FastAPI dispense", "requested.box1", 0),
+      box2: requireInteger(requested.box2, "FastAPI dispense", "requested.box2", 0),
+    },
+    results,
+  };
+};
+
+export const normalizeFastApiWaterDispense = (
+  payload: unknown,
+): WaterDispenseResponse => {
+  const value = requireRecord(payload, "FastAPI water dispense");
+  const deliveryBasis = requireString(
+    value.delivery_basis,
+    "FastAPI water dispense",
+    "delivery_basis",
+  );
+  if (deliveryBasis !== "calibrated_time") {
+    return invalidResponse(
+      "FastAPI water dispense",
+      "expected 'delivery_basis' to be 'calibrated_time'.",
+    );
+  }
+
+  const calibration = value.calibration_ml_per_second;
+  if (typeof calibration !== "number" || !Number.isFinite(calibration) || calibration <= 0) {
+    return invalidResponse(
+      "FastAPI water dispense",
+      "expected a positive 'calibration_ml_per_second'.",
+    );
+  }
+
+  return {
+    success: requireBoolean(value.success, "FastAPI water dispense", "success"),
+    requested_amount_ml: requireInteger(
+      value.requested_amount_ml,
+      "FastAPI water dispense",
+      "requested_amount_ml",
+    ),
+    delivery_basis: "calibrated_time",
+    calibration_ml_per_second: calibration,
+    duration_ms: requireInteger(value.duration_ms, "FastAPI water dispense", "duration_ms"),
+  };
+};
+
+export const buildRobotScheduleDateTime = (
+  date: string,
+  time: string,
+): string => {
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  const timeMatch = /^(\d{2}):(\d{2})$/.exec(time);
+  if (!dateMatch || !timeMatch) {
+    throw new Error("Enter the scheduled date as YYYY-MM-DD and time as HH:MM.");
+  }
+
+  const [, yearText, monthText, dayText] = dateMatch;
+  const [, hourText, minuteText] = timeMatch;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const validationDate = new Date(Date.UTC(year, month - 1, day, hour, minute));
+  if (
+    validationDate.getUTCFullYear() !== year ||
+    validationDate.getUTCMonth() !== month - 1 ||
+    validationDate.getUTCDate() !== day ||
+    hour > 23 ||
+    minute > 59
+  ) {
+    throw new Error("Enter a valid scheduled date and time.");
+  }
+
+  return `${date} ${time}:00`;
+};
+
+export const normalizeHardwareActionErrorMessage = (
+  code: unknown,
+  fallback: string,
+): string => {
+  switch (code) {
+    case "HARDWARE_UNAVAILABLE":
+      return "Hardware Disconnected.";
+    case "WATER_FLOW_NOT_CALIBRATED":
+      return "Water flow is not calibrated.";
+    case "WATER_DURATION_OUT_OF_RANGE":
+      return "The requested water amount exceeds the safe pump duration.";
+    default:
+      return fallback;
+  }
+};
+
 export const normalizeSuccessResponse = (
   payload: unknown,
   context: string,
@@ -410,6 +557,22 @@ export const normalizeSuccessResponse = (
   return {
     success: requireBoolean(value.success, context, "success"),
   };
+};
+
+export const normalizeNavigationStartErrorMessage = (
+  code: unknown,
+  fallback: string,
+): string => {
+  switch (code) {
+    case "HARDWARE_UNAVAILABLE":
+      return "Robot hardware is disconnected.";
+    case "ROBOT_API_UNAVAILABLE":
+      return "Robot service is unavailable.";
+    case "INVALID_ROBOT_API_RESPONSE":
+      return "Robot service returned an invalid response.";
+    default:
+      return fallback;
+  }
 };
 
 export const toLaravelRoomPayload = (payload: {
@@ -426,8 +589,10 @@ export const toLaravelMedicinePayload = (payload: {
   name: string;
   description?: string | null;
   stock: number;
+  dispenser_box: 1 | 2;
 }): UnknownRecord => ({
   name: payload.name,
   description: payload.description ?? null,
   stock_quantity: payload.stock,
+  dispenser_box: payload.dispenser_box,
 });

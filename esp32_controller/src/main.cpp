@@ -175,6 +175,8 @@ const bool PUMP_ACTIVE_LOW = true;
 #define ROTATION_TIMEOUT_MS 10000  // حد أمان أقصى لأي دوران
 #define ROTATION_PRINT_MS    200   // تقليل رسائل Serial أثناء الدوران
 #define PUMP_RUN_MS          2000   // مدة اختبار المضخة بالأمر P
+const unsigned long WATER_MIN_DURATION_MS = 100;
+const unsigned long WATER_MAX_DURATION_MS = 60000;
 
 // ─── مدة كل حركة بالتيست (ms) ─────────────────────
 #define TEST_MOVE_MS        1000   // مدة المشي قدام/خلف
@@ -395,11 +397,13 @@ void startLineFollowing();
 void stopLineFollowing();
 void setupRTC();
 void printRTC();
+void printRTCMachineReadable();
 void setupLCD();
 void lcdShowStatus(String line1, String line2 = "", String line3 = "", String line4 = "");
 void lcdShowReady();
 void lcdShowError(String message);
 void showRTCOnce();
+void runPumpForDuration(unsigned long durationMs);
 void startAutonomousMode();
 void stopAutonomousMode(const char* reason, char command);
 void updateAutonomousMode();
@@ -2646,8 +2650,8 @@ static void printRTCDateTime(const RtcDateTime& dt) {
     dt.Second()
   );
 
-  //Serial.print("RTC Time: ");
-  //Serial.println(dateTimeString);
+  Serial.print("RTC Time: ");
+  Serial.println(dateTimeString);
 }
 
 void setupRTC() {
@@ -2699,6 +2703,28 @@ void printRTC() {
 
   lastRTCPrintMs = nowMs;
   printRTCDateTime(rtc.GetDateTime());
+}
+
+void printRTCMachineReadable() {
+  RtcDateTime now = rtc.GetDateTime();
+  if (!now.IsValid()) {
+    Serial.println("ERROR|RTC_INVALID");
+    return;
+  }
+
+  char response[64];
+  snprintf(
+    response,
+    sizeof(response),
+    "RTC|YYYY=%04u|MM=%02u|DD=%02u|HH=%02u|MIN=%02u|SEC=%02u",
+    now.Year(),
+    now.Month(),
+    now.Day(),
+    now.Hour(),
+    now.Minute(),
+    now.Second()
+  );
+  Serial.println(response);
 }
 
 static void lcdPrintLine(uint8_t row, String text) {
@@ -2811,6 +2837,41 @@ void runPumpForTwoSeconds() {
     Serial.println("Pump test interrupted. Pump OFF.");
   }
   lcdShowStatus("Pump", "OFF");
+}
+
+void runPumpForDuration(unsigned long durationMs) {
+  if (durationMs < WATER_MIN_DURATION_MS || durationMs > WATER_MAX_DURATION_MS) {
+    Serial.println("ERROR|INVALID_WATER_DURATION");
+    return;
+  }
+
+  if (
+    autoModeEnabled ||
+    lineFollowEnabled ||
+    intersectionNavigationActive ||
+    manualMovementActive
+  ) {
+    Serial.println("ERROR|ROBOT_BUSY");
+    return;
+  }
+
+  stopAllOutputs();
+  Serial.print("ACK|WATER|DURATION_MS=");
+  Serial.println(durationMs);
+  lcdShowStatus("Water", "Dispensing");
+  pumpOn();
+
+  bool completed = waitSafely(durationMs);
+  pumpOff();
+  lcdShowStatus("Water", "OFF");
+
+  if (!completed) {
+    Serial.println("ERROR|WATER_INTERRUPTED");
+    return;
+  }
+
+  Serial.print("DONE|WATER|DURATION_MS=");
+  Serial.println(durationMs);
 }
 
 // قدام باستمرار حتى وصول أمر آخر
@@ -3544,6 +3605,23 @@ void handleTextCommand(const String& command) {
     Serial.println("ACK|PING");
   } else if (normalizedCommand == "GET_STATUS") {
     printControllerStatus();
+  } else if (normalizedCommand == "GET_RTC") {
+    printRTCMachineReadable();
+  } else if (normalizedCommand.startsWith("WATER_DISPENSE|MS=")) {
+    String durationText = normalizedCommand.substring(18);
+    if (durationText.length() == 0) {
+      Serial.println("ERROR|INVALID_WATER_DURATION");
+      return;
+    }
+
+    for (size_t i = 0; i < durationText.length(); i++) {
+      if (!isDigit(durationText.charAt(i))) {
+        Serial.println("ERROR|INVALID_WATER_DURATION");
+        return;
+      }
+    }
+
+    runPumpForDuration(strtoul(durationText.c_str(), nullptr, 10));
   } else if (normalizedCommand == "GET_LINE") {
     sampleLineSensors();
     printLineSensorReading();
@@ -3669,8 +3747,6 @@ void setup() {
 }
 
 void loop() {
-  printRTC();
-
   processSerialInput();
 
   updateIrSensor();

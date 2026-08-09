@@ -7,12 +7,17 @@ use App\Http\Requests\StoreMissionRequest;
 use App\Http\Requests\UpdateMissionRequest;
 use App\Http\Resources\MissionResource;
 use App\Models\Mission;
+use App\Services\Mission\MissionScheduleTime;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 use Illuminate\Support\Str;
 
 class MissionController extends Controller
 {
+    public function __construct(
+        private readonly MissionScheduleTime $scheduleTime,
+    ) {}
+
     public function index(): AnonymousResourceCollection
     {
         return MissionResource::collection(Mission::query()->with(['room', 'medicine'])->latest()->get());
@@ -27,6 +32,7 @@ class MissionController extends Controller
     {
         $payload = $request->validated();
         $payload['status'] = $this->normalizeStatus($payload['status'] ?? 'pending');
+        $this->normalizeScheduledAt($payload);
 
         $mission = Mission::create($payload);
 
@@ -40,6 +46,7 @@ class MissionController extends Controller
         if (array_key_exists('status', $payload)) {
             $payload['status'] = $this->normalizeStatus($payload['status']);
         }
+        $this->normalizeScheduledAt($payload);
 
         $mission->update($payload);
 
@@ -64,5 +71,21 @@ class MissionController extends Controller
             'cancelled' => 'cancelled',
             default => 'pending',
         };
+    }
+
+    private function normalizeScheduledAt(array &$payload): void
+    {
+        if (! array_key_exists('scheduled_at', $payload)) {
+            return;
+        }
+
+        $payload['schedule_claimed_at'] = null;
+        if ($payload['scheduled_at'] === null) {
+            return;
+        }
+
+        $payload['scheduled_at'] = $this->scheduleTime->localWallClockToUtc(
+            $payload['scheduled_at'],
+        );
     }
 }

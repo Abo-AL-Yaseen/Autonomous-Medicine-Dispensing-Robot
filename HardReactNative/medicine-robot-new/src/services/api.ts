@@ -16,6 +16,8 @@ import {
     stopRobotMovement,
 } from "@/src/services/robot/movementService";
 import { getRobotHardwareStatus } from "@/src/services/robot/robotHardwareService";
+import { dispenseMedicine } from "@/src/services/robot/dispenseService";
+import { dispenseWater } from "@/src/services/robot/waterService";
 
 export const startDelivery = async (payload: {
   room_id: number;
@@ -46,6 +48,8 @@ export const stopRobot = () => stopRobotMovement();
 export const startLineFollow = () => startLineFollowing();
 export const stopLineFollow = () => stopLineFollowing();
 export const emergencyStop = () => stopRobotMovement();
+export const dispenseSelectedMedicine = dispenseMedicine;
+export const dispenseSelectedWater = dispenseWater;
 
 export { startLaravelNavigation as startRobotNavigation };
 
