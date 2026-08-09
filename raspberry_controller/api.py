@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import TypeVar
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictInt, model_validator
 
 from .database import SessionLocal, init_db
@@ -32,7 +33,10 @@ from .schemas.mission import (
 )
 from .services.mission_service import MissionService
 from .services.laravel_api_client import LaravelApiClient
-from .services.mission_executor import MissionExecutor
+from .services.mission_executor import (
+    MissionExecutor,
+    MissionStartResult,
+)
 from .services.mission_scheduler import (
     LaravelMissionClient,
     MissionScheduler,
@@ -198,7 +202,6 @@ def create_app(
         controller = controller_factory(settings)
         hardware_lock = threading.Lock()
         laravel_client = laravel_client_factory(scheduler_settings)
-        executor = MissionExecutor()
 
         application.state.hardware_controller = controller
         application.state.hardware_lock = hardware_lock
@@ -213,6 +216,26 @@ def create_app(
                 raise HardwareControllerError("robot hardware is disconnected")
             with hardware_lock:
                 return controller.get_rtc_datetime()
+
+        def start_executor_line_follow() -> str:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.start_line_follow()
+
+        def stop_executor_line_follow() -> str:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.stop_line_follow()
+
+        executor = MissionExecutor(
+            hardware_available=hardware_available,
+            start_line_follow=start_executor_line_follow,
+            stop_line_follow=stop_executor_line_follow,
+            mark_mission_in_progress=laravel_client.start_claimed_mission,
+            auto_execution_enabled=scheduler_settings.auto_execution_enabled,
+        )
 
         scheduler = MissionScheduler(
             hardware_available=hardware_available,
@@ -277,6 +300,8 @@ def create_app(
                 "/rtc",
                 "/scheduler/status",
                 "/scheduler/tick",
+                "/executor/status",
+                "/executor/start",
                 "/dispense",
                 "/water/dispense",
                 "/movement/forward",
@@ -354,6 +379,32 @@ def create_app(
             **result.as_dict(),
             "executor": executor.status(),
         }
+
+    @application.get("/executor/status")
+    def executor_status(request: Request) -> dict[str, object]:
+        executor: MissionExecutor = request.app.state.mission_executor
+        return executor.status()
+
+    @application.post("/executor/start")
+    def executor_start(request: Request) -> JSONResponse:
+        executor: MissionExecutor = request.app.state.mission_executor
+        result = executor.start_ready_mission()
+        status_code = {
+            MissionStartResult.STARTED: 200,
+            MissionStartResult.NO_READY_MISSION: 409,
+            MissionStartResult.HARDWARE_UNAVAILABLE: 503,
+            MissionStartResult.EXECUTOR_BUSY: 409,
+            MissionStartResult.INVALID_MISSION: 422,
+            MissionStartResult.LINE_FOLLOW_START_FAILED: 502,
+            MissionStartResult.MISSION_STATUS_UPDATE_FAILED: 502,
+        }[result.result]
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                **result.as_dict(),
+                "executor": executor.status(),
+            },
+        )
 
     @application.post("/dispense")
     def dispense(payload: DispenseRequest, request: Request) -> dict[str, object]:

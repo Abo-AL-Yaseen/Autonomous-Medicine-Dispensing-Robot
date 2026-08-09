@@ -3,6 +3,7 @@
 use App\Http\Controllers\Api\MedicineController;
 use App\Http\Controllers\Api\MissionClaimController;
 use App\Http\Controllers\Api\MissionController;
+use App\Http\Controllers\Api\MissionExecutionController;
 use App\Http\Controllers\Api\RobotNavigationController;
 use App\Http\Controllers\Api\RobotStatusController;
 use App\Http\Controllers\Api\RoomController;
@@ -14,6 +15,7 @@ Route::middleware('api')->group(function () {
     Route::apiResource('medicines', MedicineController::class);
 
     Route::post('missions/claim-due', MissionClaimController::class);
+    Route::post('missions/{mission}/start-execution', [MissionExecutionController::class, 'start']);
     Route::get('missions', [MissionController::class, 'index']);
     Route::get('missions/{mission}', [MissionController::class, 'show']);
     Route::post('missions', [MissionController::class, 'store']);

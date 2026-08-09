@@ -287,6 +287,59 @@ class MissionScheduleTest extends TestCase
         );
     }
 
+    public function test_claim_owner_can_transition_pending_mission_to_in_progress(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 17:00:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 18:00:00',
+            'UTC',
+        );
+        $mission->save();
+
+        $this->postJson("/api/missions/{$mission->id}/start-execution", [
+            'schedule_claimed_at' => '2026-08-09T18:00:00+00:00',
+        ])->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('mission.id', $mission->id)
+            ->assertJsonPath('mission.status', 'in_progress');
+
+        $this->assertSame('in_progress', $mission->fresh()->status);
+    }
+
+    public function test_start_execution_rejects_a_replaced_claim_lease(): void
+    {
+        $mission = $this->createMission('pending', '2026-08-09 17:00:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 18:01:00',
+            'UTC',
+        );
+        $mission->save();
+
+        $this->postJson("/api/missions/{$mission->id}/start-execution", [
+            'schedule_claimed_at' => '2026-08-09T18:00:00+00:00',
+        ])->assertConflict()
+            ->assertJsonPath('code', 'INVALID_MISSION_TRANSITION');
+
+        $this->assertSame('pending', $mission->fresh()->status);
+    }
+
+    public function test_start_execution_rejects_non_pending_mission(): void
+    {
+        $mission = $this->createMission('completed', '2026-08-09 17:00:00');
+        $mission->schedule_claimed_at = CarbonImmutable::parse(
+            '2026-08-09 18:00:00',
+            'UTC',
+        );
+        $mission->save();
+
+        $this->postJson("/api/missions/{$mission->id}/start-execution", [
+            'schedule_claimed_at' => '2026-08-09T18:00:00+00:00',
+        ])->assertConflict()
+            ->assertJsonPath('code', 'INVALID_MISSION_TRANSITION');
+
+        $this->assertSame('completed', $mission->fresh()->status);
+    }
+
     public function test_claim_api_requires_the_configured_timezone(): void
     {
         $this->postJson('/api/missions/claim-due', [

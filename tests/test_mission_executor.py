@@ -1,0 +1,226 @@
+"""Software-only tests for the first controlled mission execution step."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from raspberry_controller.services.laravel_api_client import ClaimedMission
+from raspberry_controller.services.mission_executor import (
+    MissionExecutionState,
+    MissionExecutor,
+    MissionStartResult,
+)
+from raspberry_controller.services.mission_scheduler import (
+    MissionScheduler,
+    SchedulerResult,
+)
+
+
+class FakeExecutionDependencies:
+    def __init__(self) -> None:
+        self.available = True
+        self.start_ack = "ACK|LINE_FOLLOW_STARTED"
+        self.stop_ack = "ACK|LINE_FOLLOW_STOPPED"
+        self.start_error: Exception | None = None
+        self.update_error: Exception | None = None
+        self.line_calls: list[str] = []
+        self.updated_missions: list[ClaimedMission] = []
+        self.motor_calls: list[str] = []
+        self.camera_calls: list[str] = []
+        self.dispense_calls: list[object] = []
+        self.water_calls: list[object] = []
+        self.return_home_calls: list[str] = []
+
+    def start_line_follow(self) -> str:
+        self.line_calls.append("start")
+        if self.start_error:
+            raise self.start_error
+        return self.start_ack
+
+    def stop_line_follow(self) -> str:
+        self.line_calls.append("stop")
+        return self.stop_ack
+
+    def mark_in_progress(self, mission: ClaimedMission) -> None:
+        self.updated_missions.append(mission)
+        if self.update_error:
+            raise self.update_error
+
+
+class ClaimTrackingLaravelClient:
+    def __init__(self) -> None:
+        self.claim_calls: list[tuple[datetime, str]] = []
+
+    def claim_due_mission(
+        self,
+        robot_datetime: datetime,
+        timezone_name: str,
+    ) -> ClaimedMission | None:
+        self.claim_calls.append((robot_datetime, timezone_name))
+        return valid_mission(9)
+
+    def start_claimed_mission(self, mission: ClaimedMission) -> None:
+        raise AssertionError("Scheduler must not start execution")
+
+    def close(self) -> None:
+        pass
+
+
+def valid_mission(mission_id: int = 8) -> ClaimedMission:
+    return ClaimedMission(
+        mission_id,
+        1,
+        2,
+        4,
+        room_number="204",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+    )
+
+
+def ready_executor(
+    dependencies: FakeExecutionDependencies,
+) -> MissionExecutor:
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        mark_mission_in_progress=dependencies.mark_in_progress,
+    )
+    assert executor.accept(valid_mission()) is True
+    return executor
+
+
+def test_hardware_unavailable_does_not_start_or_update_laravel() -> None:
+    dependencies = FakeExecutionDependencies()
+    dependencies.available = False
+    executor = ready_executor(dependencies)
+
+    result = executor.start_ready_mission()
+
+    assert result.result is MissionStartResult.HARDWARE_UNAVAILABLE
+    assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
+    assert dependencies.line_calls == []
+    assert dependencies.updated_missions == []
+
+
+def test_invalid_claimed_mission_never_touches_hardware_or_laravel() -> None:
+    dependencies = FakeExecutionDependencies()
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        mark_mission_in_progress=dependencies.mark_in_progress,
+    )
+    executor.accept(ClaimedMission(8, 1, 2, 4))
+
+    result = executor.start_ready_mission()
+
+    assert result.result is MissionStartResult.INVALID_MISSION
+    assert executor.state is MissionExecutionState.FAILED
+    assert dependencies.line_calls == []
+    assert dependencies.updated_missions == []
+
+
+def test_success_starts_line_follow_and_updates_laravel_once() -> None:
+    dependencies = FakeExecutionDependencies()
+    executor = ready_executor(dependencies)
+
+    result = executor.start_ready_mission()
+
+    assert result.result is MissionStartResult.STARTED
+    assert dependencies.line_calls == ["start"]
+    assert dependencies.updated_missions == [valid_mission()]
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+
+
+def test_line_follow_failure_leaves_laravel_pending() -> None:
+    dependencies = FakeExecutionDependencies()
+    dependencies.start_error = RuntimeError("serial timeout")
+    executor = ready_executor(dependencies)
+
+    result = executor.start_ready_mission()
+
+    assert result.result is MissionStartResult.LINE_FOLLOW_START_FAILED
+    assert dependencies.line_calls == ["start", "stop"]
+    assert dependencies.updated_missions == []
+    assert executor.state is MissionExecutionState.FAILED
+
+
+def test_malformed_line_follow_ack_does_not_update_laravel() -> None:
+    dependencies = FakeExecutionDependencies()
+    dependencies.start_ack = "ACK|WRONG"
+    executor = ready_executor(dependencies)
+
+    result = executor.start_ready_mission()
+
+    assert result.result is MissionStartResult.LINE_FOLLOW_START_FAILED
+    assert dependencies.updated_missions == []
+    assert dependencies.line_calls == ["start", "stop"]
+    assert executor.state is MissionExecutionState.FAILED
+
+
+def test_laravel_failure_stops_line_follow_immediately() -> None:
+    dependencies = FakeExecutionDependencies()
+    dependencies.update_error = RuntimeError("Laravel unavailable")
+    executor = ready_executor(dependencies)
+
+    result = executor.start_ready_mission()
+
+    assert result.result is MissionStartResult.MISSION_STATUS_UPDATE_FAILED
+    assert dependencies.line_calls == ["start", "stop"]
+    assert len(dependencies.updated_missions) == 1
+    assert executor.state is MissionExecutionState.FAILED
+
+
+def test_repeated_start_does_not_issue_duplicate_line_command() -> None:
+    dependencies = FakeExecutionDependencies()
+    executor = ready_executor(dependencies)
+
+    first = executor.start_ready_mission()
+    second = executor.start_ready_mission()
+
+    assert first.result is MissionStartResult.STARTED
+    assert second.result is MissionStartResult.EXECUTOR_BUSY
+    assert dependencies.line_calls == ["start"]
+    assert len(dependencies.updated_missions) == 1
+
+
+def test_going_to_room_blocks_scheduler_claims() -> None:
+    dependencies = FakeExecutionDependencies()
+    executor = ready_executor(dependencies)
+    assert executor.start_ready_mission().success is True
+    laravel = ClaimTrackingLaravelClient()
+    rtc_calls: list[datetime] = []
+
+    def read_rtc() -> datetime:
+        value = datetime(2026, 8, 9, 21, 40, 0)
+        rtc_calls.append(value)
+        return value
+
+    scheduler = MissionScheduler(
+        hardware_available=lambda: True,
+        read_rtc=read_rtc,
+        laravel_client=laravel,
+        executor=executor,
+        timezone_name="Asia/Hebron",
+    )
+
+    result = scheduler.tick()
+
+    assert result.result is SchedulerResult.EXECUTOR_BUSY
+    assert rtc_calls == []
+    assert laravel.claim_calls == []
+
+
+def test_execution_step_calls_no_out_of_scope_hardware() -> None:
+    dependencies = FakeExecutionDependencies()
+    executor = ready_executor(dependencies)
+
+    executor.start_ready_mission()
+
+    assert dependencies.motor_calls == []
+    assert dependencies.camera_calls == []
+    assert dependencies.dispense_calls == []
+    assert dependencies.water_calls == []
+    assert dependencies.return_home_calls == []

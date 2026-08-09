@@ -33,6 +33,11 @@ class FakeHardwareController:
         self.rtc_calls = 0
         self.water_calls: list[int] = []
         self.hardware_error: Exception | None = None
+        self.line_start_response = "ACK|LINE_FOLLOW_STARTED"
+        self.line_stop_response = "ACK|LINE_FOLLOW_STOPPED"
+        self.line_start_error: Exception | None = None
+        self.camera_calls: list[str] = []
+        self.return_home_calls: list[str] = []
 
     def connect(self) -> None:
         self.connected = True
@@ -101,15 +106,16 @@ class FakeHardwareController:
         )
 
     def start_line_follow(self) -> str:
-        return self._record_line_call(
-            "start_line_follow",
-            "ACK|LINE_FOLLOW_STARTED",
-        )
+        self._raise_hardware_error()
+        self.line_calls.append("start_line_follow")
+        if self.line_start_error:
+            raise self.line_start_error
+        return self.line_start_response
 
     def stop_line_follow(self) -> str:
         return self._record_line_call(
             "stop_line_follow",
-            "ACK|LINE_FOLLOW_STOPPED",
+            self.line_stop_response,
         )
 
     def intersection_left(self) -> str:
@@ -155,6 +161,8 @@ class FakeLaravelClient:
     def __init__(self) -> None:
         self.claimed_mission: ClaimedMission | None = None
         self.calls: list[tuple[datetime, str]] = []
+        self.start_calls: list[ClaimedMission] = []
+        self.start_error: Exception | None = None
         self.closed = False
 
     def claim_due_mission(
@@ -164,6 +172,11 @@ class FakeLaravelClient:
     ) -> ClaimedMission | None:
         self.calls.append((robot_datetime, timezone_name))
         return self.claimed_mission
+
+    def start_claimed_mission(self, mission: ClaimedMission) -> None:
+        self.start_calls.append(mission)
+        if self.start_error:
+            raise self.start_error
 
     def close(self) -> None:
         self.closed = True
@@ -177,6 +190,18 @@ def fake_hardware() -> FakeHardwareController:
 @pytest.fixture
 def fake_laravel() -> FakeLaravelClient:
     return FakeLaravelClient()
+
+
+def executable_mission() -> ClaimedMission:
+    return ClaimedMission(
+        8,
+        1,
+        2,
+        4,
+        room_number="204",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-09T17:30:00+00:00",
+    )
 
 
 def test_robot_timezone_defaults_to_asia_hebron(
@@ -196,6 +221,7 @@ def client(
     monkeypatch.setenv("WATER_FLOW_ML_PER_SECOND", "50")
     monkeypatch.setenv("ROBOT_TIMEZONE", "Asia/Hebron")
     monkeypatch.setenv("MISSION_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("MISSION_AUTO_EXECUTION_ENABLED", "false")
 
     def fake_factory(settings: HardwareSettings) -> FakeHardwareController:
         assert settings.esp32_port.startswith("/dev/serial/by-id/")
@@ -206,6 +232,7 @@ def client(
 
     def fake_laravel_factory(settings: SchedulerSettings) -> FakeLaravelClient:
         assert settings.enabled is False
+        assert settings.auto_execution_enabled is False
         return fake_laravel
 
     application = create_app(
@@ -230,6 +257,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/rtc" in body["endpoints"]
     assert "/scheduler/status" in body["endpoints"]
     assert "/scheduler/tick" in body["endpoints"]
+    assert "/executor/status" in body["endpoints"]
+    assert "/executor/start" in body["endpoints"]
     assert "/water/dispense" in body["endpoints"]
     assert "/movement/stop" in body["endpoints"]
     assert "/line/start" in body["endpoints"]
@@ -307,8 +336,13 @@ def test_scheduler_status_is_idle_and_disabled_by_default(
         "state": "IDLE",
         "mission_id": None,
         "room_id": None,
+        "room_number": None,
+        "target_room": None,
         "medicine_id": None,
+        "dispenser_box": None,
         "quantity": None,
+        "last_error": None,
+        "auto_execution_enabled": False,
         "pending_acceptance_mission_id": None,
         "last_tick_at": None,
         "last_result": None,
@@ -349,8 +383,13 @@ def test_manual_scheduler_tick_only_prepares_claimed_mission(
         "state": "READY_FOR_EXECUTION",
         "mission_id": 8,
         "room_id": 1,
+        "room_number": None,
+        "target_room": 1,
         "medicine_id": 2,
+        "dispenser_box": None,
         "quantity": 4,
+        "last_error": None,
+        "auto_execution_enabled": False,
     }
     assert fake_hardware.movement_calls == []
     assert fake_hardware.line_calls == []
@@ -372,6 +411,102 @@ def test_manual_scheduler_tick_does_not_claim_without_hardware(
     assert response.json()["result"] == "HARDWARE_UNAVAILABLE"
     assert fake_hardware.rtc_calls == 0
     assert fake_laravel.calls == []
+
+
+def test_executor_status_and_start_require_a_ready_mission(
+    client: TestClient,
+) -> None:
+    status_response = client.get("/executor/status")
+    start_response = client.post("/executor/start")
+
+    assert status_response.status_code == 200
+    assert status_response.json()["state"] == "IDLE"
+    assert status_response.json()["auto_execution_enabled"] is False
+    assert start_response.status_code == 409
+    assert start_response.json()["result"] == "NO_READY_MISSION"
+
+
+def test_executor_start_uses_high_level_line_follow_then_laravel(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    mission = executable_mission()
+    assert client.app.state.mission_executor.accept(mission) is True
+
+    first = client.post("/executor/start")
+    second = client.post("/executor/start")
+
+    assert first.status_code == 200
+    assert first.json()["result"] == "STARTED"
+    assert first.json()["executor"]["state"] == "GOING_TO_ROOM"
+    assert second.status_code == 409
+    assert second.json()["result"] == "EXECUTOR_BUSY"
+    assert fake_hardware.line_calls == ["start_line_follow"]
+    assert fake_laravel.start_calls == [mission]
+    assert fake_hardware.movement_calls == []
+    assert fake_hardware.navigation_calls == []
+    assert fake_hardware.camera_calls == []
+    assert fake_hardware.dispense_calls == []
+    assert fake_hardware.water_calls == []
+    assert fake_hardware.return_home_calls == []
+
+
+def test_executor_start_does_nothing_when_hardware_is_unavailable(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    client.app.state.mission_executor.accept(executable_mission())
+    client.app.state.hardware_connected = False
+
+    response = client.post("/executor/start")
+
+    assert response.status_code == 503
+    assert response.json()["result"] == "HARDWARE_UNAVAILABLE"
+    assert response.json()["executor"]["state"] == "READY_FOR_EXECUTION"
+    assert fake_hardware.line_calls == []
+    assert fake_laravel.start_calls == []
+
+
+def test_executor_malformed_start_ack_never_updates_laravel(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    client.app.state.mission_executor.accept(executable_mission())
+    fake_hardware.line_start_response = "ACK|WRONG"
+
+    response = client.post("/executor/start")
+
+    assert response.status_code == 502
+    assert response.json()["result"] == "LINE_FOLLOW_START_FAILED"
+    assert response.json()["executor"]["state"] == "FAILED"
+    assert fake_hardware.line_calls == [
+        "start_line_follow",
+        "stop_line_follow",
+    ]
+    assert fake_laravel.start_calls == []
+
+
+def test_executor_laravel_failure_immediately_stops_line_follow(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    client.app.state.mission_executor.accept(executable_mission())
+    fake_laravel.start_error = RuntimeError("Laravel unavailable")
+
+    response = client.post("/executor/start")
+
+    assert response.status_code == 502
+    assert response.json()["result"] == "MISSION_STATUS_UPDATE_FAILED"
+    assert response.json()["executor"]["state"] == "FAILED"
+    assert fake_hardware.line_calls == [
+        "start_line_follow",
+        "stop_line_follow",
+    ]
+    assert fake_laravel.start_calls == [executable_mission()]
 
 
 def test_dispense_rejects_both_boxes_zero(client: TestClient) -> None:

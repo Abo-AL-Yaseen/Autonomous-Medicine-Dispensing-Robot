@@ -37,6 +37,7 @@ The API reads these optional environment variables:
 | `LARAVEL_API_TIMEOUT_SECONDS` | `2.0` seconds |
 | `MISSION_SCHEDULER_ENABLED` | `false` |
 | `MISSION_SCHEDULER_INTERVAL_SECONDS` | `5.0` seconds |
+| `MISSION_AUTO_EXECUTION_ENABLED` | `false` (reserved; does not auto-start yet) |
 | `MISSION_CLAIM_LEASE_SECONDS` | `60` seconds (Laravel stale-claim recovery) |
 
 ## Validation
@@ -140,8 +141,7 @@ Laravel mission resource, including its nested room and medicine. For example:
 Laravel atomically fills `schedule_claimed_at` for the oldest eligible pending
 mission and leaves its status as `pending`. The Raspberry `MissionExecutor` then
 holds only the runtime fields required for the software state
-`READY_FOR_EXECUTION`. It does not move, navigate, use the camera, dispense
-medicine, dispense water, or mark a mission complete.
+`READY_FOR_EXECUTION`. The scheduler itself does not start movement.
 
 `schedule_claimed_at` is a Laravel-managed lease rather than a permanent claim.
 A pending, due mission becomes claimable again when its claim timestamp is at
@@ -164,6 +164,42 @@ Safe development endpoints are available even when the periodic loop is off:
   state, held mission ID, and the most recent tick result.
 - `POST /scheduler/tick` performs one claim-only cycle. It contains no movement
   or dispensing behavior.
+
+## Starting a ready mission
+
+Automatic execution remains disabled and is not connected to the scheduler.
+`MISSION_AUTO_EXECUTION_ENABLED` defaults to `false`; in this phase it is
+reported for diagnostics only and does not start a mission even if configured.
+
+The manual software trigger `POST /executor/start` performs exactly this first
+execution step for the currently ready mission:
+
+```text
+READY_FOR_EXECUTION
+  -> verify hardware availability
+  -> STARTING
+  -> ESP32 START_LINE_FOLLOW / ACK|LINE_FOLLOW_STARTED
+  -> Laravel POST /api/missions/{id}/start-execution
+  -> GOING_TO_ROOM
+```
+
+The Laravel request includes the exact `schedule_claimed_at` returned by the
+claim. Laravel atomically permits only `pending -> in_progress` while that claim
+lease still matches. It does not expose an arbitrary status update through this
+execution endpoint.
+
+If line-follow start fails or returns a malformed acknowledgement, Laravel is
+not updated and the executor enters `FAILED`. If line following starts but the
+Laravel transition fails, the executor immediately calls the existing
+`STOP_LINE_FOLLOW` operation and requires `ACK|LINE_FOLLOW_STOPPED` before
+reporting `MISSION_STATUS_UPDATE_FAILED`. `GET /executor/status` reports the
+state, mission and target-room fields, dispenser box, last error, and configured
+auto-execution flag. Repeated starts while `STARTING` or `GOING_TO_ROOM` return
+`EXECUTOR_BUSY` without sending another line command.
+
+This phase does not implement intersection decisions, camera or ArUco use, room
+arrival, medicine or water dispensing, return-home behavior, or mission
+completion.
 
 ### Legacy Raspberry database
 

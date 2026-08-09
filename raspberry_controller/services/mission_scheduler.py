@@ -31,6 +31,8 @@ class LaravelMissionClient(Protocol):
         timezone_name: str,
     ) -> ClaimedMission | None: ...
 
+    def start_claimed_mission(self, mission: ClaimedMission) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -40,6 +42,7 @@ class SchedulerSettings:
     laravel_api_timeout_seconds: float
     enabled: bool
     interval_seconds: float
+    auto_execution_enabled: bool = False
 
     @classmethod
     def from_environment(cls) -> "SchedulerSettings":
@@ -56,6 +59,10 @@ class SchedulerSettings:
             interval_seconds=_positive_float_setting(
                 "MISSION_SCHEDULER_INTERVAL_SECONDS",
                 DEFAULT_MISSION_SCHEDULER_INTERVAL_SECONDS,
+            ),
+            auto_execution_enabled=_boolean_setting(
+                "MISSION_AUTO_EXECUTION_ENABLED",
+                False,
             ),
         )
 

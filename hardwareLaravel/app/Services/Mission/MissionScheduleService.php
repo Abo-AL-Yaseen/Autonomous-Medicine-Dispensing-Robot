@@ -85,6 +85,30 @@ class MissionScheduleService
         });
     }
 
+    /**
+     * Atomically start only the pending mission owned by this exact claim lease.
+     */
+    public function startClaimedMission(
+        Mission $mission,
+        CarbonInterface $claimTimestamp,
+    ): ?Mission {
+        $claimUtc = CarbonImmutable::instance($claimTimestamp)->utc();
+
+        return DB::transaction(function () use ($mission, $claimUtc): ?Mission {
+            $updated = Mission::query()
+                ->whereKey($mission->getKey())
+                ->where('status', 'pending')
+                ->where('schedule_claimed_at', $claimUtc)
+                ->update(['status' => 'in_progress']);
+
+            if ($updated !== 1) {
+                return null;
+            }
+
+            return $mission->fresh(['room', 'medicine']);
+        });
+    }
+
     private function claimIsAvailable(
         Mission $mission,
         CarbonImmutable $rtcUtc,

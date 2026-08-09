@@ -46,6 +46,9 @@ class FakeLaravelClient:
     def close(self) -> None:
         self.closed = True
 
+    def start_claimed_mission(self, mission: ClaimedMission) -> None:
+        raise AssertionError("Scheduler must not start mission execution")
+
 
 class SafeSchedulerHardware:
     def __init__(self) -> None:
@@ -181,8 +184,13 @@ def test_idle_executor_may_claim_a_due_mission() -> None:
         "state": "READY_FOR_EXECUTION",
         "mission_id": 8,
         "room_id": 1,
+        "room_number": None,
+        "target_room": 1,
         "medicine_id": 2,
+        "dispenser_box": None,
         "quantity": 4,
+        "last_error": None,
+        "auto_execution_enabled": False,
     }
 
 
@@ -299,6 +307,7 @@ def test_scheduler_is_disabled_by_default(
         "MISSION_SCHEDULER_INTERVAL_SECONDS",
         "LARAVEL_API_URL",
         "LARAVEL_API_TIMEOUT_SECONDS",
+        "MISSION_AUTO_EXECUTION_ENABLED",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -307,6 +316,7 @@ def test_scheduler_is_disabled_by_default(
     assert settings.enabled is False
     assert settings.interval_seconds == 5
     assert settings.laravel_api_url == "http://127.0.0.1:8000/api"
+    assert settings.auto_execution_enabled is False
 
 
 def test_disabled_loop_does_not_start_a_thread() -> None:
@@ -354,9 +364,10 @@ def test_laravel_client_sends_wall_clock_claim_contract() -> None:
                 "claimed": True,
                 "mission": {
                     "id": 8,
-                    "room": {"id": 1},
-                    "medicine": {"id": 2},
+                    "room": {"id": 1, "room_number": "204"},
+                    "medicine": {"id": 2, "dispenser_box": 1},
                     "quantity": 4,
+                    "schedule_claimed_at": "2026-08-09T18:40:00+00:00",
                 },
             },
         )
@@ -375,7 +386,51 @@ def test_laravel_client_sends_wall_clock_claim_contract() -> None:
     finally:
         client.close()
 
-    assert mission == ClaimedMission(8, 1, 2, 4)
+    assert mission == ClaimedMission(
+        8,
+        1,
+        2,
+        4,
+        room_number="204",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+    )
+
+
+def test_laravel_client_starts_only_the_exact_claimed_mission() -> None:
+    mission = ClaimedMission(
+        8,
+        1,
+        2,
+        4,
+        room_number="204",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/missions/8/start-execution"
+        assert json.loads(request.content) == {
+            "schedule_claimed_at": "2026-08-09T18:40:00+00:00"
+        }
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "mission": {"id": 8, "status": "in_progress"},
+            },
+        )
+
+    client = LaravelApiClient(
+        "http://laravel.test/api",
+        0.2,
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        client.start_claimed_mission(mission)
+    finally:
+        client.close()
 
 
 def test_laravel_client_maps_timeout_to_clear_error() -> None:
