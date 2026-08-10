@@ -137,6 +137,43 @@ class PhysicalNavigationMapTest extends TestCase
             ->assertJsonPath('data.navigation_node.marker_id', 13);
     }
 
+    public function test_read_only_navigation_map_api_exposes_the_official_contract(): void
+    {
+        $countsBefore = [
+            Room::query()->count(),
+            Node::query()->count(),
+            Connection::query()->count(),
+        ];
+
+        $response = $this->getJson('/api/navigation/map');
+
+        $response
+            ->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonCount(5, 'rooms')
+            ->assertJsonCount(8, 'nodes')
+            ->assertJsonCount(7, 'connections')
+            ->assertJsonPath('rooms.3.room_number', '4')
+            ->assertJsonPath('rooms.3.destination_node.node_name', 'ROOM_4')
+            ->assertJsonPath('rooms.3.destination_node.marker_id', 14);
+
+        $this->assertSame([
+            ['from_node' => 'NODE_0', 'to_node' => 'ROOM_1', 'direction' => 'LEFT'],
+            ['from_node' => 'NODE_0', 'to_node' => 'NODE_1', 'direction' => 'STRAIGHT'],
+            ['from_node' => 'NODE_1', 'to_node' => 'NODE_2', 'direction' => 'LEFT'],
+            ['from_node' => 'NODE_1', 'to_node' => 'ROOM_4', 'direction' => 'RIGHT'],
+            ['from_node' => 'NODE_1', 'to_node' => 'ROOM_5', 'direction' => 'STRAIGHT'],
+            ['from_node' => 'NODE_2', 'to_node' => 'ROOM_3', 'direction' => 'LEFT'],
+            ['from_node' => 'NODE_2', 'to_node' => 'ROOM_2', 'direction' => 'RIGHT'],
+        ], $response->json('connections'));
+
+        $this->assertSame($countsBefore, [
+            Room::query()->count(),
+            Node::query()->count(),
+            Connection::query()->count(),
+        ]);
+    }
+
     public function test_marker_ids_are_unique_at_the_database_level(): void
     {
         $this->expectException(QueryException::class);

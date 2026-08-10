@@ -1,10 +1,26 @@
-"""Navigation service package.
+"""Laravel-backed, decision-only physical navigation services."""
+from .route_planner import (
+    DirectedConnection,
+    LaravelRoutePlanner,
+    NavigationMapError,
+    PhysicalNavigationMap,
+    PhysicalNode,
+    PhysicalRoom,
+    RouteDecision,
+    RoutePlan,
+    RouteStep,
+    UnknownMarkerError,
+)
 
-All robot navigation logic, floor-map coordination, path planning, and
-movement orchestration should be implemented here instead of in the hardware
-controller layer.
-"""
-
-from ...navigation.graph import NavigationGraph
-
-__all__ = ["NavigationGraph"]
+__all__ = [
+    "DirectedConnection",
+    "LaravelRoutePlanner",
+    "NavigationMapError",
+    "PhysicalNavigationMap",
+    "PhysicalNode",
+    "PhysicalRoom",
+    "RouteDecision",
+    "RoutePlan",
+    "RouteStep",
+    "UnknownMarkerError",
+]

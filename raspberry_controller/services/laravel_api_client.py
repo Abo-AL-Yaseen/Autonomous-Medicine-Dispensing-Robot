@@ -7,6 +7,14 @@ from datetime import datetime
 
 import httpx
 
+from .navigation import (
+    DirectedConnection,
+    PhysicalNavigationMap,
+    PhysicalNode,
+    PhysicalRoom,
+    RouteDecision,
+)
+
 
 class LaravelApiError(RuntimeError):
     """Laravel returned an invalid or unsuccessful response."""
@@ -146,6 +154,27 @@ class LaravelApiClient:
         ):
             raise LaravelApiError("Laravel mission start response was invalid")
 
+    def get_navigation_map(self) -> PhysicalNavigationMap:
+        """Fetch and validate Laravel's authoritative physical map snapshot."""
+
+        try:
+            response = self._client.get("navigation/map")
+            response.raise_for_status()
+        except httpx.RequestError as exc:
+            raise LaravelApiUnavailable("Laravel navigation map is unavailable") from exc
+        except httpx.HTTPStatusError as exc:
+            raise LaravelApiError(
+                "Laravel navigation map request failed with HTTP "
+                f"{exc.response.status_code}"
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise LaravelApiError("Laravel navigation map was not valid JSON") from exc
+
+        return _parse_navigation_map(payload)
+
     def close(self) -> None:
         self._client.close()
 
@@ -153,6 +182,12 @@ class LaravelApiClient:
 def _positive_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise LaravelApiError(f"Laravel claim response has an invalid {field}")
+    return value
+
+
+def _nonnegative_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise LaravelApiError(f"Laravel navigation map has an invalid {field}")
     return value
 
 
@@ -185,4 +220,152 @@ def _optional_dispenser_box(value: object) -> int | None:
         raise LaravelApiError(
             "Laravel claim response has an invalid mission.medicine.dispenser_box"
         )
+    return value
+
+
+def _parse_navigation_map(payload: object) -> PhysicalNavigationMap:
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        raise LaravelApiError("Laravel navigation map has an invalid success field")
+
+    raw_nodes = _list(payload.get("nodes"), "nodes")
+    raw_rooms = _list(payload.get("rooms"), "rooms")
+    raw_connections = _list(payload.get("connections"), "connections")
+
+    nodes: list[PhysicalNode] = []
+    node_names: set[str] = set()
+    marker_ids: set[int] = set()
+    node_ids: set[int] = set()
+    for index, raw_node in enumerate(raw_nodes):
+        node = _object(raw_node, f"nodes.{index}")
+        parsed = PhysicalNode(
+            id=_positive_int(node.get("id"), f"nodes.{index}.id"),
+            name=_nonempty_string(
+                node.get("node_name"),
+                f"nodes.{index}.node_name",
+            ),
+            node_type=_nonempty_string(
+                node.get("node_type"),
+                f"nodes.{index}.node_type",
+            ),
+            marker_id=_nonnegative_int(
+                node.get("marker_id"),
+                f"nodes.{index}.marker_id",
+            ),
+        )
+        if (
+            parsed.id in node_ids
+            or parsed.name in node_names
+            or parsed.marker_id in marker_ids
+        ):
+            raise LaravelApiError("Laravel navigation map contains duplicate nodes")
+        node_ids.add(parsed.id)
+        node_names.add(parsed.name)
+        marker_ids.add(parsed.marker_id)
+        nodes.append(parsed)
+
+    nodes_by_name = {node.name: node for node in nodes}
+    rooms: list[PhysicalRoom] = []
+    room_ids: set[int] = set()
+    for index, raw_room in enumerate(raw_rooms):
+        room = _object(raw_room, f"rooms.{index}")
+        destination = _object(
+            room.get("destination_node"),
+            f"rooms.{index}.destination_node",
+        )
+        destination_node_id = _positive_int(
+            destination.get("id"),
+            f"rooms.{index}.destination_node.id",
+        )
+        destination_node_name = _nonempty_string(
+            destination.get("node_name"),
+            f"rooms.{index}.destination_node.node_name",
+        )
+        destination_marker_id = _nonnegative_int(
+            destination.get("marker_id"),
+            f"rooms.{index}.destination_node.marker_id",
+        )
+        mapped_node = nodes_by_name.get(destination_node_name)
+        if (
+            mapped_node is None
+            or mapped_node.id != destination_node_id
+            or mapped_node.marker_id != destination_marker_id
+        ):
+            raise LaravelApiError(
+                "Laravel navigation map contains an inconsistent room destination"
+            )
+
+        parsed_room = PhysicalRoom(
+            id=_positive_int(room.get("id"), f"rooms.{index}.id"),
+            room_number=_nonempty_string(
+                room.get("room_number"),
+                f"rooms.{index}.room_number",
+            ),
+            room_name=_nonempty_string(
+                room.get("room_name"),
+                f"rooms.{index}.room_name",
+            ),
+            destination_node=destination_node_name,
+            destination_marker_id=destination_marker_id,
+        )
+        if parsed_room.id in room_ids:
+            raise LaravelApiError("Laravel navigation map contains duplicate rooms")
+        room_ids.add(parsed_room.id)
+        rooms.append(parsed_room)
+
+    connections: list[DirectedConnection] = []
+    connection_keys: set[tuple[str, str, RouteDecision]] = set()
+    for index, raw_connection in enumerate(raw_connections):
+        connection = _object(raw_connection, f"connections.{index}")
+        from_node = _nonempty_string(
+            connection.get("from_node"),
+            f"connections.{index}.from_node",
+        )
+        to_node = _nonempty_string(
+            connection.get("to_node"),
+            f"connections.{index}.to_node",
+        )
+        if from_node not in nodes_by_name or to_node not in nodes_by_name:
+            raise LaravelApiError(
+                "Laravel navigation map connection references an unknown node"
+            )
+        try:
+            direction = RouteDecision(
+                _nonempty_string(
+                    connection.get("direction"),
+                    f"connections.{index}.direction",
+                )
+            )
+        except ValueError as exc:
+            raise LaravelApiError(
+                "Laravel navigation map contains an unsupported direction"
+            ) from exc
+        if direction in {RouteDecision.ARRIVED, RouteDecision.NO_ROUTE}:
+            raise LaravelApiError(
+                "Laravel navigation map contains a non-traversal direction"
+            )
+
+        key = (from_node, to_node, direction)
+        if key in connection_keys:
+            raise LaravelApiError(
+                "Laravel navigation map contains duplicate connections"
+            )
+        connection_keys.add(key)
+        connections.append(
+            DirectedConnection(
+                from_node=from_node,
+                to_node=to_node,
+                direction=direction,
+            )
+        )
+
+    return PhysicalNavigationMap(
+        rooms=tuple(rooms),
+        nodes=tuple(nodes),
+        connections=tuple(connections),
+    )
+
+
+def _list(value: object, field: str) -> list[object]:
+    if not isinstance(value, list):
+        raise LaravelApiError(f"Laravel navigation map has an invalid {field}")
     return value

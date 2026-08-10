@@ -4,6 +4,7 @@ use App\Http\Controllers\Api\MedicineController;
 use App\Http\Controllers\Api\MissionClaimController;
 use App\Http\Controllers\Api\MissionController;
 use App\Http\Controllers\Api\MissionExecutionController;
+use App\Http\Controllers\Api\PhysicalNavigationMapController;
 use App\Http\Controllers\Api\RobotNavigationController;
 use App\Http\Controllers\Api\RobotStatusController;
 use App\Http\Controllers\Api\RoomController;
@@ -13,6 +14,7 @@ use Illuminate\Support\Facades\Route;
 Route::middleware('api')->group(function () {
     Route::apiResource('rooms', RoomController::class);
     Route::apiResource('medicines', MedicineController::class);
+    Route::get('navigation/map', PhysicalNavigationMapController::class);
 
     Route::post('missions/claim-due', MissionClaimController::class);
     Route::post('missions/{mission}/start-execution', [MissionExecutionController::class, 'start']);

@@ -10,6 +10,13 @@ from raspberry_controller.services.mission_executor import (
     MissionExecutor,
     MissionStartResult,
 )
+from raspberry_controller.services.navigation import (
+    DirectedConnection,
+    PhysicalNavigationMap,
+    PhysicalNode,
+    PhysicalRoom,
+    RouteDecision,
+)
 from raspberry_controller.services.mission_scheduler import (
     MissionScheduler,
     SchedulerResult,
@@ -89,6 +96,58 @@ def ready_executor(
     )
     assert executor.accept(valid_mission()) is True
     return executor
+
+
+def navigation_map_for_room_one() -> PhysicalNavigationMap:
+    return PhysicalNavigationMap(
+        rooms=(PhysicalRoom(1, "1", "Room 1", "ROOM_1", 11),),
+        nodes=(
+            PhysicalNode(1, "NODE_0", "intersection", 0),
+            PhysicalNode(2, "ROOM_1", "room", 11),
+        ),
+        connections=(
+            DirectedConnection("NODE_0", "ROOM_1", RouteDecision.LEFT),
+        ),
+    )
+
+
+def test_accept_resolves_destination_from_laravel_map_without_hardware() -> None:
+    dependencies = FakeExecutionDependencies()
+    map_calls: list[str] = []
+
+    def load_map() -> PhysicalNavigationMap:
+        map_calls.append("load")
+        return navigation_map_for_room_one()
+
+    executor = MissionExecutor(load_navigation_map=load_map)
+
+    assert executor.accept(valid_mission()) is True
+    mission, plan = executor.plan_route(0)
+
+    assert mission.id == 8
+    assert executor.destination_node == PhysicalNode(2, "ROOM_1", "room", 11)
+    assert plan.decision is RouteDecision.LEFT
+    assert plan.next_node == "ROOM_1"
+    assert map_calls == ["load"]
+    assert dependencies.line_calls == []
+    assert dependencies.motor_calls == []
+
+
+def test_map_resolution_failure_leaves_executor_idle_for_safe_retry() -> None:
+    def fail_to_load_map() -> PhysicalNavigationMap:
+        raise RuntimeError("Laravel unavailable")
+
+    executor = MissionExecutor(load_navigation_map=fail_to_load_map)
+
+    try:
+        executor.accept(valid_mission())
+    except RuntimeError as exc:
+        assert str(exc) == "Laravel unavailable"
+    else:
+        raise AssertionError("map loading failure must reject mission acceptance")
+
+    assert executor.state is MissionExecutionState.IDLE
+    assert executor.mission_id is None
 
 
 def test_hardware_unavailable_does_not_start_or_update_laravel() -> None:

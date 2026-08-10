@@ -433,6 +433,66 @@ def test_laravel_client_starts_only_the_exact_claimed_mission() -> None:
         client.close()
 
 
+def test_laravel_client_loads_the_read_only_navigation_map_contract() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/navigation/map"
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "rooms": [
+                    {
+                        "id": 1,
+                        "room_number": "1",
+                        "room_name": "Room 1",
+                        "destination_node": {
+                            "id": 2,
+                            "node_name": "ROOM_1",
+                            "marker_id": 11,
+                        },
+                    }
+                ],
+                "nodes": [
+                    {
+                        "id": 1,
+                        "node_name": "NODE_0",
+                        "node_type": "intersection",
+                        "marker_id": 0,
+                    },
+                    {
+                        "id": 2,
+                        "node_name": "ROOM_1",
+                        "node_type": "room",
+                        "marker_id": 11,
+                    },
+                ],
+                "connections": [
+                    {
+                        "from_node": "NODE_0",
+                        "to_node": "ROOM_1",
+                        "direction": "LEFT",
+                    }
+                ],
+            },
+        )
+
+    client = LaravelApiClient(
+        "http://laravel.test/api",
+        0.2,
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        navigation_map = client.get_navigation_map()
+    finally:
+        client.close()
+
+    assert navigation_map.node_for_marker(0).name == "NODE_0"  # type: ignore[union-attr]
+    assert navigation_map.room_by_id(1).destination_node == "ROOM_1"  # type: ignore[union-attr]
+    assert navigation_map.connections[0].direction.value == "LEFT"
+
+
 def test_laravel_client_maps_timeout_to_clear_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)

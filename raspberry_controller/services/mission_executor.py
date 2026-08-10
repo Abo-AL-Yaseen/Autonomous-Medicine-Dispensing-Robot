@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .laravel_api_client import ClaimedMission
+from .navigation import (
+    LaravelRoutePlanner,
+    PhysicalNavigationMap,
+    PhysicalNode,
+    RoutePlan,
+)
 
 
 LINE_FOLLOW_STARTED_ACK = "ACK|LINE_FOLLOW_STARTED"
@@ -30,6 +36,10 @@ class MissionStartResult(str, Enum):
     INVALID_MISSION = "INVALID_MISSION"
     LINE_FOLLOW_START_FAILED = "LINE_FOLLOW_START_FAILED"
     MISSION_STATUS_UPDATE_FAILED = "MISSION_STATUS_UPDATE_FAILED"
+
+
+class MissionRouteUnavailableError(RuntimeError):
+    """No accepted mission or Laravel map is available for route preview."""
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,7 @@ class MissionExecutor:
         start_line_follow: Callable[[], str] | None = None,
         stop_line_follow: Callable[[], str] | None = None,
         mark_mission_in_progress: Callable[[ClaimedMission], None] | None = None,
+        load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
         auto_execution_enabled: bool = False,
     ) -> None:
         self._lock = threading.Lock()
@@ -66,6 +77,9 @@ class MissionExecutor:
         self._start_line_follow = start_line_follow
         self._stop_line_follow = stop_line_follow
         self._mark_mission_in_progress = mark_mission_in_progress
+        self._load_navigation_map = load_navigation_map
+        self._route_planner: LaravelRoutePlanner | None = None
+        self._destination_node: PhysicalNode | None = None
         self._auto_execution_enabled = auto_execution_enabled
 
     @property
@@ -91,10 +105,49 @@ class MissionExecutor:
                     return False
                 raise RuntimeError("MissionExecutor is already holding a mission")
 
+        route_planner: LaravelRoutePlanner | None = None
+        destination_node: PhysicalNode | None = None
+        if self._load_navigation_map is not None:
+            navigation_map = self._load_navigation_map()
+            route_planner = LaravelRoutePlanner(navigation_map)
+            destination_node = route_planner.destination_for_room(mission.room_id)
+
+        with self._lock:
+            if self._state is not MissionExecutionState.IDLE:
+                if (
+                    self._state is MissionExecutionState.READY_FOR_EXECUTION
+                    and self._mission
+                    and self._mission.id == mission.id
+                ):
+                    return False
+                raise RuntimeError("MissionExecutor is already holding a mission")
             self._mission = mission
+            self._route_planner = route_planner
+            self._destination_node = destination_node
             self._last_error = None
             self._state = MissionExecutionState.READY_FOR_EXECUTION
             return True
+
+    def plan_route(self, marker_id: int) -> tuple[ClaimedMission, RoutePlan]:
+        """Preview a Laravel-backed route without changing state or hardware."""
+
+        with self._lock:
+            mission = self._mission
+            route_planner = self._route_planner
+
+        if mission is None:
+            raise MissionRouteUnavailableError("No mission is loaded")
+        if route_planner is None:
+            raise MissionRouteUnavailableError(
+                "No Laravel navigation map is loaded for this mission"
+            )
+
+        return mission, route_planner.plan(marker_id, mission.room_id)
+
+    @property
+    def destination_node(self) -> PhysicalNode | None:
+        with self._lock:
+            return self._destination_node
 
     def start_ready_mission(self) -> MissionStartOutcome:
         """Perform only READY -> line follow -> in_progress -> GOING_TO_ROOM."""

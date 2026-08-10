@@ -33,11 +33,13 @@ from .schemas.mission import (
 )
 from .services.camera import ArucoCameraService, CameraSettings
 from .services.mission_service import MissionService
-from .services.laravel_api_client import LaravelApiClient
+from .services.laravel_api_client import ClaimedMission, LaravelApiClient
 from .services.mission_executor import (
     MissionExecutor,
+    MissionRouteUnavailableError,
     MissionStartResult,
 )
+from .services.navigation import NavigationMapError, RoutePlan, UnknownMarkerError
 from .services.mission_scheduler import (
     LaravelMissionClient,
     MissionScheduler,
@@ -118,6 +120,12 @@ class WaterDispenseRequest(BaseModel):
     """Requested water amount; delivery remains calibrated-time based."""
 
     amount_ml: StrictInt = Field(ge=1, le=1000)
+
+
+class NavigationDecisionPreviewRequest(BaseModel):
+    """A marker observation used only for read-only route diagnostics."""
+
+    marker_id: StrictInt = Field(ge=0)
 
 
 class WaterCalibrationError(ValueError):
@@ -246,6 +254,7 @@ def create_app(
             start_line_follow=start_executor_line_follow,
             stop_line_follow=stop_executor_line_follow,
             mark_mission_in_progress=laravel_client.start_claimed_mission,
+            load_navigation_map=laravel_client.get_navigation_map,
             auto_execution_enabled=scheduler_settings.auto_execution_enabled,
         )
 
@@ -350,6 +359,8 @@ def create_app(
                 "/navigation/intersection/right",
                 "/navigation/intersection/straight",
                 "/navigation/u-turn",
+                "/navigation/route/current",
+                "/navigation/decision/preview",
                 "/missions",
                 "/missions/{id}",
                 "/missions/{id}/start",
@@ -671,6 +682,27 @@ def create_app(
             lambda controller: controller.u_turn(),
         )
 
+    @application.get("/navigation/route/current")
+    def current_navigation_route(
+        marker_id: int,
+        request: Request,
+    ) -> dict[str, object]:
+        executor: MissionExecutor = request.app.state.mission_executor
+        mission, plan = _preview_route(executor, marker_id)
+        return {
+            **_route_preview_payload(mission.id, mission.room_id, plan),
+            "route": [step.as_dict() for step in plan.steps],
+        }
+
+    @application.post("/navigation/decision/preview")
+    def preview_navigation_decision(
+        payload: NavigationDecisionPreviewRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        executor: MissionExecutor = request.app.state.mission_executor
+        mission, plan = _preview_route(executor, payload.marker_id)
+        return _route_preview_payload(mission.id, mission.room_id, plan)
+
     @application.post("/missions")
     def create_mission(payload: MissionCreateRequest, request: Request) -> dict[str, object]:
         service: MissionService = request.app.state.mission_service
@@ -787,6 +819,47 @@ def _navigation_response(
 ) -> dict[str, object]:
     response = _run_hardware_operation(request, operation)
     return {"success": True, "direction": direction, "response": response}
+
+
+def _preview_route(
+    executor: MissionExecutor,
+    marker_id: int,
+) -> tuple[ClaimedMission, RoutePlan]:
+    try:
+        return executor.plan_route(marker_id)
+    except UnknownMarkerError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "UNKNOWN_MARKER"},
+        ) from exc
+    except MissionRouteUnavailableError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "NO_LOADED_MISSION"},
+        ) from exc
+    except NavigationMapError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "NAVIGATION_MAP_INVALID"},
+        ) from exc
+
+
+def _route_preview_payload(
+    mission_id: int,
+    room_id: int,
+    plan: RoutePlan,
+) -> dict[str, object]:
+    return {
+        "success": plan.success,
+        "mission_id": mission_id,
+        "room_id": room_id,
+        "current_node": plan.current_node.name,
+        "current_marker_id": plan.current_node.marker_id,
+        "destination_node": plan.destination_node.name,
+        "destination_marker_id": plan.destination_node.marker_id,
+        "decision": plan.decision.value,
+        "next_node": plan.next_node,
+    }
 
 
 def _run_hardware_operation(

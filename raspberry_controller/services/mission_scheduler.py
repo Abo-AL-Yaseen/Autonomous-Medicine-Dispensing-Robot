@@ -16,6 +16,7 @@ from .laravel_api_client import (
     LaravelApiError,
     LaravelApiUnavailable,
 )
+from .navigation import PhysicalNavigationMap
 from .mission_executor import MissionExecutionState, MissionExecutor
 
 
@@ -32,6 +33,8 @@ class LaravelMissionClient(Protocol):
     ) -> ClaimedMission | None: ...
 
     def start_claimed_mission(self, mission: ClaimedMission) -> None: ...
+
+    def get_navigation_map(self) -> PhysicalNavigationMap: ...
 
     def close(self) -> None: ...
 

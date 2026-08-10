@@ -22,6 +22,17 @@ from raspberry_controller.services.camera import (
     MarkerDetectionResult,
 )
 from raspberry_controller.services.laravel_api_client import ClaimedMission
+from raspberry_controller.services.mission_executor import (
+    MissionExecutionState,
+    MissionExecutor,
+)
+from raspberry_controller.services.navigation import (
+    DirectedConnection,
+    PhysicalNavigationMap,
+    PhysicalNode,
+    PhysicalRoom,
+    RouteDecision,
+)
 from raspberry_controller.services.mission_scheduler import SchedulerSettings
 
 
@@ -207,6 +218,8 @@ class FakeLaravelClient:
         self.calls: list[tuple[datetime, str]] = []
         self.start_calls: list[ClaimedMission] = []
         self.start_error: Exception | None = None
+        self.map_calls = 0
+        self.navigation_map = _navigation_map_fixture()
         self.closed = False
 
     def claim_due_mission(
@@ -222,8 +235,45 @@ class FakeLaravelClient:
         if self.start_error:
             raise self.start_error
 
+    def get_navigation_map(self) -> PhysicalNavigationMap:
+        self.map_calls += 1
+        return self.navigation_map
+
     def close(self) -> None:
         self.closed = True
+
+
+def _navigation_map_fixture() -> PhysicalNavigationMap:
+    nodes = (
+        PhysicalNode(1, "NODE_0", "intersection", 0),
+        PhysicalNode(2, "NODE_1", "intersection", 1),
+        PhysicalNode(3, "NODE_2", "intersection", 2),
+        PhysicalNode(4, "ROOM_1", "room", 11),
+        PhysicalNode(5, "ROOM_2", "room", 12),
+        PhysicalNode(6, "ROOM_3", "room", 13),
+        PhysicalNode(7, "ROOM_4", "room", 14),
+        PhysicalNode(8, "ROOM_5", "room", 15),
+    )
+    rooms = tuple(
+        PhysicalRoom(
+            room_number,
+            str(room_number),
+            f"Room {room_number}",
+            f"ROOM_{room_number}",
+            10 + room_number,
+        )
+        for room_number in range(1, 6)
+    )
+    connections = (
+        DirectedConnection("NODE_0", "ROOM_1", RouteDecision.LEFT),
+        DirectedConnection("NODE_0", "NODE_1", RouteDecision.STRAIGHT),
+        DirectedConnection("NODE_1", "NODE_2", RouteDecision.LEFT),
+        DirectedConnection("NODE_1", "ROOM_4", RouteDecision.RIGHT),
+        DirectedConnection("NODE_1", "ROOM_5", RouteDecision.STRAIGHT),
+        DirectedConnection("NODE_2", "ROOM_3", RouteDecision.LEFT),
+        DirectedConnection("NODE_2", "ROOM_2", RouteDecision.RIGHT),
+    )
+    return PhysicalNavigationMap(rooms, nodes, connections)
 
 
 class FakeCameraService:
@@ -376,6 +426,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/navigation/intersection/right" in body["endpoints"]
     assert "/navigation/intersection/straight" in body["endpoints"]
     assert "/navigation/u-turn" in body["endpoints"]
+    assert "/navigation/route/current" in body["endpoints"]
+    assert "/navigation/decision/preview" in body["endpoints"]
 
 
 def test_health_reports_connected_hardware(client: TestClient) -> None:
@@ -424,6 +476,143 @@ def test_camera_detect_is_read_only_and_returns_structured_detection(
     assert fake_hardware.navigation_calls == []
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
+
+
+def test_navigation_decision_preview_uses_loaded_mission_without_hardware(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    executor: MissionExecutor = client.app.state.mission_executor
+    mission = ClaimedMission(
+        84,
+        4,
+        2,
+        1,
+        room_number="4",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-09T17:30:00+00:00",
+    )
+    assert executor.accept(mission) is True
+
+    response = client.post(
+        "/navigation/decision/preview",
+        json={"marker_id": 0},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "mission_id": 84,
+        "room_id": 4,
+        "current_node": "NODE_0",
+        "current_marker_id": 0,
+        "destination_node": "ROOM_4",
+        "destination_marker_id": 14,
+        "decision": "STRAIGHT",
+        "next_node": "NODE_1",
+    }
+    assert fake_laravel.map_calls == 1
+    assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
+    assert fake_hardware.movement_calls == []
+    assert fake_hardware.line_calls == []
+    assert fake_hardware.navigation_calls == []
+    assert fake_hardware.dispense_calls == []
+    assert fake_hardware.water_calls == []
+
+
+def test_current_navigation_route_returns_all_remaining_directed_steps(
+    client: TestClient,
+) -> None:
+    executor: MissionExecutor = client.app.state.mission_executor
+    executor.accept(
+        ClaimedMission(
+            82,
+            2,
+            2,
+            1,
+            room_number="2",
+            dispenser_box=1,
+            schedule_claimed_at="2026-08-09T17:30:00+00:00",
+        )
+    )
+
+    response = client.get("/navigation/route/current", params={"marker_id": 0})
+
+    assert response.status_code == 200
+    assert response.json()["route"] == [
+        {"from_node": "NODE_0", "direction": "STRAIGHT", "to_node": "NODE_1"},
+        {"from_node": "NODE_1", "direction": "LEFT", "to_node": "NODE_2"},
+        {"from_node": "NODE_2", "direction": "RIGHT", "to_node": "ROOM_2"},
+    ]
+
+
+def test_navigation_preview_reports_arrived_only_at_loaded_destination(
+    client: TestClient,
+) -> None:
+    executor: MissionExecutor = client.app.state.mission_executor
+    executor.accept(
+        ClaimedMission(
+            84,
+            4,
+            2,
+            1,
+            room_number="4",
+            dispenser_box=1,
+            schedule_claimed_at="2026-08-09T17:30:00+00:00",
+        )
+    )
+
+    arrived = client.post(
+        "/navigation/decision/preview",
+        json={"marker_id": 14},
+    )
+    wrong_room_marker = client.post(
+        "/navigation/decision/preview",
+        json={"marker_id": 11},
+    )
+
+    assert arrived.status_code == 200
+    assert arrived.json()["decision"] == "ARRIVED"
+    assert arrived.json()["next_node"] is None
+    assert wrong_room_marker.status_code == 200
+    assert wrong_room_marker.json()["success"] is False
+    assert wrong_room_marker.json()["decision"] == "NO_ROUTE"
+
+
+def test_navigation_preview_rejects_unknown_marker_safely(
+    client: TestClient,
+) -> None:
+    executor: MissionExecutor = client.app.state.mission_executor
+    executor.accept(
+        ClaimedMission(
+            81,
+            1,
+            2,
+            1,
+            room_number="1",
+            dispenser_box=1,
+            schedule_claimed_at="2026-08-09T17:30:00+00:00",
+        )
+    )
+
+    response = client.post(
+        "/navigation/decision/preview",
+        json={"marker_id": 99},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": {"code": "UNKNOWN_MARKER"}}
+
+
+def test_navigation_preview_requires_a_loaded_mission(client: TestClient) -> None:
+    response = client.post(
+        "/navigation/decision/preview",
+        json={"marker_id": 0},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "NO_LOADED_MISSION"}}
 
 
 def test_health_still_works_when_camera_is_unavailable_at_startup(
