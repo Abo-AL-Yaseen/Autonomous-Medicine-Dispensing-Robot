@@ -3604,28 +3604,28 @@ static void handleManualDriveCommand(const String& command) {
   } else if (command == "MANUAL_BACKWARD") {
     driveBackwardAt(MANUAL_STRAIGHT_PWM);
   } else if (command == "MANUAL_LEFT") {
-    turnLeftInPlaceAt(MANUAL_PIVOT_PWM);
-  } else if (command == "MANUAL_RIGHT") {
     turnRightInPlaceAt(MANUAL_PIVOT_PWM);
+  } else if (command == "MANUAL_RIGHT") {
+    turnLeftInPlaceAt(MANUAL_PIVOT_PWM);
   } else if (command == "MANUAL_FORWARD_LEFT") {
     driveForwardDifferential(
-      MANUAL_STEERING_INNER_PWM,
-      MANUAL_STRAIGHT_PWM
+      MANUAL_STRAIGHT_PWM,
+      MANUAL_STEERING_INNER_PWM
     );
   } else if (command == "MANUAL_FORWARD_RIGHT") {
     driveForwardDifferential(
-      MANUAL_STRAIGHT_PWM,
-      MANUAL_STEERING_INNER_PWM
-    );
-  } else if (command == "MANUAL_BACKWARD_LEFT") {
-    driveBackwardDifferential(
       MANUAL_STEERING_INNER_PWM,
       MANUAL_STRAIGHT_PWM
     );
-  } else if (command == "MANUAL_BACKWARD_RIGHT") {
+  } else if (command == "MANUAL_BACKWARD_LEFT") {
     driveBackwardDifferential(
       MANUAL_STRAIGHT_PWM,
       MANUAL_STEERING_INNER_PWM
+    );
+  } else if (command == "MANUAL_BACKWARD_RIGHT") {
+    driveBackwardDifferential(
+      MANUAL_STEERING_INNER_PWM,
+      MANUAL_STRAIGHT_PWM
     );
   } else if (command == "MANUAL_STOP") {
     lcdShowStatus("Manual Drive", "Stopped");
