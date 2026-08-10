@@ -31,6 +31,7 @@ from .schemas.mission import (
     MissionStartRequest,
     MissionStatusResponse,
 )
+from .services.camera import ArucoCameraService, CameraSettings
 from .services.mission_service import MissionService
 from .services.laravel_api_client import LaravelApiClient
 from .services.mission_executor import (
@@ -56,6 +57,7 @@ DEFAULT_ROBOT_TIMEZONE = "Asia/Hebron"
 ResultType = TypeVar("ResultType")
 ControllerFactory = Callable[["HardwareSettings"], RobotHardwareController]
 LaravelClientFactory = Callable[[SchedulerSettings], LaravelMissionClient]
+CameraFactory = Callable[[CameraSettings], ArucoCameraService]
 
 
 @dataclass(frozen=True)
@@ -187,9 +189,16 @@ def build_laravel_client(settings: SchedulerSettings) -> LaravelApiClient:
     )
 
 
+def build_camera_service(settings: CameraSettings) -> ArucoCameraService:
+    """Create the read-only camera service without opening serial hardware."""
+
+    return ArucoCameraService(settings)
+
+
 def create_app(
     controller_factory: ControllerFactory = build_hardware_controller,
     laravel_client_factory: LaravelClientFactory = build_laravel_client,
+    camera_factory: CameraFactory = build_camera_service,
 ) -> FastAPI:
     """Create an API application, optionally with an injected test controller."""
 
@@ -199,14 +208,17 @@ def create_app(
 
         settings = HardwareSettings.from_environment()
         scheduler_settings = SchedulerSettings.from_environment()
+        camera_settings = CameraSettings.from_environment()
         controller = controller_factory(settings)
         hardware_lock = threading.Lock()
         laravel_client = laravel_client_factory(scheduler_settings)
+        camera_service = camera_factory(camera_settings)
 
         application.state.hardware_controller = controller
         application.state.hardware_lock = hardware_lock
         application.state.hardware_connected = False
         application.state.hardware_settings = settings
+        application.state.camera_service = camera_service
 
         def hardware_available() -> bool:
             return bool(application.state.hardware_connected)
@@ -261,12 +273,22 @@ def create_app(
             # Keep /health available even when hardware is disconnected.
             application.state.hardware_connected = False
 
+        try:
+            camera_service.start()
+        except Exception:
+            # Camera availability is independent from robot serial startup.
+            pass
+
         scheduler_loop.start()
 
         try:
             yield
         finally:
             scheduler_loop.stop()
+            try:
+                camera_service.close()
+            except Exception:
+                pass
             try:
                 laravel_client.close()
             finally:
@@ -295,6 +317,8 @@ def create_app(
             "endpoints": [
                 "/",
                 "/health",
+                "/camera/status",
+                "/camera/detect",
                 "/ping",
                 "/status",
                 "/rtc",
@@ -337,10 +361,22 @@ def create_app(
 
     @application.get("/health")
     def health(request: Request) -> dict[str, object]:
+        camera_service: ArucoCameraService = request.app.state.camera_service
         return {
             "status": "running",
             "hardware_connected": bool(request.app.state.hardware_connected),
+            "camera_available": bool(camera_service.status()["camera_available"]),
         }
+
+    @application.get("/camera/status")
+    def camera_status(request: Request) -> dict[str, object]:
+        camera_service: ArucoCameraService = request.app.state.camera_service
+        return camera_service.status()
+
+    @application.post("/camera/detect")
+    def camera_detect(request: Request) -> dict[str, object]:
+        camera_service: ArucoCameraService = request.app.state.camera_service
+        return camera_service.detect().as_dict()
 
     @application.get("/ping")
     def ping(request: Request) -> dict[str, object]:

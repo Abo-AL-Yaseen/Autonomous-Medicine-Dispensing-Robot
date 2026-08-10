@@ -16,6 +16,11 @@ from raspberry_controller.api import (
     create_app,
 )
 from raspberry_controller.hardware_controller import SerialConnectionError
+from raspberry_controller.services.camera import (
+    ArucoCameraService,
+    CameraSettings,
+    MarkerDetectionResult,
+)
 from raspberry_controller.services.laravel_api_client import ClaimedMission
 from raspberry_controller.services.mission_scheduler import SchedulerSettings
 
@@ -221,6 +226,49 @@ class FakeLaravelClient:
         self.closed = True
 
 
+class FakeCameraService:
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self.started = False
+        self.closed = False
+        self.detect_calls = 0
+        self.detection = MarkerDetectionResult(
+            camera_available=available,
+            detected=True,
+            confirmed=True,
+            marker_id=1,
+            node_name="NODE_1",
+            marker_type="intersection",
+            area=3600,
+            consecutive_frames=3,
+        )
+
+    def start(self) -> bool:
+        self.started = True
+        return self.available
+
+    def close(self) -> None:
+        self.closed = True
+
+    def status(self) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "device": "/dev/video0",
+            "camera_open": self.available,
+            "camera_available": self.available,
+            "dictionary": "DICT_4X4_50",
+            "width": 640,
+            "height": 480,
+            "confirm_frames": 3,
+            "min_marker_area": 2500.0,
+            "error": None if self.available else "CAMERA_UNAVAILABLE",
+        }
+
+    def detect(self) -> MarkerDetectionResult:
+        self.detect_calls += 1
+        return self.detection
+
+
 @pytest.fixture
 def fake_hardware() -> FakeHardwareController:
     return FakeHardwareController()
@@ -229,6 +277,11 @@ def fake_hardware() -> FakeHardwareController:
 @pytest.fixture
 def fake_laravel() -> FakeLaravelClient:
     return FakeLaravelClient()
+
+
+@pytest.fixture
+def fake_camera() -> FakeCameraService:
+    return FakeCameraService()
 
 
 def executable_mission() -> ClaimedMission:
@@ -255,12 +308,14 @@ def test_robot_timezone_defaults_to_asia_hebron(
 def client(
     fake_hardware: FakeHardwareController,
     fake_laravel: FakeLaravelClient,
+    fake_camera: FakeCameraService,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[TestClient]:
     monkeypatch.setenv("WATER_FLOW_ML_PER_SECOND", "50")
     monkeypatch.setenv("ROBOT_TIMEZONE", "Asia/Hebron")
     monkeypatch.setenv("MISSION_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("MISSION_AUTO_EXECUTION_ENABLED", "false")
+    monkeypatch.setenv("CAMERA_ENABLED", "true")
 
     def fake_factory(settings: HardwareSettings) -> FakeHardwareController:
         assert settings.esp32_port.startswith("/dev/serial/by-id/")
@@ -274,15 +329,24 @@ def client(
         assert settings.auto_execution_enabled is False
         return fake_laravel
 
+    def fake_camera_factory(settings: CameraSettings) -> ArucoCameraService:
+        assert settings.enabled is True
+        assert settings.device == "/dev/video0"
+        assert settings.confirm_frames == 3
+        assert settings.min_marker_area == 2500.0
+        return fake_camera  # type: ignore[return-value]
+
     application = create_app(
         controller_factory=fake_factory,
         laravel_client_factory=fake_laravel_factory,
+        camera_factory=fake_camera_factory,
     )
     with TestClient(application) as test_client:
         yield test_client
 
     assert fake_hardware.closed is True
     assert fake_laravel.closed is True
+    assert fake_camera.closed is True
 
 
 def test_root_lists_api_information(client: TestClient) -> None:
@@ -292,6 +356,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     body = response.json()
     assert body["name"] == "Autonomous Medicine Dispensing Robot Hardware API"
     assert body["version"] == "1.0.0"
+    assert "/camera/status" in body["endpoints"]
+    assert "/camera/detect" in body["endpoints"]
     assert "/dispense" in body["endpoints"]
     assert "/rtc" in body["endpoints"]
     assert "/scheduler/status" in body["endpoints"]
@@ -316,7 +382,75 @@ def test_health_reports_connected_hardware(client: TestClient) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "running", "hardware_connected": True}
+    assert response.json() == {
+        "status": "running",
+        "hardware_connected": True,
+        "camera_available": True,
+    }
+
+
+def test_camera_status_reports_independent_camera_configuration(
+    client: TestClient,
+) -> None:
+    response = client.get("/camera/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": True,
+        "device": "/dev/video0",
+        "camera_open": True,
+        "camera_available": True,
+        "dictionary": "DICT_4X4_50",
+        "width": 640,
+        "height": 480,
+        "confirm_frames": 3,
+        "min_marker_area": 2500.0,
+        "error": None,
+    }
+
+
+def test_camera_detect_is_read_only_and_returns_structured_detection(
+    client: TestClient,
+    fake_camera: FakeCameraService,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.post("/camera/detect")
+
+    assert response.status_code == 200
+    assert response.json() == fake_camera.detection.as_dict()
+    assert fake_camera.detect_calls == 1
+    assert fake_hardware.movement_calls == []
+    assert fake_hardware.line_calls == []
+    assert fake_hardware.navigation_calls == []
+    assert fake_hardware.dispense_calls == []
+    assert fake_hardware.water_calls == []
+
+
+def test_health_still_works_when_camera_is_unavailable_at_startup(
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unavailable_camera = FakeCameraService(available=False)
+    monkeypatch.setenv("MISSION_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("MISSION_AUTO_EXECUTION_ENABLED", "false")
+
+    application = create_app(
+        controller_factory=lambda settings: fake_hardware,
+        laravel_client_factory=lambda settings: fake_laravel,
+        camera_factory=lambda settings: unavailable_camera,  # type: ignore[arg-type]
+    )
+
+    with TestClient(application) as test_client:
+        response = test_client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "running",
+            "hardware_connected": True,
+            "camera_available": False,
+        }
+        assert fake_hardware.connected is True
 
 
 def test_ping_returns_both_board_responses(client: TestClient) -> None:
