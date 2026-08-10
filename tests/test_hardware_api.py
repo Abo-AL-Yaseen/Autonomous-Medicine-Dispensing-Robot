@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import datetime
@@ -54,6 +55,7 @@ class FakeHardwareController:
         self.line_start_error: Exception | None = None
         self.camera_calls: list[str] = []
         self.return_home_calls: list[str] = []
+        self.esp32_events: queue.Queue[str] = queue.Queue()
 
     def connect(self) -> None:
         self.connected = True
@@ -190,6 +192,12 @@ class FakeHardwareController:
             "straight",
             "ACK|INTERSECTION_STRAIGHT_STARTED",
         )
+
+    def get_esp32_event(self, timeout: float = 0.0) -> str | None:
+        try:
+            return self.esp32_events.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def u_turn(self) -> str:
         return self._record_navigation_call(
@@ -365,6 +373,7 @@ def client(
     monkeypatch.setenv("ROBOT_TIMEZONE", "Asia/Hebron")
     monkeypatch.setenv("MISSION_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("MISSION_AUTO_EXECUTION_ENABLED", "false")
+    monkeypatch.setenv("NAVIGATION_AUTO_ENABLED", "false")
     monkeypatch.setenv("CAMERA_ENABLED", "true")
 
     def fake_factory(settings: HardwareSettings) -> FakeHardwareController:
@@ -428,6 +437,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/navigation/u-turn" in body["endpoints"]
     assert "/navigation/route/current" in body["endpoints"]
     assert "/navigation/decision/preview" in body["endpoints"]
+    assert "/navigation/status" in body["endpoints"]
+    assert "/navigation/test/intersection-event" in body["endpoints"]
 
 
 def test_health_reports_connected_hardware(client: TestClient) -> None:
@@ -517,6 +528,57 @@ def test_navigation_decision_preview_uses_loaded_mission_without_hardware(
     assert fake_hardware.movement_calls == []
     assert fake_hardware.line_calls == []
     assert fake_hardware.navigation_calls == []
+    assert fake_hardware.dispense_calls == []
+    assert fake_hardware.water_calls == []
+
+
+def test_navigation_status_reports_auto_disabled_by_default(
+    client: TestClient,
+) -> None:
+    response = client.get("/navigation/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": False,
+        "state": "DISABLED",
+        "mission_id": None,
+        "armed": True,
+        "last_intersection_event": None,
+        "last_marker_id": None,
+        "last_node": None,
+        "last_decision": None,
+        "last_command": None,
+        "last_error": None,
+    }
+
+
+def test_disabled_intersection_test_endpoint_never_sends_hardware_command(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor: MissionExecutor = client.app.state.mission_executor
+    assert executor.accept(
+        ClaimedMission(
+            85,
+            4,
+            2,
+            1,
+            room_number="4",
+            dispenser_box=1,
+            schedule_claimed_at="2026-08-09T17:30:00+00:00",
+        )
+    )
+    assert client.post("/executor/start").status_code == 200
+    fake_hardware.line_calls.clear()
+
+    response = client.post("/navigation/test/intersection-event")
+
+    assert response.status_code == 200
+    assert response.json()["last_decision"] == "RIGHT"
+    assert response.json()["last_error"] == "TEST_PREVIEW_ONLY"
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert fake_hardware.navigation_calls == []
+    assert fake_hardware.line_calls == []
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
 

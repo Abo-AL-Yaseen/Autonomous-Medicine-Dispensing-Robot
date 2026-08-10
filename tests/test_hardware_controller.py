@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
 from datetime import datetime
 
@@ -390,6 +391,7 @@ class FakeSerialConnection:
         self.writes: list[bytes] = []
         self.is_open = True
         self.timeout = 0.01
+        self.readline_threads: list[str] = []
 
     def write(self, payload: bytes) -> None:
         self.writes.append(payload)
@@ -398,7 +400,11 @@ class FakeSerialConnection:
         pass
 
     def readline(self) -> bytes:
+        self.readline_threads.append(threading.current_thread().name)
         return self.responses.pop(0) if self.responses else b""
+
+    def close(self) -> None:
+        self.is_open = False
 
 
 def test_async_line_event_is_skipped_before_valid_response() -> None:
@@ -417,6 +423,9 @@ def test_async_line_event_is_skipped_before_valid_response() -> None:
 
     assert controller.get_line_reading().endswith("PATTERN=11011")
     assert connection.writes == [b"GET_LINE\n"]
+    assert controller.get_esp32_event(0.05) == (
+        "EVENT|INTERSECTION|PATTERN=00000"
+    )
 
 
 def test_async_line_recovery_diagnostic_is_skipped_before_line_reading() -> None:
@@ -438,6 +447,37 @@ def test_async_line_recovery_diagnostic_is_skipped_before_line_reading() -> None
 
     assert controller.get_line_reading().endswith("PATTERN=11011")
     assert connection.writes == [b"GET_LINE\n"]
+    assert controller.get_esp32_event(0.05) == (
+        "LINE|RECOVERY|STATE=GYRO_SEARCH|PATTERN=11111|"
+        "ERROR=0.00|ANGLE=-22.5|CYCLE=1"
+    )
+
+
+def test_one_persistent_reader_dispatches_event_and_command_response() -> None:
+    connection = FakeSerialConnection(
+        [
+            b"EVENT|INTERSECTION|PATTERN=00000\n",
+            b"ACK|INTERSECTION_LEFT_STARTED\n",
+        ]
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.intersection_left() == "ACK|INTERSECTION_LEFT_STARTED"
+    reader_thread = esp32._reader_thread
+    esp32._ensure_reader_started()
+
+    assert reader_thread is not None
+    assert esp32._reader_thread is reader_thread
+    assert controller.get_esp32_event(0.05) == (
+        "EVENT|INTERSECTION|PATTERN=00000"
+    )
+    assert set(connection.readline_threads) == {"serial-reader-mock"}
+    esp32.close()
 
 
 def test_malformed_line_response_is_rejected() -> None:

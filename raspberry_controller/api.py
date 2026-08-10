@@ -40,6 +40,10 @@ from .services.mission_executor import (
     MissionStartResult,
 )
 from .services.navigation import NavigationMapError, RoutePlan, UnknownMarkerError
+from .services.navigation.coordinator import (
+    NavigationCoordinator,
+    NavigationCoordinatorSettings,
+)
 from .services.mission_scheduler import (
     LaravelMissionClient,
     MissionScheduler,
@@ -217,6 +221,7 @@ def create_app(
         settings = HardwareSettings.from_environment()
         scheduler_settings = SchedulerSettings.from_environment()
         camera_settings = CameraSettings.from_environment()
+        navigation_settings = NavigationCoordinatorSettings.from_environment()
         controller = controller_factory(settings)
         hardware_lock = threading.Lock()
         laravel_client = laravel_client_factory(scheduler_settings)
@@ -249,6 +254,12 @@ def create_app(
             with hardware_lock:
                 return controller.stop_line_follow()
 
+        def run_navigation_hardware(operation: Callable[[], str]) -> str:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return operation()
+
         executor = MissionExecutor(
             hardware_available=hardware_available,
             start_line_follow=start_executor_line_follow,
@@ -270,9 +281,28 @@ def create_app(
             enabled=scheduler_settings.enabled,
             interval_seconds=scheduler_settings.interval_seconds,
         )
+        navigation_coordinator = NavigationCoordinator(
+            settings=navigation_settings,
+            executor=executor,
+            camera_service=camera_service,
+            next_serial_event=controller.get_esp32_event,
+            intersection_left=lambda: run_navigation_hardware(
+                controller.intersection_left
+            ),
+            intersection_right=lambda: run_navigation_hardware(
+                controller.intersection_right
+            ),
+            intersection_straight=lambda: run_navigation_hardware(
+                controller.intersection_straight
+            ),
+            stop_line_follow=lambda: run_navigation_hardware(
+                controller.stop_line_follow
+            ),
+        )
         application.state.mission_executor = executor
         application.state.mission_scheduler = scheduler
         application.state.mission_scheduler_loop = scheduler_loop
+        application.state.navigation_coordinator = navigation_coordinator
 
         try:
             with hardware_lock:
@@ -288,12 +318,14 @@ def create_app(
             # Camera availability is independent from robot serial startup.
             pass
 
+        navigation_coordinator.start()
         scheduler_loop.start()
 
         try:
             yield
         finally:
             scheduler_loop.stop()
+            navigation_coordinator.stop()
             try:
                 camera_service.close()
             except Exception:
@@ -361,6 +393,8 @@ def create_app(
                 "/navigation/u-turn",
                 "/navigation/route/current",
                 "/navigation/decision/preview",
+                "/navigation/status",
+                "/navigation/test/intersection-event",
                 "/missions",
                 "/missions/{id}",
                 "/missions/{id}/start",
@@ -702,6 +736,27 @@ def create_app(
         executor: MissionExecutor = request.app.state.mission_executor
         mission, plan = _preview_route(executor, payload.marker_id)
         return _route_preview_payload(mission.id, mission.room_id, plan)
+
+    @application.get("/navigation/status")
+    def navigation_status(request: Request) -> dict[str, object]:
+        coordinator: NavigationCoordinator = (
+            request.app.state.navigation_coordinator
+        )
+        return coordinator.status()
+
+    @application.post("/navigation/test/intersection-event")
+    def test_navigation_intersection_event(
+        request: Request,
+    ) -> dict[str, object]:
+        coordinator: NavigationCoordinator = (
+            request.app.state.navigation_coordinator
+        )
+        if coordinator.enabled:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "NAVIGATION_TEST_DISABLED_WHILE_AUTO_ENABLED"},
+            )
+        return coordinator.preview_test_intersection()
 
     @application.post("/missions")
     def create_mission(payload: MissionCreateRequest, request: Request) -> dict[str, object]:

@@ -38,6 +38,7 @@ The API reads these optional environment variables:
 | `MISSION_SCHEDULER_ENABLED` | `false` |
 | `MISSION_SCHEDULER_INTERVAL_SECONDS` | `5.0` seconds |
 | `MISSION_AUTO_EXECUTION_ENABLED` | `false` (reserved; does not auto-start yet) |
+| `NAVIGATION_AUTO_ENABLED` | `false` (intersection events are observable but cannot move the robot) |
 | `MISSION_CLAIM_LEASE_SECONDS` | `60` seconds (Laravel stale-claim recovery) |
 
 ## Validation
@@ -197,9 +198,32 @@ state, mission and target-room fields, dispenser box, last error, and configured
 auto-execution flag. Repeated starts while `STARTING` or `GOING_TO_ROOM` return
 `EXECUTOR_BUSY` without sending another line command.
 
-This phase does not implement intersection decisions, camera or ArUco use, room
-arrival, medicine or water dispensing, return-home behavior, or mission
-completion.
+## Intersection navigation coordinator
+
+Automatic intersection handling is disabled unless
+`NAVIGATION_AUTO_ENABLED=true`. FastAPI owns the only ESP32 serial connection,
+and one persistent reader dispatches command responses separately from
+`EVENT|...` and `LINE|RECOVERY|...` telemetry. Neither the camera service nor
+the navigation coordinator reads serial directly.
+
+While the executor is `GOING_TO_ROOM`, an `EVENT|INTERSECTION|...` line causes
+the coordinator to request a confirmed ArUco detection, resolve its marker
+through the Laravel map snapshot loaded with the mission, and send exactly one
+existing `INTERSECTION_LEFT`, `INTERSECTION_RIGHT`, or
+`INTERSECTION_STRAIGHT` command. Any missing camera/marker/map/route or invalid
+executor state leaves the robot stopped and records a machine-readable error in
+`GET /navigation/status`; there is no straight-ahead fallback.
+
+The first intersection event disarms the coordinator. Duplicate events are
+ignored until the ESP32 emits `EVENT|INTERSECTION_COMPLETE|...`, which proves
+the accepted maneuver finished and re-arms the next physical intersection. If
+the planner reports `ARRIVED`, line following is stopped and the executor moves
+to `ARRIVED_AT_ROOM` while retaining the mission. This phase does not dispense
+medicine or water, return home, or complete the mission.
+
+`POST /navigation/test/intersection-event` is available only while automatic
+navigation is disabled. It previews the same camera and route-decision path but
+never sends an ESP32 command or changes mission state.
 
 ### Legacy Raspberry database
 

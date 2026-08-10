@@ -25,6 +25,7 @@ class MissionExecutionState(str, Enum):
     READY_FOR_EXECUTION = "READY_FOR_EXECUTION"
     STARTING = "STARTING"
     GOING_TO_ROOM = "GOING_TO_ROOM"
+    ARRIVED_AT_ROOM = "ARRIVED_AT_ROOM"
     FAILED = "FAILED"
 
 
@@ -148,6 +149,16 @@ class MissionExecutor:
     def destination_node(self) -> PhysicalNode | None:
         with self._lock:
             return self._destination_node
+
+    def mark_arrived_at_room(self) -> None:
+        """Record physical arrival without completing or releasing the mission."""
+
+        with self._lock:
+            if self._state is not MissionExecutionState.GOING_TO_ROOM:
+                raise MissionRouteUnavailableError(
+                    "MissionExecutor is not going to a room"
+                )
+            self._state = MissionExecutionState.ARRIVED_AT_ROOM
 
     def start_ready_mission(self) -> MissionStartOutcome:
         """Perform only READY -> line follow -> in_progress -> GOING_TO_ROOM."""

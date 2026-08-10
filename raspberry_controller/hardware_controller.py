@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import errno
 import os
+import queue
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Any, Callable, Sequence
@@ -76,6 +78,12 @@ class SerialController:
         self.read_timeout = read_timeout
         self._connection: Any | None = None
         self._serial_module: Any | None = None
+        self._response_queue: queue.Queue[str] = queue.Queue()
+        self._event_queue: queue.Queue[str] = queue.Queue()
+        self._reader_stop = threading.Event()
+        self._reader_lock = threading.Lock()
+        self._reader_thread: threading.Thread | None = None
+        self._reader_error: SerialConnectionError | None = None
 
     def open(self) -> None:
         """Open the port, wait for a possible board reset, and discard boot text."""
@@ -121,6 +129,8 @@ class SerialController:
             # USB serial open can reset either board and emit startup messages.
             time.sleep(self.startup_delay)
             connection.reset_input_buffer()
+            self._reset_dispatcher()
+            self._ensure_reader_started()
         except (serial.SerialException, OSError) as exc:
             try:
                 self.close()
@@ -139,6 +149,7 @@ class SerialController:
         if connection is None or not connection.is_open:
             return
 
+        self._reader_stop.set()
         try:
             connection.close()
         except self._communication_exceptions() as exc:
@@ -146,11 +157,20 @@ class SerialController:
                 f"SERIAL_CLOSE_FAILED|PORT={_clean_field(self.port)}"
                 f"|DETAIL={_clean_field(exc)}"
             ) from exc
+        finally:
+            reader_thread = self._reader_thread
+            if (
+                reader_thread is not None
+                and reader_thread is not threading.current_thread()
+            ):
+                reader_thread.join(timeout=SERIAL_POLL_TIMEOUT_SECONDS * 2)
+            self._reader_thread = None
 
     def send_command(self, command: str) -> None:
         """Send one ASCII command terminated by a newline."""
 
         connection = self._require_connection()
+        self._ensure_reader_started()
         normalized_command = command.strip()
         if (
             not normalized_command
@@ -183,8 +203,10 @@ class SerialController:
     ) -> str:
         """Scan serial lines until an expected response or overall timeout."""
 
-        connection = self._require_connection()
-        expected_responses = (expected,) if isinstance(expected, str) else tuple(expected)
+        self._require_connection()
+        expected_responses = (
+            (expected,) if isinstance(expected, str) else tuple(expected)
+        )
         if not expected_responses:
             raise ValueError("at least one expected response is required")
 
@@ -201,26 +223,13 @@ class SerialController:
                 break
 
             # Keep each read short so asynchronous lines cannot extend the deadline.
-            connection.timeout = min(SERIAL_POLL_TIMEOUT_SECONDS, remaining_time)
             try:
-                raw_response = connection.readline()
-            except self._communication_exceptions() as exc:
-                raise SerialConnectionError(
-                    f"SERIAL_READ_FAILED|PORT={_clean_field(self.port)}"
-                    f"|DETAIL={_clean_field(exc)}"
-                ) from exc
-
-            if not raw_response:
-                continue
-
-            response = raw_response.decode("ascii", errors="replace").rstrip("\r\n")
-            if not response:
-                continue
-
-            # Recovery diagnostics are asynchronous telemetry. In particular,
-            # they intentionally share the LINE prefix used by GET_LINE and
-            # must not be mistaken for a malformed sensor response.
-            if response.startswith("LINE|RECOVERY|"):
+                response = self._response_queue.get(
+                    timeout=min(SERIAL_POLL_TIMEOUT_SECONDS, remaining_time)
+                )
+            except queue.Empty:
+                if self._reader_error is not None:
+                    raise self._reader_error
                 continue
 
             last_non_empty_response = response
@@ -250,6 +259,90 @@ class SerialController:
                 f"|LAST_RECEIVED={_clean_field(last_non_empty_response)}"
             )
         raise SerialResponseTimeout(timeout_message)
+
+    def get_async_line(self, timeout: float = 0.0) -> str | None:
+        """Return one line dispatched by the sole serial reader as telemetry."""
+
+        if timeout < 0:
+            raise ValueError("timeout must not be negative")
+        self._require_connection()
+        self._ensure_reader_started()
+        try:
+            return self._event_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    @property
+    def reader_running(self) -> bool:
+        thread = self._reader_thread
+        return bool(thread is not None and thread.is_alive())
+
+    def _ensure_reader_started(self) -> None:
+        with self._reader_lock:
+            if self._reader_thread is not None and self._reader_thread.is_alive():
+                return
+            connection = self._require_connection()
+            self._reader_stop.clear()
+            self._reader_error = None
+            self._reader_thread = threading.Thread(
+                target=self._reader_loop,
+                args=(connection,),
+                name=f"serial-reader-{self.port}",
+                daemon=True,
+            )
+            self._reader_thread.start()
+
+    def _reader_loop(self, connection: Any) -> None:
+        while not self._reader_stop.is_set():
+            connection.timeout = min(
+                SERIAL_POLL_TIMEOUT_SECONDS,
+                self.read_timeout,
+            )
+            try:
+                raw_line = connection.readline()
+            except self._communication_exceptions() as exc:
+                if not self._reader_stop.is_set():
+                    self._reader_error = SerialConnectionError(
+                        f"SERIAL_READ_FAILED|PORT={_clean_field(self.port)}"
+                        f"|DETAIL={_clean_field(exc)}"
+                    )
+                return
+
+            if not raw_line:
+                self._reader_stop.wait(0.001)
+                continue
+
+            line = raw_line.decode("ascii", errors="replace").rstrip("\r\n")
+            if not line:
+                continue
+
+            if self._is_async_line(line):
+                self._event_queue.put(line)
+            else:
+                self._response_queue.put(line)
+
+    @staticmethod
+    def _is_async_line(line: str) -> bool:
+        if line.startswith("EVENT|") or line.startswith("LINE|RECOVERY|"):
+            return True
+
+        response_prefixes = (
+            "ACK|",
+            "DONE|",
+            "ERROR|",
+            "STATUS|",
+            "RTC|",
+            "LINE|",
+            "LINE_STATUS|",
+        )
+        return not line.startswith(response_prefixes)
+
+    def _reset_dispatcher(self) -> None:
+        self._reader_stop.set()
+        self._reader_thread = None
+        self._response_queue = queue.Queue()
+        self._event_queue = queue.Queue()
+        self._reader_error = None
 
     def _require_connection(self) -> Any:
         if self._connection is None or not self._connection.is_open:
@@ -340,6 +433,8 @@ class RobotHardwareController:
             ARDUINO_UNO_BAUD_RATE,
             startup_delay=ARDUINO_UNO_STARTUP_DELAY_SECONDS,
         )
+        self._esp32_transaction_lock = threading.RLock()
+        self._arduino_transaction_lock = threading.RLock()
 
     def connect(self) -> None:
         """Connect both boards and clean up if either connection fails."""
@@ -565,6 +660,11 @@ class RobotHardwareController:
             response_prefix="ACK|U_TURN",
         )
 
+    def get_esp32_event(self, timeout: float = 0.0) -> str | None:
+        """Consume ESP32 telemetry without reading the serial connection directly."""
+
+        return self.esp32.get_async_line(timeout)
+
     def get_rtc_datetime(self) -> datetime:
         """Read and strictly parse the DS1302 wall-clock response."""
 
@@ -594,16 +694,17 @@ class RobotHardwareController:
         command = f"WATER_DISPENSE|MS={duration_ms}"
         acknowledgement = f"ACK|WATER|DURATION_MS={duration_ms}"
         completion = f"DONE|WATER|DURATION_MS={duration_ms}"
-        self.esp32.send_command(command)
-        self.esp32.wait_for_response(
-            acknowledgement,
-            response_prefix="ACK|WATER|",
-        )
-        self.esp32.wait_for_response(
-            completion,
-            response_prefix="DONE|WATER|",
-            overall_timeout=(duration_ms / 1000) + self.esp32.read_timeout,
-        )
+        with self._esp32_transaction_lock:
+            self.esp32.send_command(command)
+            self.esp32.wait_for_response(
+                acknowledgement,
+                response_prefix="ACK|WATER|",
+            )
+            self.esp32.wait_for_response(
+                completion,
+                response_prefix="DONE|WATER|",
+                overall_timeout=(duration_ms / 1000) + self.esp32.read_timeout,
+            )
 
         return {"duration_ms": duration_ms}
 
@@ -624,38 +725,39 @@ class RobotHardwareController:
         completion = f"DONE|{command}"
         completed_pills = 0
 
-        for _ in range(pill_count):
-            try:
-                self.arduino_uno.send_command(command)
-            except HardwareControllerError as exc:
-                self._raise_dispense_error(
-                    box_number,
-                    completed_pills,
-                    "SEND",
-                    exc,
-                )
+        with self._arduino_transaction_lock:
+            for _ in range(pill_count):
+                try:
+                    self.arduino_uno.send_command(command)
+                except HardwareControllerError as exc:
+                    self._raise_dispense_error(
+                        box_number,
+                        completed_pills,
+                        "SEND",
+                        exc,
+                    )
 
-            try:
-                self.arduino_uno.wait_for_response(acknowledgement)
-            except HardwareControllerError as exc:
-                self._raise_dispense_error(
-                    box_number,
-                    completed_pills,
-                    "ACK",
-                    exc,
-                )
+                try:
+                    self.arduino_uno.wait_for_response(acknowledgement)
+                except HardwareControllerError as exc:
+                    self._raise_dispense_error(
+                        box_number,
+                        completed_pills,
+                        "ACK",
+                        exc,
+                    )
 
-            try:
-                self.arduino_uno.wait_for_response(completion)
-            except HardwareControllerError as exc:
-                self._raise_dispense_error(
-                    box_number,
-                    completed_pills,
-                    "DONE",
-                    exc,
-                )
+                try:
+                    self.arduino_uno.wait_for_response(completion)
+                except HardwareControllerError as exc:
+                    self._raise_dispense_error(
+                        box_number,
+                        completed_pills,
+                        "DONE",
+                        exc,
+                    )
 
-            completed_pills += 1
+                completed_pills += 1
 
         return {
             "box_number": box_number,
@@ -663,8 +765,8 @@ class RobotHardwareController:
             "dispensed_pills": completed_pills,
         }
 
-    @staticmethod
     def _request(
+        self,
         controller: SerialController,
         command: str,
         expected: str | Sequence[str],
@@ -672,14 +774,20 @@ class RobotHardwareController:
         validator: Callable[[str], bool] | None = None,
         response_prefix: str | None = None,
     ) -> str:
-        controller.send_command(command)
-        if validator is None and response_prefix is None:
-            return controller.wait_for_response(expected)
-        return controller.wait_for_response(
-            expected,
-            validator=validator,
-            response_prefix=response_prefix,
+        transaction_lock = (
+            self._esp32_transaction_lock
+            if controller is self.esp32
+            else self._arduino_transaction_lock
         )
+        with transaction_lock:
+            controller.send_command(command)
+            if validator is None and response_prefix is None:
+                return controller.wait_for_response(expected)
+            return controller.wait_for_response(
+                expected,
+                validator=validator,
+                response_prefix=response_prefix,
+            )
 
     @staticmethod
     def _is_valid_line_reading(response: str) -> bool:
