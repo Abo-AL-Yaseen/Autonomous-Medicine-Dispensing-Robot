@@ -4,8 +4,6 @@ namespace App\Services\Navigation;
 
 use App\Models\Connection;
 use App\Models\Mission;
-use App\Models\Node;
-use Illuminate\Support\Collection;
 
 class PathFindingService
 {
@@ -55,15 +53,9 @@ class PathFindingService
      */
     public function resolveTargetRoomNode(Mission $mission): ?string
     {
-        $roomNode = Node::query()
-            ->where('node_code', 'ROOM_' . $mission->room->room_number)
-            ->first();
-
-        if ($roomNode) {
-            return $roomNode->node_code;
-        }
-
-        return null;
+        return $mission->room
+            ?->navigationNode
+            ?->node_code;
     }
 
     /**

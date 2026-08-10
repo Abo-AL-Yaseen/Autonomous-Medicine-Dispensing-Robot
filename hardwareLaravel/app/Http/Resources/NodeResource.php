@@ -13,6 +13,7 @@ class NodeResource extends JsonResource
             'id' => $this->id,
             'node_code' => $this->node_code,
             'node_type' => $this->node_type,
+            'marker_id' => $this->marker_id,
             'created_at' => $this->created_at,
             'updated_at' => $this->updated_at,
         ];

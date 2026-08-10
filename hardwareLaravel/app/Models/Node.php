@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class Node extends Model
 {
@@ -13,7 +14,17 @@ class Node extends Model
     protected $fillable = [
         'node_code',
         'node_type',
+        'marker_id',
     ];
+
+    protected $casts = [
+        'marker_id' => 'integer',
+    ];
+
+    public function room(): HasOne
+    {
+        return $this->hasOne(Room::class, 'navigation_node_id');
+    }
 
     public function outgoingConnections(): HasMany
     {

@@ -81,7 +81,7 @@ class MissionScheduleService
                 return null;
             }
 
-            return $mission->fresh(['room', 'medicine']);
+            return $mission->fresh(['room.navigationNode', 'medicine']);
         });
     }
 
@@ -105,7 +105,7 @@ class MissionScheduleService
                 return null;
             }
 
-            return $mission->fresh(['room', 'medicine']);
+            return $mission->fresh(['room.navigationNode', 'medicine']);
         });
     }
 

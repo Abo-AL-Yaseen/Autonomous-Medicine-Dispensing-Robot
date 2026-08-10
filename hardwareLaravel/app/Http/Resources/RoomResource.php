@@ -14,6 +14,11 @@ class RoomResource extends JsonResource
             'room_number' => $this->room_number,
             'room_name' => $this->room_name,
             'description' => $this->description,
+            'navigation_node' => $this->navigationNode === null ? null : [
+                'id' => $this->navigationNode->id,
+                'name' => $this->navigationNode->node_code,
+                'marker_id' => $this->navigationNode->marker_id,
+            ],
             'created_at' => $this->created_at,
             'updated_at' => $this->updated_at,
         ];

@@ -14,26 +14,26 @@ class RoomController extends Controller
 {
     public function index(): AnonymousResourceCollection
     {
-        return RoomResource::collection(Room::query()->latest()->get());
+        return RoomResource::collection(Room::query()->with('navigationNode')->latest()->get());
     }
 
     public function show(Room $room): RoomResource
     {
-        return new RoomResource($room);
+        return new RoomResource($room->load('navigationNode'));
     }
 
     public function store(StoreRoomRequest $request): RoomResource
     {
         $room = Room::create($request->validated());
 
-        return new RoomResource($room);
+        return new RoomResource($room->load('navigationNode'));
     }
 
     public function update(UpdateRoomRequest $request, Room $room): RoomResource
     {
         $room->update($request->validated());
 
-        return new RoomResource($room->fresh());
+        return new RoomResource($room->fresh()->load('navigationNode'));
     }
 
     public function destroy(Room $room): JsonResponse

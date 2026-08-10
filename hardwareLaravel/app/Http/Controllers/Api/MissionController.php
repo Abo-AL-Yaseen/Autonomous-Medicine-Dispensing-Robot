@@ -20,12 +20,12 @@ class MissionController extends Controller
 
     public function index(): AnonymousResourceCollection
     {
-        return MissionResource::collection(Mission::query()->with(['room', 'medicine'])->latest()->get());
+        return MissionResource::collection(Mission::query()->with(['room.navigationNode', 'medicine'])->latest()->get());
     }
 
     public function show(Mission $mission): MissionResource
     {
-        return new MissionResource($mission->load(['room', 'medicine']));
+        return new MissionResource($mission->load(['room.navigationNode', 'medicine']));
     }
 
     public function store(StoreMissionRequest $request): MissionResource
@@ -36,7 +36,7 @@ class MissionController extends Controller
 
         $mission = Mission::create($payload);
 
-        return new MissionResource($mission->load(['room', 'medicine']));
+        return new MissionResource($mission->load(['room.navigationNode', 'medicine']));
     }
 
     public function update(UpdateMissionRequest $request, Mission $mission): MissionResource
@@ -50,7 +50,7 @@ class MissionController extends Controller
 
         $mission->update($payload);
 
-        return new MissionResource($mission->fresh()->load(['room', 'medicine']));
+        return new MissionResource($mission->fresh()->load(['room.navigationNode', 'medicine']));
     }
 
     public function destroy(Mission $mission): JsonResponse

@@ -5,7 +5,6 @@ namespace App\Services\Navigation;
 use App\Models\Connection;
 use App\Models\Mission;
 use App\Models\Node;
-use Illuminate\Support\Collection;
 
 class NavigationService
 {

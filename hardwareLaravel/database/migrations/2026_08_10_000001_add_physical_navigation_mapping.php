@@ -1,0 +1,34 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('nodes', function (Blueprint $table) {
+            $table->unsignedInteger('marker_id')->nullable()->unique();
+        });
+
+        Schema::table('rooms', function (Blueprint $table) {
+            $table->foreignId('navigation_node_id')
+                ->nullable()
+                ->constrained('nodes')
+                ->nullOnDelete();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('rooms', function (Blueprint $table) {
+            $table->dropConstrainedForeignId('navigation_node_id');
+        });
+
+        Schema::table('nodes', function (Blueprint $table) {
+            $table->dropUnique(['marker_id']);
+            $table->dropColumn('marker_id');
+        });
+    }
+};

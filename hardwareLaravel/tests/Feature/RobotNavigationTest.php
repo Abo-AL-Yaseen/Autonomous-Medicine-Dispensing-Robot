@@ -45,6 +45,7 @@ class RobotNavigationTest extends TestCase
         $node2 = Node::create(['node_code' => 'NODE_2', 'node_type' => 'intersection']);
         $node5 = Node::create(['node_code' => 'NODE_5', 'node_type' => 'intersection']);
         $roomNode = Node::create(['node_code' => 'ROOM_15', 'node_type' => 'room']);
+        $room->update(['navigation_node_id' => $roomNode->id]);
 
         Connection::create(['from_node_id' => $node1->id, 'to_node_id' => $node2->id, 'direction' => 'LEFT']);
         Connection::create(['from_node_id' => $node1->id, 'to_node_id' => $node5->id, 'direction' => 'RIGHT']);

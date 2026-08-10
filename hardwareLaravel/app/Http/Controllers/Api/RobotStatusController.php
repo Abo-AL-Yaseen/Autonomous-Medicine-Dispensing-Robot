@@ -6,7 +6,6 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\UpdateRobotStatusRequest;
 use App\Http\Resources\RobotStatusResource;
 use App\Models\RobotStatus;
-use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Carbon;
 
 class RobotStatusController extends Controller
