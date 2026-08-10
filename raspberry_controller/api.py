@@ -309,6 +309,15 @@ def create_app(
                 "/movement/left",
                 "/movement/right",
                 "/movement/stop",
+                "/movement/manual/forward",
+                "/movement/manual/backward",
+                "/movement/manual/left",
+                "/movement/manual/right",
+                "/movement/manual/forward-left",
+                "/movement/manual/forward-right",
+                "/movement/manual/backward-left",
+                "/movement/manual/backward-right",
+                "/movement/manual/stop",
                 "/line/sensors",
                 "/line/status",
                 "/line/start",
@@ -488,6 +497,78 @@ def create_app(
             request,
             "stop",
             lambda controller: controller.stop(),
+        )
+
+    @application.post("/movement/manual/forward")
+    def manual_forward(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-forward",
+            lambda controller: controller.manual_forward(),
+        )
+
+    @application.post("/movement/manual/backward")
+    def manual_backward(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-backward",
+            lambda controller: controller.manual_backward(),
+        )
+
+    @application.post("/movement/manual/left")
+    def manual_left(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-left",
+            lambda controller: controller.manual_left(),
+        )
+
+    @application.post("/movement/manual/right")
+    def manual_right(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-right",
+            lambda controller: controller.manual_right(),
+        )
+
+    @application.post("/movement/manual/forward-left")
+    def manual_forward_left(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-forward-left",
+            lambda controller: controller.manual_forward_left(),
+        )
+
+    @application.post("/movement/manual/forward-right")
+    def manual_forward_right(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-forward-right",
+            lambda controller: controller.manual_forward_right(),
+        )
+
+    @application.post("/movement/manual/backward-left")
+    def manual_backward_left(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-backward-left",
+            lambda controller: controller.manual_backward_left(),
+        )
+
+    @application.post("/movement/manual/backward-right")
+    def manual_backward_right(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-backward-right",
+            lambda controller: controller.manual_backward_right(),
+        )
+
+    @application.post("/movement/manual/stop")
+    def manual_stop(request: Request) -> dict[str, object]:
+        return _movement_response(
+            request,
+            "manual-stop",
+            lambda controller: controller.manual_stop(),
         )
 
     @application.get("/line/sensors")

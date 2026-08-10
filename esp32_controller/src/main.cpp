@@ -171,6 +171,9 @@ const bool PUMP_ACTIVE_LOW = true;
 #define MOTOR_RESOLUTION    8
 #define DRIVE_SPEED         240    // سرعة القيادة للأمام والخلف
 #define TURN_SPEED          240    // سرعة الدوران الجيروسكوبي يمينًا ويسارًا
+const uint8_t MANUAL_STRAIGHT_PWM = DRIVE_SPEED;
+const uint8_t MANUAL_STEERING_INNER_PWM = 150;
+const uint8_t MANUAL_PIVOT_PWM = TURN_SPEED;
 #define GYRO_THRESHOLD       1.5   // تجاهل ضجيج الـ gyro
 #define ROTATION_TIMEOUT_MS 10000  // حد أمان أقصى لأي دوران
 #define ROTATION_PRINT_MS    200   // تقليل رسائل Serial أثناء الدوران
@@ -701,6 +704,13 @@ static void driveBackwardAt(uint8_t speed) {
   digitalWrite(MOTOR1_PIN1, HIGH); digitalWrite(MOTOR1_PIN2, LOW);
   digitalWrite(MOTOR2_PIN1, HIGH); digitalWrite(MOTOR2_PIN2, LOW);
   applyMotorSpeed(speed);
+}
+
+static void driveBackwardDifferential(uint8_t leftSpeed, uint8_t rightSpeed) {
+  digitalWrite(MOTOR1_PIN1, HIGH); digitalWrite(MOTOR1_PIN2, LOW);
+  digitalWrite(MOTOR2_PIN1, HIGH); digitalWrite(MOTOR2_PIN2, LOW);
+  ledcWrite(MOTOR1_PWM_CHANNEL, leftSpeed);
+  ledcWrite(MOTOR2_PWM_CHANNEL, rightSpeed);
 }
 
 static void turnLeftInPlaceAt(uint8_t speed) {
@@ -3576,6 +3586,62 @@ void handleLegacyCommand(char rawCommand) {
   }
 }
 
+static void prepareManualDrive() {
+  if (autoModeEnabled) {
+    stopAutonomousMode("manual drive command", 'M');
+  }
+  cancelIntersectionNavigation();
+  disableLineFollowing(LINE_FOLLOW_IDLE);
+  stopMotorOutputs();
+  manualMovementActive = false;
+}
+
+static void handleManualDriveCommand(const String& command) {
+  prepareManualDrive();
+
+  if (command == "MANUAL_FORWARD") {
+    driveForwardAt(MANUAL_STRAIGHT_PWM);
+  } else if (command == "MANUAL_BACKWARD") {
+    driveBackwardAt(MANUAL_STRAIGHT_PWM);
+  } else if (command == "MANUAL_LEFT") {
+    turnLeftInPlaceAt(MANUAL_PIVOT_PWM);
+  } else if (command == "MANUAL_RIGHT") {
+    turnRightInPlaceAt(MANUAL_PIVOT_PWM);
+  } else if (command == "MANUAL_FORWARD_LEFT") {
+    driveForwardDifferential(
+      MANUAL_STEERING_INNER_PWM,
+      MANUAL_STRAIGHT_PWM
+    );
+  } else if (command == "MANUAL_FORWARD_RIGHT") {
+    driveForwardDifferential(
+      MANUAL_STRAIGHT_PWM,
+      MANUAL_STEERING_INNER_PWM
+    );
+  } else if (command == "MANUAL_BACKWARD_LEFT") {
+    driveBackwardDifferential(
+      MANUAL_STEERING_INNER_PWM,
+      MANUAL_STRAIGHT_PWM
+    );
+  } else if (command == "MANUAL_BACKWARD_RIGHT") {
+    driveBackwardDifferential(
+      MANUAL_STRAIGHT_PWM,
+      MANUAL_STEERING_INNER_PWM
+    );
+  } else if (command == "MANUAL_STOP") {
+    lcdShowStatus("Manual Drive", "Stopped");
+    Serial.println("ACK|MANUAL_STOP");
+    return;
+  } else {
+    Serial.println("ERROR|UNKNOWN_MANUAL_COMMAND");
+    return;
+  }
+
+  manualMovementActive = true;
+  lcdShowStatus("Manual Drive", command.substring(7));
+  Serial.print("ACK|");
+  Serial.println(command);
+}
+
 static void printControllerStatus() {
   if (intersectionNavigationActive) {
     Serial.println("STATUS|NAVIGATION");
@@ -3607,6 +3673,8 @@ void handleTextCommand(const String& command) {
     printControllerStatus();
   } else if (normalizedCommand == "GET_RTC") {
     printRTCMachineReadable();
+  } else if (normalizedCommand.startsWith("MANUAL_")) {
+    handleManualDriveCommand(normalizedCommand);
   } else if (normalizedCommand.startsWith("WATER_DISPENSE|MS=")) {
     String durationText = normalizedCommand.substring(18);
     if (durationText.length() == 0) {

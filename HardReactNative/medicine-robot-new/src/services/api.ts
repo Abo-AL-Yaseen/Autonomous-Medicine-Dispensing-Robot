@@ -9,6 +9,15 @@ import {
     stopLineFollowing,
 } from "@/src/services/robot/lineService";
 import {
+    manualDriveBackward,
+    manualDriveBackwardLeft,
+    manualDriveBackwardRight,
+    manualDriveForward,
+    manualDriveForwardLeft,
+    manualDriveForwardRight,
+    manualDriveLeft,
+    manualDriveRight,
+    manualDriveStop,
     moveRobotBackward,
     moveRobotForward,
     moveRobotLeft,
@@ -48,8 +57,23 @@ export const stopRobot = () => stopRobotMovement();
 export const startLineFollow = () => startLineFollowing();
 export const stopLineFollow = () => stopLineFollowing();
 export const emergencyStop = () => stopRobotMovement();
+export const manualForward = () => manualDriveForward();
+export const manualBackward = () => manualDriveBackward();
+export const manualLeft = () => manualDriveLeft();
+export const manualRight = () => manualDriveRight();
+export const manualForwardLeft = () => manualDriveForwardLeft();
+export const manualForwardRight = () => manualDriveForwardRight();
+export const manualBackwardLeft = () => manualDriveBackwardLeft();
+export const manualBackwardRight = () => manualDriveBackwardRight();
+export const manualStop = () => manualDriveStop();
 export const dispenseSelectedMedicine = dispenseMedicine;
 export const dispenseSelectedWater = dispenseWater;
 
+export {
+  intersectionLeft,
+  intersectionRight,
+  intersectionStraight,
+  uTurn,
+} from "@/src/services/robot/lineService";
 export { startLaravelNavigation as startRobotNavigation };
 

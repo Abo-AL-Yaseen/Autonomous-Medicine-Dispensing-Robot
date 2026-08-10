@@ -420,6 +420,71 @@ class RobotHardwareController:
 
         return self._request(self.esp32, "S", "ACK|STOP")
 
+    def manual_forward(self) -> str:
+        """Start persistent non-blocking manual forward drive."""
+
+        return self._request(
+            self.esp32, "MANUAL_FORWARD", "ACK|MANUAL_FORWARD"
+        )
+
+    def manual_backward(self) -> str:
+        """Start persistent non-blocking manual backward drive."""
+
+        return self._request(
+            self.esp32, "MANUAL_BACKWARD", "ACK|MANUAL_BACKWARD"
+        )
+
+    def manual_left(self) -> str:
+        """Start a persistent non-blocking manual left pivot."""
+
+        return self._request(self.esp32, "MANUAL_LEFT", "ACK|MANUAL_LEFT")
+
+    def manual_right(self) -> str:
+        """Start a persistent non-blocking manual right pivot."""
+
+        return self._request(self.esp32, "MANUAL_RIGHT", "ACK|MANUAL_RIGHT")
+
+    def manual_forward_left(self) -> str:
+        """Start a persistent forward-left manual arc."""
+
+        return self._request(
+            self.esp32,
+            "MANUAL_FORWARD_LEFT",
+            "ACK|MANUAL_FORWARD_LEFT",
+        )
+
+    def manual_forward_right(self) -> str:
+        """Start a persistent forward-right manual arc."""
+
+        return self._request(
+            self.esp32,
+            "MANUAL_FORWARD_RIGHT",
+            "ACK|MANUAL_FORWARD_RIGHT",
+        )
+
+    def manual_backward_left(self) -> str:
+        """Start a persistent backward-left manual arc."""
+
+        return self._request(
+            self.esp32,
+            "MANUAL_BACKWARD_LEFT",
+            "ACK|MANUAL_BACKWARD_LEFT",
+        )
+
+    def manual_backward_right(self) -> str:
+        """Start a persistent backward-right manual arc."""
+
+        return self._request(
+            self.esp32,
+            "MANUAL_BACKWARD_RIGHT",
+            "ACK|MANUAL_BACKWARD_RIGHT",
+        )
+
+    def manual_stop(self) -> str:
+        """Stop manual drive motors without using a blocking maneuver."""
+
+        return self._request(self.esp32, "MANUAL_STOP", "ACK|MANUAL_STOP")
+
     def get_line_reading(self) -> str:
         """Return one validated active-low sensor reading from the ESP32."""
 

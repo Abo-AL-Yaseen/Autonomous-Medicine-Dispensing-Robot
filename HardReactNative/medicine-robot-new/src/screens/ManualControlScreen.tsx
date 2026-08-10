@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Alert, ScrollView, StyleSheet, View } from "react-native";
 import { Text } from "react-native-paper";
 
@@ -12,15 +12,27 @@ import {
     emergencyStop,
     dispenseSelectedMedicine,
     dispenseSelectedWater,
-    moveBackward,
-    moveForward,
+    intersectionLeft,
+    intersectionRight,
+    intersectionStraight,
+    manualBackward,
+    manualBackwardLeft,
+    manualBackwardRight,
+    manualForward,
+    manualForwardLeft,
+    manualForwardRight,
+    manualLeft,
+    manualRight,
+    manualStop,
     startLineFollow,
     stopLineFollow,
-    stopRobot,
-    turnLeft,
-    turnRight,
+    uTurn,
 } from "@/src/services/api";
 import { getMedicines } from "@/src/services/laravel/medicineService";
+import {
+  LatestManualDriveDispatcher,
+  ManualDriveState,
+} from "@/src/services/robot/manualDriveController";
 import { getRobotHardwareStatus } from "@/src/services/robot/robotHardwareService";
 import { theme } from "@/src/theme/theme";
 import type {
@@ -29,6 +41,33 @@ import type {
   RobotConnection,
   RobotMode,
 } from "@/src/types";
+
+const manualDriveRequests: Record<
+  ManualDriveState,
+  () => Promise<MovementResponse>
+> = {
+  MANUAL_FORWARD: manualForward,
+  MANUAL_BACKWARD: manualBackward,
+  MANUAL_LEFT: manualLeft,
+  MANUAL_RIGHT: manualRight,
+  MANUAL_FORWARD_LEFT: manualForwardLeft,
+  MANUAL_FORWARD_RIGHT: manualForwardRight,
+  MANUAL_BACKWARD_LEFT: manualBackwardLeft,
+  MANUAL_BACKWARD_RIGHT: manualBackwardRight,
+  MANUAL_STOP: manualStop,
+};
+
+const manualDriveLabels: Record<ManualDriveState, string> = {
+  MANUAL_FORWARD: "Moving Forward",
+  MANUAL_BACKWARD: "Moving Backward",
+  MANUAL_LEFT: "Manual Left",
+  MANUAL_RIGHT: "Manual Right",
+  MANUAL_FORWARD_LEFT: "Moving Forward Left",
+  MANUAL_FORWARD_RIGHT: "Moving Forward Right",
+  MANUAL_BACKWARD_LEFT: "Moving Backward Left",
+  MANUAL_BACKWARD_RIGHT: "Moving Backward Right",
+  MANUAL_STOP: "Stopped",
+};
 
 export default function ManualControlScreen() {
   const [status, setStatus] = useState("Ready");
@@ -42,6 +81,33 @@ export default function ManualControlScreen() {
   const [selectedMedicine, setSelectedMedicine] = useState("0");
   const [medicineQuantity, setMedicineQuantity] = useState(1);
   const [waterAmountMl, setWaterAmountMl] = useState(100);
+  const [directionPadResetSignal, setDirectionPadResetSignal] = useState(0);
+  const manualDriveDispatcherRef =
+    useRef<LatestManualDriveDispatcher | null>(null);
+
+  if (manualDriveDispatcherRef.current === null) {
+    manualDriveDispatcherRef.current = new LatestManualDriveDispatcher({
+      sendManual: (state) => manualDriveRequests[state](),
+      sendEmergencyStop: emergencyStop,
+      onSuccess: (state, emergency) => {
+        setError(null);
+        setStatus(emergency ? "Emergency Stop" : manualDriveLabels[state]);
+      },
+      onError: (driveError, _state, emergency) => {
+        const message =
+          driveError instanceof Error
+            ? driveError.message
+            : emergency
+              ? "Emergency stop failed."
+              : "Manual drive command failed.";
+        setError(message);
+        Alert.alert(
+          emergency ? "Emergency Stop Error" : "Robot Communication Error",
+          message,
+        );
+      },
+    });
+  }
 
   useEffect(() => {
     const loadHardwareState = async () => {
@@ -172,6 +238,18 @@ export default function ManualControlScreen() {
     }
   };
 
+  const handleManualDriveStateChange = (
+    driveState: ManualDriveState,
+    force = false,
+  ) => {
+    manualDriveDispatcherRef.current?.setDesired(driveState, force);
+  };
+
+  const handleEmergencyStop = () => {
+    setDirectionPadResetSignal((current) => current + 1);
+    manualDriveDispatcherRef.current?.emergencyStop();
+  };
+
   return (
     <View style={styles.safeArea}>
       <ScrollView
@@ -185,15 +263,8 @@ export default function ManualControlScreen() {
         </View>
 
         <DirectionPad
-          onForward={() =>
-            updateRobotState(() => moveForward(), "Moving Forward")
-          }
-          onBackward={() =>
-            updateRobotState(() => moveBackward(), "Moving Backward")
-          }
-          onLeft={() => updateRobotState(() => turnLeft(), "Turning Left")}
-          onRight={() => updateRobotState(() => turnRight(), "Turning Right")}
-          onStop={() => updateRobotState(() => stopRobot(), "Stopped")}
+          onDriveStateChange={handleManualDriveStateChange}
+          resetSignal={directionPadResetSignal}
         />
 
         <View style={styles.primaryActions}>
@@ -213,14 +284,49 @@ export default function ManualControlScreen() {
             disabled={loading}
             loading={loading}
           />
+          <View style={styles.navigationTestSection}>
+            <Text style={styles.sectionTitle}>Navigation Test</Text>
+            <PrimaryButton
+              label="Intersection Left"
+              onPress={() =>
+                updateRobotState(() => intersectionLeft(), "Intersection Left")
+              }
+              disabled={loading}
+              loading={loading}
+            />
+            <PrimaryButton
+              label="Intersection Straight"
+              onPress={() =>
+                updateRobotState(
+                  () => intersectionStraight(),
+                  "Intersection Straight",
+                )
+              }
+              disabled={loading}
+              loading={loading}
+            />
+            <PrimaryButton
+              label="Intersection Right"
+              onPress={() =>
+                updateRobotState(
+                  () => intersectionRight(),
+                  "Intersection Right",
+                )
+              }
+              disabled={loading}
+              loading={loading}
+            />
+            <PrimaryButton
+              label="U-Turn"
+              onPress={() => updateRobotState(() => uTurn(), "U-Turn")}
+              disabled={loading}
+              loading={loading}
+            />
+          </View>
           <PrimaryButton
             label="Emergency Stop"
-            onPress={() =>
-              updateRobotState(() => emergencyStop(), "Emergency Stop")
-            }
+            onPress={handleEmergencyStop}
             variant="danger"
-            disabled={loading}
-            loading={loading}
           />
         </View>
 
@@ -327,6 +433,14 @@ const styles = StyleSheet.create({
   },
   controlSection: {
     marginBottom: 28,
+    padding: 18,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.card,
+  },
+  navigationTestSection: {
+    gap: 12,
     padding: 18,
     borderRadius: 22,
     borderWidth: 1,

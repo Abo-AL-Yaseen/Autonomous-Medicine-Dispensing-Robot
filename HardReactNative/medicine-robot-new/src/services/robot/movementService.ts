@@ -25,3 +25,19 @@ export const moveRobotBackward = () => movementRequest("/movement/backward");
 export const moveRobotLeft = () => movementRequest("/movement/left");
 export const moveRobotRight = () => movementRequest("/movement/right");
 export const stopRobotMovement = () => movementRequest("/movement/stop");
+
+export const manualDriveForward = () =>
+  movementRequest("/movement/manual/forward");
+export const manualDriveBackward = () =>
+  movementRequest("/movement/manual/backward");
+export const manualDriveLeft = () => movementRequest("/movement/manual/left");
+export const manualDriveRight = () => movementRequest("/movement/manual/right");
+export const manualDriveForwardLeft = () =>
+  movementRequest("/movement/manual/forward-left");
+export const manualDriveForwardRight = () =>
+  movementRequest("/movement/manual/forward-right");
+export const manualDriveBackwardLeft = () =>
+  movementRequest("/movement/manual/backward-left");
+export const manualDriveBackwardRight = () =>
+  movementRequest("/movement/manual/backward-right");
+export const manualDriveStop = () => movementRequest("/movement/manual/stop");

@@ -1,50 +1,116 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 import { Text } from "react-native-paper";
 
 import { theme } from "@/src/theme/theme";
+import {
+  createEmptyHeldDirections,
+  HeldDirections,
+  ManualDriveState,
+  resolveManualDriveState,
+} from "@/src/services/robot/manualDriveController";
 
 interface DirectionPadProps {
-  onForward: () => void;
-  onBackward: () => void;
-  onLeft: () => void;
-  onRight: () => void;
-  onStop: () => void;
+  onDriveStateChange: (state: ManualDriveState, force?: boolean) => void;
+  resetSignal?: number;
 }
 
 export function DirectionPad({
-  onForward,
-  onBackward,
-  onLeft,
-  onRight,
-  onStop,
+  onDriveStateChange,
+  resetSignal = 0,
 }: DirectionPadProps) {
+  const heldDirectionsRef = useRef<HeldDirections>(createEmptyHeldDirections());
+  const lastStateRef = useRef<ManualDriveState>("MANUAL_STOP");
+  const onDriveStateChangeRef = useRef(onDriveStateChange);
+  const previousResetSignalRef = useRef(resetSignal);
+
+  useEffect(() => {
+    onDriveStateChangeRef.current = onDriveStateChange;
+  }, [onDriveStateChange]);
+
+  useEffect(() => {
+    if (previousResetSignalRef.current === resetSignal) return;
+    previousResetSignalRef.current = resetSignal;
+    heldDirectionsRef.current = createEmptyHeldDirections();
+    lastStateRef.current = "MANUAL_STOP";
+  }, [resetSignal]);
+
+  const updateHeldDirection = (
+    direction: keyof HeldDirections,
+    held: boolean,
+  ) => {
+    const nextHeldDirections = {
+      ...heldDirectionsRef.current,
+      [direction]: held,
+    };
+    heldDirectionsRef.current = nextHeldDirections;
+
+    const nextState = resolveManualDriveState(nextHeldDirections);
+    if (nextState === lastStateRef.current) return;
+    lastStateRef.current = nextState;
+    onDriveStateChangeRef.current(nextState);
+  };
+
+  const stopManualDrive = () => {
+    heldDirectionsRef.current = createEmptyHeldDirections();
+    lastStateRef.current = "MANUAL_STOP";
+    onDriveStateChangeRef.current("MANUAL_STOP", true);
+  };
+
   return (
     <View style={styles.wrapper}>
       <View style={styles.pad}>
-        <Pressable onPress={onForward} style={styles.controlTop}>
+        <Pressable
+          onPressIn={() => updateHeldDirection("forward", true)}
+          onPressOut={() => updateHeldDirection("forward", false)}
+          style={({ pressed }) => [
+            styles.controlTop,
+            pressed && styles.controlPressed,
+          ]}
+        >
           <Text style={styles.arrow}>▲</Text>
           <Text style={styles.label}>Forward</Text>
         </Pressable>
 
         <View style={styles.middleRow}>
-          <Pressable onPress={onLeft} style={styles.controlSide}>
+          <Pressable
+            onPressIn={() => updateHeldDirection("left", true)}
+            onPressOut={() => updateHeldDirection("left", false)}
+            style={({ pressed }) => [
+              styles.controlSide,
+              pressed && styles.controlPressed,
+            ]}
+          >
             <Text style={styles.arrow}>◀</Text>
             <Text style={styles.label}>Left</Text>
           </Pressable>
 
-          <Pressable onPress={onStop} style={styles.stopButton}>
+          <Pressable onPress={stopManualDrive} style={styles.stopButton}>
             <Text style={styles.stopText}>■</Text>
             <Text style={styles.label}>Stop</Text>
           </Pressable>
 
-          <Pressable onPress={onRight} style={styles.controlSide}>
+          <Pressable
+            onPressIn={() => updateHeldDirection("right", true)}
+            onPressOut={() => updateHeldDirection("right", false)}
+            style={({ pressed }) => [
+              styles.controlSide,
+              pressed && styles.controlPressed,
+            ]}
+          >
             <Text style={styles.arrow}>▶</Text>
             <Text style={styles.label}>Right</Text>
           </Pressable>
         </View>
 
-        <Pressable onPress={onBackward} style={styles.controlBottom}>
+        <Pressable
+          onPressIn={() => updateHeldDirection("backward", true)}
+          onPressOut={() => updateHeldDirection("backward", false)}
+          style={({ pressed }) => [
+            styles.controlBottom,
+            pressed && styles.controlPressed,
+          ]}
+        >
           <Text style={styles.arrow}>▼</Text>
           <Text style={styles.label}>Backward</Text>
         </Pressable>
@@ -98,6 +164,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     marginTop: 10,
+  },
+  controlPressed: {
+    opacity: 0.55,
   },
   arrow: {
     fontSize: 30,

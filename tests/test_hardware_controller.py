@@ -137,6 +137,55 @@ def test_movement_uses_only_esp32(
 @pytest.mark.parametrize(
     ("method_name", "command", "acknowledgement"),
     [
+        ("manual_forward", "MANUAL_FORWARD", "ACK|MANUAL_FORWARD"),
+        ("manual_backward", "MANUAL_BACKWARD", "ACK|MANUAL_BACKWARD"),
+        ("manual_left", "MANUAL_LEFT", "ACK|MANUAL_LEFT"),
+        ("manual_right", "MANUAL_RIGHT", "ACK|MANUAL_RIGHT"),
+        (
+            "manual_forward_left",
+            "MANUAL_FORWARD_LEFT",
+            "ACK|MANUAL_FORWARD_LEFT",
+        ),
+        (
+            "manual_forward_right",
+            "MANUAL_FORWARD_RIGHT",
+            "ACK|MANUAL_FORWARD_RIGHT",
+        ),
+        (
+            "manual_backward_left",
+            "MANUAL_BACKWARD_LEFT",
+            "ACK|MANUAL_BACKWARD_LEFT",
+        ),
+        (
+            "manual_backward_right",
+            "MANUAL_BACKWARD_RIGHT",
+            "ACK|MANUAL_BACKWARD_RIGHT",
+        ),
+        ("manual_stop", "MANUAL_STOP", "ACK|MANUAL_STOP"),
+    ],
+)
+def test_manual_drive_uses_only_esp32_and_validates_exact_ack(
+    method_name: str,
+    command: str,
+    acknowledgement: str,
+) -> None:
+    esp32 = RecordingSerialController({command: acknowledgement})
+    arduino_uno = RecordingSerialController()
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=arduino_uno,  # type: ignore[arg-type]
+    )
+
+    assert getattr(controller, method_name)() == acknowledgement
+    assert esp32.commands == [command]
+    assert esp32.expected_responses == [acknowledgement]
+    assert arduino_uno.commands == []
+    assert arduino_uno.expected_responses == []
+
+
+@pytest.mark.parametrize(
+    ("method_name", "command", "acknowledgement"),
+    [
         (
             "intersection_left",
             "INTERSECTION_LEFT",

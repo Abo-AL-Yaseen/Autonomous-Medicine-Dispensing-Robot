@@ -88,6 +88,45 @@ class FakeHardwareController:
     def stop(self) -> str:
         return self._record_movement("stop", "ACK|STOP")
 
+    def manual_forward(self) -> str:
+        return self._record_movement("manual-forward", "ACK|MANUAL_FORWARD")
+
+    def manual_backward(self) -> str:
+        return self._record_movement("manual-backward", "ACK|MANUAL_BACKWARD")
+
+    def manual_left(self) -> str:
+        return self._record_movement("manual-left", "ACK|MANUAL_LEFT")
+
+    def manual_right(self) -> str:
+        return self._record_movement("manual-right", "ACK|MANUAL_RIGHT")
+
+    def manual_forward_left(self) -> str:
+        return self._record_movement(
+            "manual-forward-left",
+            "ACK|MANUAL_FORWARD_LEFT",
+        )
+
+    def manual_forward_right(self) -> str:
+        return self._record_movement(
+            "manual-forward-right",
+            "ACK|MANUAL_FORWARD_RIGHT",
+        )
+
+    def manual_backward_left(self) -> str:
+        return self._record_movement(
+            "manual-backward-left",
+            "ACK|MANUAL_BACKWARD_LEFT",
+        )
+
+    def manual_backward_right(self) -> str:
+        return self._record_movement(
+            "manual-backward-right",
+            "ACK|MANUAL_BACKWARD_RIGHT",
+        )
+
+    def manual_stop(self) -> str:
+        return self._record_movement("manual-stop", "ACK|MANUAL_STOP")
+
     def _record_movement(self, movement: str, response: str) -> str:
         self._raise_hardware_error()
         self.movement_calls.append(movement)
@@ -261,6 +300,10 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/executor/start" in body["endpoints"]
     assert "/water/dispense" in body["endpoints"]
     assert "/movement/stop" in body["endpoints"]
+    assert "/movement/manual/forward" in body["endpoints"]
+    assert "/movement/manual/forward-right" in body["endpoints"]
+    assert "/movement/manual/backward-left" in body["endpoints"]
+    assert "/movement/manual/stop" in body["endpoints"]
     assert "/line/start" in body["endpoints"]
     assert "/line/stop" in body["endpoints"]
     assert "/navigation/intersection/left" in body["endpoints"]
@@ -689,6 +732,39 @@ def test_hardware_error_returns_service_unavailable(
         ("/movement/left", "left", "ACK|LEFT"),
         ("/movement/right", "right", "ACK|RIGHT"),
         ("/movement/stop", "stop", "ACK|STOP"),
+        (
+            "/movement/manual/forward",
+            "manual-forward",
+            "ACK|MANUAL_FORWARD",
+        ),
+        (
+            "/movement/manual/backward",
+            "manual-backward",
+            "ACK|MANUAL_BACKWARD",
+        ),
+        ("/movement/manual/left", "manual-left", "ACK|MANUAL_LEFT"),
+        ("/movement/manual/right", "manual-right", "ACK|MANUAL_RIGHT"),
+        (
+            "/movement/manual/forward-left",
+            "manual-forward-left",
+            "ACK|MANUAL_FORWARD_LEFT",
+        ),
+        (
+            "/movement/manual/forward-right",
+            "manual-forward-right",
+            "ACK|MANUAL_FORWARD_RIGHT",
+        ),
+        (
+            "/movement/manual/backward-left",
+            "manual-backward-left",
+            "ACK|MANUAL_BACKWARD_LEFT",
+        ),
+        (
+            "/movement/manual/backward-right",
+            "manual-backward-right",
+            "ACK|MANUAL_BACKWARD_RIGHT",
+        ),
+        ("/movement/manual/stop", "manual-stop", "ACK|MANUAL_STOP"),
     ],
 )
 def test_movement_endpoint_sends_exactly_one_command(
