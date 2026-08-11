@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import TypeVar
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, StrictInt, model_validator
 
 from .database import SessionLocal, init_db
@@ -360,6 +360,7 @@ def create_app(
                 "/health",
                 "/camera/status",
                 "/camera/detect",
+                "/camera/stream",
                 "/ping",
                 "/status",
                 "/rtc",
@@ -422,6 +423,24 @@ def create_app(
     def camera_detect(request: Request) -> dict[str, object]:
         camera_service: ArucoCameraService = request.app.state.camera_service
         return camera_service.detect().as_dict()
+
+    @application.get("/camera/stream")
+    def camera_stream(request: Request) -> StreamingResponse:
+        camera_service: ArucoCameraService = request.app.state.camera_service
+        first_frame = camera_service.get_preview_jpeg(timeout=1.0)
+        if first_frame is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "CAMERA_UNAVAILABLE"},
+            )
+        return StreamingResponse(
+            camera_service.mjpeg_stream(first_frame),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+            },
+        )
 
     @application.get("/ping")
     def ping(request: Request) -> dict[str, object]:

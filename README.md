@@ -66,6 +66,18 @@ python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000
 
 Swagger documentation is available at `http://<raspberry-pi-address>:8000/docs`.
 
+## USB camera preview
+
+FastAPI owns one `/dev/video0` `VideoCapture` and one camera-reader thread. The
+reader supplies a shared frame buffer to both ArUco detection and the browser
+preview, so opening multiple browser clients never opens the camera again.
+
+Open `http://<raspberry-pi-address>:8000/camera/stream` for an MJPEG preview at
+approximately 12 FPS. The preview draws marker boxes, IDs, estimated areas, and
+camera resolution on a copy of each frame. `POST /camera/detect` continues to
+apply `DICT_4X4_50`, approved-marker filtering, minimum area, and consecutive
+frame confirmation to the unmodified buffered frames.
+
 ## DS1302 RTC API
 
 The Raspberry Pi reads the ESP32 using this exact read-only serial command:
@@ -222,8 +234,9 @@ to `ARRIVED_AT_ROOM` while retaining the mission. This phase does not dispense
 medicine or water, return home, or complete the mission.
 
 `POST /navigation/test/intersection-event` is available only while automatic
-navigation is disabled. It previews the same camera and route-decision path but
-never sends an ESP32 command or changes mission state.
+navigation is disabled. It records the synthetic event without calling the
+camera, route planner, executor validation, or ESP32, and never changes mission
+state.
 
 ### Legacy Raspberry database
 

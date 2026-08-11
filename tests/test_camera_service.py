@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -28,11 +30,15 @@ class FakeCapture:
         self.opened = opened
         self.released = False
         self.settings: list[tuple[int, int]] = []
+        self.read_calls = 0
+        self.read_threads: list[str] = []
 
     def isOpened(self) -> bool:
         return self.opened and not self.released
 
     def read(self) -> tuple[bool, Any]:
+        self.read_calls += 1
+        self.read_threads.append(threading.current_thread().name)
         if not self.frames:
             return False, None
         return True, self.frames.pop(0)
@@ -47,7 +53,24 @@ class FakeCapture:
 
 class FakeDetector:
     def detectMarkers(self, frame: Any) -> Any:
-        return frame
+        return frame.detections if isinstance(frame, FakeFrame) else frame
+
+
+class FakeFrame:
+    def __init__(self, detections: Any) -> None:
+        self.detections = detections
+        self.shape = (480, 640, 3)
+        self.annotations: list[str] = []
+
+    def copy(self) -> "FakeFrame":
+        copied = FakeFrame(self.detections)
+        copied.annotations = list(self.annotations)
+        return copied
+
+
+class FakeEncoded:
+    def tobytes(self) -> bytes:
+        return b"encoded-jpeg"
 
 
 class FakeAruco:
@@ -65,12 +88,48 @@ class FakeAruco:
     def ArucoDetector(dictionary: Any, parameters: Any) -> FakeDetector:
         return FakeDetector()
 
+    @staticmethod
+    def drawDetectedMarkers(
+        frame: FakeFrame,
+        corners: Any,
+        marker_ids: Any,
+    ) -> None:
+        frame.annotations.append("boxes")
+
 
 class FakeCv2:
     CAP_V4L2 = 200
     CAP_PROP_FRAME_WIDTH = 3
     CAP_PROP_FRAME_HEIGHT = 4
+    IMWRITE_JPEG_QUALITY = 1
+    FONT_HERSHEY_SIMPLEX = 0
+    LINE_AA = 16
     aruco = FakeAruco()
+
+    @staticmethod
+    def putText(
+        frame: FakeFrame,
+        text: str,
+        position: tuple[int, int],
+        font: int,
+        scale: float,
+        color: tuple[int, int, int],
+        thickness: int,
+        line_type: int,
+    ) -> None:
+        frame.annotations.append(text)
+
+    @staticmethod
+    def imencode(
+        extension: str,
+        frame: FakeFrame,
+        options: list[int],
+    ) -> tuple[bool, FakeEncoded]:
+        assert extension == ".jpg"
+        assert "boxes" in frame.annotations
+        assert "ID 1  area 2500" in frame.annotations
+        assert "640x480" in frame.annotations
+        return True, FakeEncoded()
 
 
 def build_service(
@@ -255,3 +314,49 @@ def test_camera_service_releases_camera_and_never_touches_serial(
 
     assert serial_calls == []
     assert capture.released is True
+
+
+def test_preview_and_detection_share_one_capture_and_one_reader() -> None:
+    frame = FakeFrame(([square(50)], [[1]], []))
+    capture = FakeCapture([frame])
+    capture_factory_calls: list[str] = []
+
+    def capture_factory(cv2_module: Any, device: str) -> FakeCapture:
+        capture_factory_calls.append(device)
+        return capture
+
+    service = ArucoCameraService(
+        CameraSettings(confirm_frames=1, min_marker_area=100),
+        cv2_module=FakeCv2(),
+        capture_factory=capture_factory,
+    )
+
+    assert service.start() is True
+    assert service.start() is True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        preview_future = pool.submit(service.get_preview_jpeg, timeout=1.0)
+        detection_future = pool.submit(service.detect)
+        preview = preview_future.result(timeout=2.0)
+        detection = detection_future.result(timeout=2.0)
+
+    assert preview is not None
+    assert preview[1] == b"encoded-jpeg"
+    assert detection.marker_id == 1
+    assert detection.confirmed is True
+    assert capture_factory_calls == ["/dev/video0"]
+    assert set(capture.read_threads) == {"aruco-camera-reader"}
+
+    first_part = next(service.mjpeg_stream(preview))
+    assert first_part.startswith(b"--frame\r\nContent-Type: image/jpeg")
+    assert b"encoded-jpeg" in first_part
+    service.close()
+
+    assert capture.released is True
+
+
+def test_unavailable_camera_cannot_create_preview() -> None:
+    capture = FakeCapture([], opened=False)
+    service = build_service(capture)
+
+    assert service.start() is False
+    assert service.get_preview_jpeg(timeout=0.01) is None

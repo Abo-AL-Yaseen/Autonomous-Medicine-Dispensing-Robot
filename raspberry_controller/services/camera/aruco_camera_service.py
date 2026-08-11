@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib
 import os
 import threading
-from collections.abc import Callable, Sequence
+import time
+from collections import deque
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -16,6 +18,9 @@ DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
 DEFAULT_CONFIRM_FRAMES = 3
 DEFAULT_MIN_MARKER_AREA = 2500.0
+DEFAULT_PREVIEW_FPS = 12.0
+DEFAULT_FRAME_WAIT_SECONDS = 1.0
+FRAME_HISTORY_MINIMUM = 8
 
 # Diagnostic-only local mapping. Laravel remains the authoritative map and a
 # later integration phase can replace this lookup without changing detection.
@@ -102,6 +107,18 @@ class ArucoCameraService:
         self._candidate_frames = 0
         self._last_error: str | None = None
         self._lock = threading.Lock()
+        self._detection_lock = threading.Lock()
+        self._confirmation_lock = threading.RLock()
+        self._detector_lock = threading.Lock()
+        self._frame_condition = threading.Condition()
+        self._latest_frame: Any | None = None
+        self._frame_sequence = 0
+        self._frame_history: deque[tuple[int, Any]] = deque(
+            maxlen=max(FRAME_HISTORY_MINIMUM, settings.confirm_frames * 2)
+        )
+        self._last_detection_sequence: int | None = None
+        self._reader_stop = threading.Event()
+        self._reader_thread: threading.Thread | None = None
 
     def start(self) -> bool:
         """Open and configure the camera without propagating availability failures."""
@@ -112,6 +129,9 @@ class ArucoCameraService:
                 return False
 
             if self._camera_is_open():
+                if not self._reader_is_running():
+                    self._reset_frame_buffer()
+                    self._start_reader()
                 return True
 
             try:
@@ -148,6 +168,8 @@ class ArucoCameraService:
                     return False
 
                 self._set_capture_dimensions()
+                self._reset_frame_buffer()
+                self._start_reader()
                 self._last_error = None
                 return True
             except Exception:
@@ -158,18 +180,32 @@ class ArucoCameraService:
     def close(self) -> None:
         """Release the camera cleanly and reset confirmation state."""
 
+        self._reader_stop.set()
+        with self._frame_condition:
+            self._frame_condition.notify_all()
+        reader_thread = self._reader_thread
+        if (
+            reader_thread is not None
+            and reader_thread is not threading.current_thread()
+        ):
+            reader_thread.join(timeout=1.0)
         with self._lock:
             self._release_capture()
             self._reset_confirmation()
+            self._reader_thread = None
+        if reader_thread is not None and reader_thread.is_alive():
+            reader_thread.join(timeout=0.5)
+        self._reset_frame_buffer()
 
     def status(self) -> dict[str, object]:
         with self._lock:
             camera_open = self._camera_is_open()
+            reader_running = self._reader_is_running()
             return {
                 "enabled": self.settings.enabled,
                 "device": self.settings.device,
                 "camera_open": camera_open,
-                "camera_available": camera_open,
+                "camera_available": camera_open and reader_running,
                 "dictionary": ARUCO_DICTIONARY_NAME,
                 "width": self.settings.width,
                 "height": self.settings.height,
@@ -179,10 +215,10 @@ class ArucoCameraService:
             }
 
     def detect(self) -> MarkerDetectionResult:
-        """Read enough frames for one candidate to satisfy confirmation."""
+        """Inspect consecutive frames supplied by the sole camera reader."""
 
-        with self._lock:
-            if not self._camera_is_open():
+        with self._detection_lock:
+            if not self._camera_is_available():
                 return MarkerDetectionResult(
                     camera_available=False,
                     detected=False,
@@ -196,12 +232,20 @@ class ArucoCameraService:
             )
             for _ in range(self.settings.confirm_frames):
                 try:
-                    result = self._detect_next_frame()
+                    next_frame = self._next_detection_frame(
+                        self._last_detection_sequence,
+                        timeout=DEFAULT_FRAME_WAIT_SECONDS,
+                    )
+                    if next_frame is None:
+                        raise RuntimeError("camera frame unavailable")
+                    sequence, frame = next_frame
+                    self._last_detection_sequence = sequence
+                    result = self._detect_frame(frame)
                 except Exception:
-                    self._last_error = "CAMERA_READ_FAILED"
+                    self._set_last_error("CAMERA_READ_FAILED")
                     self._reset_confirmation()
                     return MarkerDetectionResult(
-                        camera_available=self._camera_is_open(),
+                        camera_available=self._camera_is_available(),
                         detected=False,
                         confirmed=False,
                     )
@@ -219,6 +263,20 @@ class ArucoCameraService:
     ) -> MarkerDetectionResult:
         """Filter one detector result and update consecutive-frame state."""
 
+        with self._confirmation_lock:
+            return self._process_detections_locked(
+                marker_ids,
+                corners,
+                camera_available=camera_available,
+            )
+
+    def _process_detections_locked(
+        self,
+        marker_ids: Any,
+        corners: Sequence[Any],
+        *,
+        camera_available: bool,
+    ) -> MarkerDetectionResult:
         observations: list[tuple[int, int]] = []
         flattened_ids = _flatten_marker_ids(marker_ids)
 
@@ -261,26 +319,223 @@ class ArucoCameraService:
             consecutive_frames=self._candidate_frames,
         )
 
-    def _detect_next_frame(self) -> MarkerDetectionResult:
-        received, frame = self._capture.read()
-        if not received:
-            self._reset_confirmation()
-            return MarkerDetectionResult(
-                camera_available=True,
-                detected=False,
-                confirmed=False,
-            )
-
-        if self._detector is not None:
-            corners, marker_ids, _ = self._detector.detectMarkers(frame)
-        else:
-            corners, marker_ids, _ = self._cv2.aruco.detectMarkers(
-                frame,
-                self._dictionary,
-                parameters=self._parameters,
-            )
-
+    def _detect_frame(self, frame: Any) -> MarkerDetectionResult:
+        corners, marker_ids = self._detect_markers(frame)
         return self.process_detections(marker_ids, corners)
+
+    def get_preview_jpeg(
+        self,
+        *,
+        after_sequence: int | None = None,
+        timeout: float = DEFAULT_FRAME_WAIT_SECONDS,
+    ) -> tuple[int, bytes] | None:
+        """Encode one annotated copy of a buffered frame for browser preview."""
+
+        frame_item = self._latest_frame_copy(after_sequence, timeout)
+        if frame_item is None or not self._camera_is_available():
+            return None
+
+        sequence, frame = frame_item
+        try:
+            preview = self._draw_preview_overlay(frame)
+            encode_options = []
+            if hasattr(self._cv2, "IMWRITE_JPEG_QUALITY"):
+                encode_options = [self._cv2.IMWRITE_JPEG_QUALITY, 75]
+            encoded_ok, encoded = self._cv2.imencode(
+                ".jpg",
+                preview,
+                encode_options,
+            )
+            if not encoded_ok:
+                raise RuntimeError("JPEG encoding failed")
+            return sequence, encoded.tobytes()
+        except Exception:
+            self._set_last_error("CAMERA_PREVIEW_ENCODING_FAILED")
+            return None
+
+    def mjpeg_stream(
+        self,
+        first_frame: tuple[int, bytes],
+        *,
+        fps: float = DEFAULT_PREVIEW_FPS,
+    ) -> Iterator[bytes]:
+        """Yield independently paced MJPEG parts without blocking camera reads."""
+
+        if fps <= 0:
+            raise ValueError("fps must be positive")
+
+        sequence, jpeg = first_frame
+        interval = 1.0 / fps
+        while not self._reader_stop.is_set():
+            yield _mjpeg_part(jpeg)
+            if self._reader_stop.wait(interval):
+                return
+            next_frame = self.get_preview_jpeg(
+                after_sequence=sequence,
+                timeout=DEFAULT_FRAME_WAIT_SECONDS,
+            )
+            if next_frame is None:
+                if not self._camera_is_available():
+                    return
+                continue
+            sequence, jpeg = next_frame
+
+    def _start_reader(self) -> None:
+        if self._reader_is_running():
+            return
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(
+            target=self._camera_reader_loop,
+            name="aruco-camera-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def _camera_reader_loop(self) -> None:
+        consecutive_failures = 0
+        while not self._reader_stop.is_set():
+            with self._lock:
+                capture = self._capture
+            if capture is None:
+                return
+
+            try:
+                received, frame = capture.read()
+            except Exception:
+                received, frame = False, None
+
+            if not received or frame is None:
+                consecutive_failures += 1
+                self._set_last_error("CAMERA_READ_FAILED")
+                if consecutive_failures >= 10:
+                    self._reader_stop.set()
+                    with self._frame_condition:
+                        self._frame_condition.notify_all()
+                    return
+                self._reader_stop.wait(0.05)
+                continue
+
+            consecutive_failures = 0
+            with self._frame_condition:
+                self._frame_sequence += 1
+                frame_item = (self._frame_sequence, frame)
+                self._latest_frame = frame
+                self._frame_history.append(frame_item)
+                self._frame_condition.notify_all()
+            self._set_last_error(None)
+
+    def _next_detection_frame(
+        self,
+        after_sequence: int | None,
+        *,
+        timeout: float,
+    ) -> tuple[int, Any] | None:
+        deadline = time.monotonic() + timeout
+        with self._frame_condition:
+            while True:
+                for sequence, frame in self._frame_history:
+                    if after_sequence is None or sequence > after_sequence:
+                        return sequence, frame
+                if self._reader_stop.is_set():
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._frame_condition.wait(remaining)
+
+    def _latest_frame_copy(
+        self,
+        after_sequence: int | None,
+        timeout: float,
+    ) -> tuple[int, Any] | None:
+        deadline = time.monotonic() + timeout
+        with self._frame_condition:
+            while self._latest_frame is None or (
+                after_sequence is not None
+                and self._frame_sequence <= after_sequence
+            ):
+                if self._reader_stop.is_set():
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._frame_condition.wait(remaining)
+
+            frame = self._latest_frame
+            return self._frame_sequence, frame.copy()
+
+    def _detect_markers(self, frame: Any) -> tuple[Sequence[Any], Any]:
+        with self._detector_lock:
+            if self._detector is not None:
+                corners, marker_ids, _ = self._detector.detectMarkers(frame)
+            else:
+                corners, marker_ids, _ = self._cv2.aruco.detectMarkers(
+                    frame,
+                    self._dictionary,
+                    parameters=self._parameters,
+                )
+        return corners, marker_ids
+
+    def _draw_preview_overlay(self, frame: Any) -> Any:
+        # _latest_frame_copy already detached this frame from the reader buffer.
+        preview = frame
+        corners, marker_ids = self._detect_markers(frame)
+        flattened_ids = _flatten_marker_ids(marker_ids)
+
+        if flattened_ids:
+            try:
+                self._cv2.aruco.drawDetectedMarkers(
+                    preview,
+                    corners,
+                    marker_ids,
+                )
+            except Exception:
+                pass
+
+        for marker_id, marker_corners in zip(
+            flattened_ids,
+            corners,
+            strict=False,
+        ):
+            x, y = _first_corner(marker_corners)
+            area = int(round(_polygon_area(marker_corners)))
+            self._draw_text(preview, f"ID {marker_id}  area {area}", x, y - 8)
+
+        height, width = frame.shape[:2]
+        self._draw_text(preview, f"{width}x{height}", 10, 24)
+        return preview
+
+    def _draw_text(self, frame: Any, text: str, x: int, y: int) -> None:
+        self._cv2.putText(
+            frame,
+            text,
+            (max(0, x), max(18, y)),
+            self._cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            self._cv2.LINE_AA,
+        )
+
+    def _camera_is_available(self) -> bool:
+        with self._lock:
+            return self._camera_is_open() and self._reader_is_running()
+
+    def _reader_is_running(self) -> bool:
+        thread = self._reader_thread
+        return bool(thread is not None and thread.is_alive())
+
+    def _set_last_error(self, error: str | None) -> None:
+        with self._lock:
+            self._last_error = error
+
+    def _reset_frame_buffer(self) -> None:
+        with self._frame_condition:
+            self._latest_frame = None
+            self._frame_sequence = 0
+            self._frame_history.clear()
+            self._last_detection_sequence = None
+            self._frame_condition.notify_all()
 
     def _camera_is_open(self) -> bool:
         if self._capture is None:
@@ -311,8 +566,32 @@ class ArucoCameraService:
             pass
 
     def _reset_confirmation(self) -> None:
-        self._candidate_id = None
-        self._candidate_frames = 0
+        with self._confirmation_lock:
+            self._candidate_id = None
+            self._candidate_frames = 0
+
+
+def _mjpeg_part(jpeg: bytes) -> bytes:
+    return (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n"
+        + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+        + jpeg
+        + b"\r\n"
+    )
+
+
+def _first_corner(corners: Any) -> tuple[int, int]:
+    points = corners.tolist() if hasattr(corners, "tolist") else corners
+    while (
+        isinstance(points, Sequence)
+        and len(points) == 1
+        and isinstance(points[0], Sequence)
+    ):
+        points = points[0]
+    if not isinstance(points, Sequence) or not points:
+        return 0, 0
+    return int(round(float(points[0][0]))), int(round(float(points[0][1])))
 
 
 def _flatten_marker_ids(marker_ids: Any) -> list[int]:

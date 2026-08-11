@@ -290,6 +290,8 @@ class FakeCameraService:
         self.started = False
         self.closed = False
         self.detect_calls = 0
+        self.preview_calls = 0
+        self.stream_calls = 0
         self.detection = MarkerDetectionResult(
             camera_available=available,
             detected=True,
@@ -325,6 +327,26 @@ class FakeCameraService:
     def detect(self) -> MarkerDetectionResult:
         self.detect_calls += 1
         return self.detection
+
+    def get_preview_jpeg(
+        self,
+        *,
+        after_sequence: int | None = None,
+        timeout: float = 1.0,
+    ) -> tuple[int, bytes] | None:
+        self.preview_calls += 1
+        if not self.available:
+            return None
+        return 1, b"fake-jpeg"
+
+    def mjpeg_stream(
+        self,
+        first_frame: tuple[int, bytes],
+        *,
+        fps: float = 12.0,
+    ) -> Iterator[bytes]:
+        self.stream_calls += 1
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + first_frame[1]
 
 
 @pytest.fixture
@@ -417,6 +439,7 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert body["version"] == "1.0.0"
     assert "/camera/status" in body["endpoints"]
     assert "/camera/detect" in body["endpoints"]
+    assert "/camera/stream" in body["endpoints"]
     assert "/dispense" in body["endpoints"]
     assert "/rtc" in body["endpoints"]
     assert "/scheduler/status" in body["endpoints"]
@@ -487,6 +510,28 @@ def test_camera_detect_is_read_only_and_returns_structured_detection(
     assert fake_hardware.navigation_calls == []
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
+
+
+def test_camera_stream_uses_existing_service_and_detect_still_works(
+    client: TestClient,
+    fake_camera: FakeCameraService,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    stream_response = client.get("/camera/stream")
+    detect_response = client.post("/camera/detect")
+
+    assert stream_response.status_code == 200
+    assert stream_response.headers["content-type"].startswith(
+        "multipart/x-mixed-replace; boundary=frame"
+    )
+    assert b"fake-jpeg" in stream_response.content
+    assert detect_response.status_code == 200
+    assert fake_camera.preview_calls == 1
+    assert fake_camera.stream_calls == 1
+    assert fake_camera.detect_calls == 1
+    assert fake_hardware.movement_calls == []
+    assert fake_hardware.line_calls == []
+    assert fake_hardware.navigation_calls == []
 
 
 def test_navigation_decision_preview_uses_loaded_mission_without_hardware(
@@ -689,6 +734,7 @@ def test_health_still_works_when_camera_is_unavailable_at_startup(
 
     with TestClient(application) as test_client:
         response = test_client.get("/health")
+        stream_response = test_client.get("/camera/stream")
 
         assert response.status_code == 200
         assert response.json() == {
@@ -697,6 +743,10 @@ def test_health_still_works_when_camera_is_unavailable_at_startup(
             "camera_available": False,
         }
         assert fake_hardware.connected is True
+        assert stream_response.status_code == 503
+        assert stream_response.json() == {
+            "detail": {"code": "CAMERA_UNAVAILABLE"}
+        }
 
 
 def test_ping_returns_both_board_responses(client: TestClient) -> None:
