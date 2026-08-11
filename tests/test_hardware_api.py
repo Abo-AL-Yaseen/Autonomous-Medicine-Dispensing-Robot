@@ -555,28 +555,23 @@ def test_navigation_status_reports_auto_disabled_by_default(
 def test_disabled_intersection_test_endpoint_never_sends_hardware_command(
     client: TestClient,
     fake_hardware: FakeHardwareController,
+    fake_camera: FakeCameraService,
+    fake_laravel: FakeLaravelClient,
 ) -> None:
     executor: MissionExecutor = client.app.state.mission_executor
-    assert executor.accept(
-        ClaimedMission(
-            85,
-            4,
-            2,
-            1,
-            room_number="4",
-            dispenser_box=1,
-            schedule_claimed_at="2026-08-09T17:30:00+00:00",
-        )
-    )
-    assert client.post("/executor/start").status_code == 200
-    fake_hardware.line_calls.clear()
 
     response = client.post("/navigation/test/intersection-event")
 
     assert response.status_code == 200
-    assert response.json()["last_decision"] == "RIGHT"
-    assert response.json()["last_error"] == "TEST_PREVIEW_ONLY"
-    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert response.json()["last_intersection_event"] == (
+        "EVENT|INTERSECTION|SOURCE=TEST"
+    )
+    assert response.json()["state"] == "DISABLED"
+    assert response.json()["last_command"] is None
+    assert response.json()["last_error"] is None
+    assert executor.state is MissionExecutionState.IDLE
+    assert fake_camera.detect_calls == 0
+    assert fake_laravel.map_calls == 0
     assert fake_hardware.navigation_calls == []
     assert fake_hardware.line_calls == []
     assert fake_hardware.dispense_calls == []

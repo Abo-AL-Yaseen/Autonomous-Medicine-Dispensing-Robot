@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
+from unittest.mock import Mock
 
 import pytest
 
@@ -169,16 +170,25 @@ def test_navigation_auto_is_disabled_by_default(
 
 
 def test_disabled_navigation_observes_event_and_sends_no_commands() -> None:
+    executor = MissionExecutor(load_navigation_map=approved_navigation_map)
+    route_planner = Mock(side_effect=AssertionError("route planner called"))
+    executor.plan_route = route_planner  # type: ignore[method-assign]
     camera = FakeCamera(confirmed_marker(0))
     hardware = HardwareRecorder()
-    service = coordinator(going_executor(1), camera, hardware, enabled=False)
+    service = coordinator(executor, camera, hardware, enabled=False)
 
     service.process_serial_line(INTERSECTION_EVENT)
 
+    status = service.status()
+    assert status["last_intersection_event"] == INTERSECTION_EVENT
+    assert status["state"] == "DISABLED"
+    assert status["last_command"] is None
+    assert status["last_error"] is None
+    assert executor.state is MissionExecutionState.IDLE
     assert hardware.navigation == []
     assert hardware.line == []
     assert camera.calls == 0
-    assert service.status()["last_error"] == "NAVIGATION_AUTO_DISABLED"
+    route_planner.assert_not_called()
 
 
 def test_background_event_consumer_runs_the_real_coordinator_flow() -> None:
@@ -354,15 +364,13 @@ def test_missing_mission_and_wrong_executor_state_send_no_command(
     if load_mission:
         assert executor.accept(mission_for_room(1)) is True
     hardware = HardwareRecorder()
-    service = coordinator(
-        executor,
-        FakeCamera(confirmed_marker(0)),
-        hardware,
-    )
+    camera = FakeCamera(confirmed_marker(0))
+    service = coordinator(executor, camera, hardware)
 
     service.process_serial_line(INTERSECTION_EVENT)
 
     assert hardware.navigation == []
+    assert camera.calls == 0
     assert service.status()["last_error"] == "EXECUTOR_NOT_GOING_TO_ROOM"
 
 
@@ -389,11 +397,14 @@ def test_arrived_stops_line_follow_but_does_not_deliver_or_release_mission() -> 
 
 
 def test_disabled_preview_never_moves_or_changes_executor_state() -> None:
-    executor = going_executor(1)
+    executor = MissionExecutor(load_navigation_map=approved_navigation_map)
+    route_planner = Mock(side_effect=AssertionError("route planner called"))
+    executor.plan_route = route_planner  # type: ignore[method-assign]
+    camera = FakeCamera(confirmed_marker(11))
     hardware = HardwareRecorder()
     service = coordinator(
         executor,
-        FakeCamera(confirmed_marker(11)),
+        camera,
         hardware,
         enabled=False,
     )
@@ -402,5 +413,12 @@ def test_disabled_preview_never_moves_or_changes_executor_state() -> None:
 
     assert hardware.navigation == []
     assert hardware.line == []
-    assert executor.state is MissionExecutionState.GOING_TO_ROOM
-    assert status["last_error"] == "TEST_PREVIEW_ONLY"
+    assert camera.calls == 0
+    route_planner.assert_not_called()
+    assert executor.state is MissionExecutionState.IDLE
+    assert status["last_intersection_event"] == (
+        "EVENT|INTERSECTION|SOURCE=TEST"
+    )
+    assert status["state"] == "DISABLED"
+    assert status["last_command"] is None
+    assert status["last_error"] is None

@@ -115,6 +115,10 @@ class NavigationCoordinator:
     def process_serial_line(self, line: str) -> None:
         """Process one line already dispatched by the sole serial reader."""
 
+        if not self.enabled and self._is_intersection_event(line):
+            self._observe_disabled_event(line)
+            return
+
         if line.startswith(INTERSECTION_COMPLETE_PREFIX):
             with self._lock:
                 self._armed = True
@@ -132,24 +136,42 @@ class NavigationCoordinator:
         if not line.startswith(INTERSECTION_EVENT_PREFIX):
             return
 
-        if not self.enabled:
-            with self._lock:
-                self._last_intersection_event = line
-                self._state = NavigationCoordinatorState.DISABLED
-                self._last_error = "NAVIGATION_AUTO_DISABLED"
-            return
-
         self._process_intersection(line, execute_command=True, enforce_debounce=True)
 
     def preview_test_intersection(self) -> dict[str, object]:
         """Evaluate a synthetic event without ever dispatching a command."""
 
+        event = "EVENT|INTERSECTION|SOURCE=TEST"
+        if not self.enabled:
+            self._observe_disabled_event(event)
+            return self.status()
+
         self._process_intersection(
-            "EVENT|INTERSECTION|SOURCE=TEST",
+            event,
             execute_command=False,
             enforce_debounce=False,
         )
         return self.status()
+
+    @staticmethod
+    def _is_intersection_event(line: str) -> bool:
+        return line.startswith(
+            (
+                INTERSECTION_EVENT_PREFIX,
+                INTERSECTION_COMPLETE_PREFIX,
+                INTERSECTION_FAILED_PREFIX,
+            )
+        )
+
+    def _observe_disabled_event(self, event: str) -> None:
+        with self._lock:
+            self._last_intersection_event = event
+            self._last_marker_id = None
+            self._last_node = None
+            self._last_decision = None
+            self._last_command = None
+            self._last_error = None
+            self._state = NavigationCoordinatorState.DISABLED
 
     def status(self) -> dict[str, object]:
         with self._lock:
