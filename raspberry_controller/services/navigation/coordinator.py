@@ -89,6 +89,13 @@ class NavigationCoordinator:
         self._last_decision: str | None = None
         self._last_command: str | None = None
         self._last_error: str | None = None
+        self._expected_marker_id: int | None = None
+        self._expected_mission_id: int | None = None
+        self._last_marker_area: int | None = None
+        self._last_second_marker_id: int | None = None
+        self._last_second_marker_area: int | None = None
+        self._last_area_ratio: float | None = None
+        self._last_selection_ambiguous = False
 
     @property
     def enabled(self) -> bool:
@@ -171,6 +178,13 @@ class NavigationCoordinator:
             self._last_decision = None
             self._last_command = None
             self._last_error = None
+            self._expected_marker_id = None
+            self._expected_mission_id = None
+            self._last_marker_area = None
+            self._last_second_marker_id = None
+            self._last_second_marker_area = None
+            self._last_area_ratio = None
+            self._last_selection_ambiguous = False
             self._state = NavigationCoordinatorState.DISABLED
 
     def status(self) -> dict[str, object]:
@@ -186,6 +200,12 @@ class NavigationCoordinator:
                 "last_decision": self._last_decision,
                 "last_command": self._last_command,
                 "last_error": self._last_error,
+                "expected_marker_id": self._expected_marker_id,
+                "last_marker_area": self._last_marker_area,
+                "last_second_marker_id": self._last_second_marker_id,
+                "last_second_marker_area": self._last_second_marker_area,
+                "last_area_ratio": self._last_area_ratio,
+                "last_selection_ambiguous": self._last_selection_ambiguous,
             }
 
     def _event_loop(self) -> None:
@@ -229,9 +249,31 @@ class NavigationCoordinator:
                 self._record_error("EXECUTOR_NOT_GOING_TO_ROOM")
                 return
 
-            detection = self._camera_service.detect()
+            mission_id = self._executor.mission_id
+            with self._lock:
+                if self._expected_mission_id != mission_id:
+                    self._expected_marker_id = None
+                    self._expected_mission_id = mission_id
+                expected_marker_id = self._expected_marker_id
+
+            detection = self._camera_service.detect(
+                expected_marker_id=expected_marker_id,
+            )
+            with self._lock:
+                self._last_marker_id = detection.marker_id
+                self._last_marker_area = detection.area
+                self._last_second_marker_id = detection.second_marker_id
+                self._last_second_marker_area = detection.second_area
+                self._last_area_ratio = detection.area_ratio
+                self._last_selection_ambiguous = detection.ambiguous
             if not detection.camera_available:
                 self._record_error("CAMERA_UNAVAILABLE")
+                return
+            if detection.ambiguous:
+                self._record_error("AMBIGUOUS_MARKERS")
+                return
+            if detection.selection_error == "UNEXPECTED_MARKER":
+                self._record_error("UNEXPECTED_MARKER")
                 return
             if (
                 not detection.detected
@@ -279,6 +321,7 @@ class NavigationCoordinator:
                     stop_error = "LINE_FOLLOW_STOP_FAILED"
                 self._executor.mark_arrived_at_room()
                 with self._lock:
+                    self._expected_marker_id = None
                     self._state = NavigationCoordinatorState.ARRIVED_AT_ROOM
                     self._last_error = stop_error
                 return
@@ -289,6 +332,14 @@ class NavigationCoordinator:
                 return
 
             command_name, operation = command
+            if plan.next_node is None:
+                self._record_error("NAVIGATION_MAP_INVALID")
+                return
+            try:
+                next_marker_id = self._executor.marker_for_node(plan.next_node)
+            except (MissionRouteUnavailableError, NavigationMapError):
+                self._record_error("NAVIGATION_MAP_INVALID")
+                return
             if not execute_command:
                 with self._lock:
                     self._state = NavigationCoordinatorState.DISABLED
@@ -303,6 +354,8 @@ class NavigationCoordinator:
 
             with self._lock:
                 self._last_command = command_name
+                self._expected_marker_id = next_marker_id
+                self._expected_mission_id = mission_id
                 self._state = NavigationCoordinatorState.COMMAND_SENT
                 self._last_error = None
         finally:

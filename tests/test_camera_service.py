@@ -24,6 +24,10 @@ def square(size: int, *, offset: int = 0) -> list[list[list[int]]]:
     ]]
 
 
+def rectangle(width: int, height: int) -> list[list[list[int]]]:
+    return [[[0, 0], [width, 0], [width, height], [0, height]]]
+
+
 class FakeCapture:
     def __init__(self, frames: list[Any], *, opened: bool = True) -> None:
         self.frames = list(frames)
@@ -161,6 +165,7 @@ def test_camera_settings_are_loaded_from_environment(
     monkeypatch.setenv("CAMERA_HEIGHT", "720")
     monkeypatch.setenv("ARUCO_CONFIRM_FRAMES", "4")
     monkeypatch.setenv("ARUCO_MIN_MARKER_AREA", "3200.5")
+    monkeypatch.setenv("ARUCO_MIN_AREA_RATIO", "1.6")
 
     assert CameraSettings.from_environment() == CameraSettings(
         enabled=True,
@@ -169,6 +174,7 @@ def test_camera_settings_are_loaded_from_environment(
         height=720,
         confirm_frames=4,
         min_marker_area=3200.5,
+        min_area_ratio=1.6,
     )
 
 
@@ -188,6 +194,12 @@ def test_camera_unavailable_is_reported_without_raising() -> None:
         "marker_type": None,
         "area": None,
         "consecutive_frames": 0,
+        "second_marker_id": None,
+        "second_area": None,
+        "area_ratio": None,
+        "ambiguous": False,
+        "expected_marker_id": None,
+        "selection_error": None,
     }
 
 
@@ -289,6 +301,136 @@ def test_largest_approved_marker_is_the_only_selected_candidate() -> None:
     assert result.marker_id == 11
     assert result.node_name == "ROOM_1"
     assert result.area == 4900
+
+
+@pytest.mark.parametrize(
+    ("second_marker_id", "second_area"),
+    [(15, 8000), (1, 10000)],
+)
+def test_clearly_dominant_largest_area_marker_wins(
+    second_marker_id: int,
+    second_area: int,
+) -> None:
+    service = build_service(FakeCapture([]), confirm_frames=1)
+
+    result = service.process_detections(
+        [[0], [second_marker_id]],
+        [rectangle(250, 200), rectangle(second_area // 100, 100)],
+    )
+
+    assert result.marker_id == 0
+    assert result.area == 50000
+    assert result.second_marker_id == second_marker_id
+    assert result.second_area == second_area
+    assert result.area_ratio == 50000 / second_area
+    assert result.ambiguous is False
+    assert result.confirmed is True
+
+
+def test_similarly_sized_markers_are_ambiguous_and_never_confirm() -> None:
+    service = build_service(FakeCapture([]), confirm_frames=1)
+
+    result = service.process_detections(
+        [[0], [1]],
+        [rectangle(300, 100), rectangle(280, 100)],
+    )
+
+    assert result.marker_id == 0
+    assert result.area == 30000
+    assert result.second_marker_id == 1
+    assert result.second_area == 28000
+    assert result.area_ratio == pytest.approx(30000 / 28000)
+    assert result.ambiguous is True
+    assert result.confirmed is False
+    assert result.selection_error == "AMBIGUOUS_MARKERS"
+
+
+def test_all_markers_below_minimum_area_are_rejected() -> None:
+    service = build_service(
+        FakeCapture([]),
+        confirm_frames=1,
+        min_marker_area=2500,
+    )
+
+    result = service.process_detections(
+        [[0], [1]],
+        [rectangle(40, 40), rectangle(30, 30)],
+    )
+
+    assert result.detected is False
+    assert result.marker_id is None
+    assert result.confirmed is False
+
+
+def test_area_candidate_must_remain_stable_for_three_frames() -> None:
+    service = build_service(FakeCapture([]), confirm_frames=3)
+
+    results = [
+        service.process_detections([[0]], [rectangle(250, 200)])
+        for _ in range(3)
+    ]
+
+    assert [result.consecutive_frames for result in results] == [1, 2, 3]
+    assert [result.confirmed for result in results] == [False, False, True]
+
+
+def test_candidate_change_resets_consecutive_confirmation() -> None:
+    service = build_service(FakeCapture([]), confirm_frames=3)
+
+    first = service.process_detections([[0]], [rectangle(250, 200)])
+    changed = service.process_detections([[1]], [rectangle(250, 200)])
+    second = service.process_detections([[1]], [rectangle(250, 200)])
+
+    assert first.consecutive_frames == 1
+    assert changed.consecutive_frames == 1
+    assert second.consecutive_frames == 2
+    assert second.confirmed is False
+
+
+def test_larger_unrelated_marker_cannot_override_expected_route_marker() -> None:
+    service = build_service(FakeCapture([]), confirm_frames=1)
+
+    result = service.process_detections(
+        [[0], [1]],
+        [rectangle(250, 200), rectangle(100, 100)],
+        expected_marker_id=1,
+    )
+
+    assert result.marker_id == 0
+    assert result.expected_marker_id == 1
+    assert result.confirmed is False
+    assert result.selection_error == "UNEXPECTED_MARKER"
+
+
+def test_dominant_expected_marker_wins_over_unrelated_distant_marker() -> None:
+    service = build_service(FakeCapture([]), confirm_frames=1)
+
+    result = service.process_detections(
+        [[0], [15]],
+        [rectangle(250, 200), rectangle(100, 80)],
+        expected_marker_id=0,
+    )
+
+    assert result.marker_id == 0
+    assert result.second_marker_id == 15
+    assert result.area_ratio == 6.25
+    assert result.confirmed is True
+    assert result.selection_error is None
+
+
+def test_expected_room_marker_remains_a_valid_arrival_candidate() -> None:
+    service = build_service(FakeCapture([]), confirm_frames=1)
+
+    result = service.process_detections(
+        [[15]],
+        [rectangle(250, 200)],
+        expected_marker_id=15,
+    )
+
+    assert result.marker_id == 15
+    assert result.marker_type == "room"
+    assert result.expected_marker_id == 15
+    assert result.confirmed is True
 
 
 def test_camera_service_releases_camera_and_never_touches_serial(

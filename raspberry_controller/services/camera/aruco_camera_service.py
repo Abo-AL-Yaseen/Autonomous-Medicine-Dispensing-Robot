@@ -18,6 +18,7 @@ DEFAULT_CAMERA_WIDTH = 640
 DEFAULT_CAMERA_HEIGHT = 480
 DEFAULT_CONFIRM_FRAMES = 3
 DEFAULT_MIN_MARKER_AREA = 2500.0
+DEFAULT_MIN_AREA_RATIO = 1.4
 DEFAULT_PREVIEW_FPS = 12.0
 DEFAULT_FRAME_WAIT_SECONDS = 1.0
 FRAME_HISTORY_MINIMUM = 8
@@ -48,6 +49,7 @@ class CameraSettings:
     height: int = DEFAULT_CAMERA_HEIGHT
     confirm_frames: int = DEFAULT_CONFIRM_FRAMES
     min_marker_area: float = DEFAULT_MIN_MARKER_AREA
+    min_area_ratio: float = DEFAULT_MIN_AREA_RATIO
 
     @classmethod
     def from_environment(cls) -> "CameraSettings":
@@ -64,6 +66,10 @@ class CameraSettings:
                 "ARUCO_MIN_MARKER_AREA",
                 DEFAULT_MIN_MARKER_AREA,
             ),
+            min_area_ratio=_read_min_area_ratio_setting(
+                "ARUCO_MIN_AREA_RATIO",
+                DEFAULT_MIN_AREA_RATIO,
+            ),
         )
 
 
@@ -77,6 +83,12 @@ class MarkerDetectionResult:
     marker_type: str | None = None
     area: int | None = None
     consecutive_frames: int = 0
+    second_marker_id: int | None = None
+    second_area: int | None = None
+    area_ratio: float | None = None
+    ambiguous: bool = False
+    expected_marker_id: int | None = None
+    selection_error: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -211,10 +223,15 @@ class ArucoCameraService:
                 "height": self.settings.height,
                 "confirm_frames": self.settings.confirm_frames,
                 "min_marker_area": self.settings.min_marker_area,
+                "min_area_ratio": self.settings.min_area_ratio,
                 "error": self._last_error,
             }
 
-    def detect(self) -> MarkerDetectionResult:
+    def detect(
+        self,
+        *,
+        expected_marker_id: int | None = None,
+    ) -> MarkerDetectionResult:
         """Inspect consecutive frames supplied by the sole camera reader."""
 
         with self._detection_lock:
@@ -240,7 +257,10 @@ class ArucoCameraService:
                         raise RuntimeError("camera frame unavailable")
                     sequence, frame = next_frame
                     self._last_detection_sequence = sequence
-                    result = self._detect_frame(frame)
+                    result = self._detect_frame(
+                        frame,
+                        expected_marker_id=expected_marker_id,
+                    )
                 except Exception:
                     self._set_last_error("CAMERA_READ_FAILED")
                     self._reset_confirmation()
@@ -260,6 +280,7 @@ class ArucoCameraService:
         corners: Sequence[Any],
         *,
         camera_available: bool = True,
+        expected_marker_id: int | None = None,
     ) -> MarkerDetectionResult:
         """Filter one detector result and update consecutive-frame state."""
 
@@ -268,6 +289,7 @@ class ArucoCameraService:
                 marker_ids,
                 corners,
                 camera_available=camera_available,
+                expected_marker_id=expected_marker_id,
             )
 
     def _process_detections_locked(
@@ -276,8 +298,9 @@ class ArucoCameraService:
         corners: Sequence[Any],
         *,
         camera_available: bool,
+        expected_marker_id: int | None,
     ) -> MarkerDetectionResult:
-        observations: list[tuple[int, int]] = []
+        observations_by_marker: dict[int, int] = {}
         flattened_ids = _flatten_marker_ids(marker_ids)
 
         for marker_id, marker_corners in zip(flattened_ids, corners, strict=False):
@@ -288,26 +311,71 @@ class ArucoCameraService:
             if area < self.settings.min_marker_area:
                 continue
 
-            observations.append((marker_id, int(round(area))))
+            rounded_area = int(round(area))
+            observations_by_marker[marker_id] = max(
+                rounded_area,
+                observations_by_marker.get(marker_id, 0),
+            )
 
-        if not observations:
+        if not observations_by_marker:
             self._reset_confirmation()
             return MarkerDetectionResult(
                 camera_available=camera_available,
                 detected=False,
                 confirmed=False,
+                expected_marker_id=expected_marker_id,
+                selection_error="NO_VALID_MARKER",
             )
 
-        # Largest approved marker wins. Equal areas deterministically prefer
-        # the lower marker ID so only one candidate can advance confirmation.
-        marker_id, area = max(observations, key=lambda item: (item[1], -item[0]))
+        observations = sorted(
+            observations_by_marker.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        marker_id, area = observations[0]
+        second_marker_id: int | None = None
+        second_area: int | None = None
+        area_ratio: float | None = None
+        if len(observations) > 1:
+            second_marker_id, second_area = observations[1]
+            area_ratio = area / second_area if second_area > 0 else None
+
+        ambiguous = bool(
+            area_ratio is not None
+            and area_ratio < self.settings.min_area_ratio
+        )
+        unexpected = bool(
+            expected_marker_id is not None
+            and marker_id != expected_marker_id
+        )
+        node_name, marker_type = APPROVED_MARKERS[marker_id]
+
+        if ambiguous or unexpected:
+            self._reset_confirmation()
+            return MarkerDetectionResult(
+                camera_available=camera_available,
+                detected=True,
+                confirmed=False,
+                marker_id=marker_id,
+                node_name=node_name,
+                marker_type=marker_type,
+                area=area,
+                consecutive_frames=0,
+                second_marker_id=second_marker_id,
+                second_area=second_area,
+                area_ratio=area_ratio,
+                ambiguous=ambiguous,
+                expected_marker_id=expected_marker_id,
+                selection_error=(
+                    "AMBIGUOUS_MARKERS" if ambiguous else "UNEXPECTED_MARKER"
+                ),
+            )
+
         if marker_id == self._candidate_id:
             self._candidate_frames += 1
         else:
             self._candidate_id = marker_id
             self._candidate_frames = 1
 
-        node_name, marker_type = APPROVED_MARKERS[marker_id]
         return MarkerDetectionResult(
             camera_available=camera_available,
             detected=True,
@@ -317,11 +385,25 @@ class ArucoCameraService:
             marker_type=marker_type,
             area=area,
             consecutive_frames=self._candidate_frames,
+            second_marker_id=second_marker_id,
+            second_area=second_area,
+            area_ratio=area_ratio,
+            ambiguous=False,
+            expected_marker_id=expected_marker_id,
         )
 
-    def _detect_frame(self, frame: Any) -> MarkerDetectionResult:
+    def _detect_frame(
+        self,
+        frame: Any,
+        *,
+        expected_marker_id: int | None,
+    ) -> MarkerDetectionResult:
         corners, marker_ids = self._detect_markers(frame)
-        return self.process_detections(marker_ids, corners)
+        return self.process_detections(
+            marker_ids,
+            corners,
+            expected_marker_id=expected_marker_id,
+        )
 
     def get_preview_jpeg(
         self,
@@ -669,4 +751,11 @@ def _read_positive_float_setting(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number") from exc
     if parsed <= 0:
         raise ValueError(f"{name} must be positive")
+    return parsed
+
+
+def _read_min_area_ratio_setting(name: str, default: float) -> float:
+    parsed = _read_positive_float_setting(name, default)
+    if parsed < 1:
+        raise ValueError(f"{name} must be at least 1")
     return parsed

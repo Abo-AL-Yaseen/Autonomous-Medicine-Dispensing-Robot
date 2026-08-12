@@ -145,6 +145,22 @@ class MissionExecutor:
 
         return mission, route_planner.plan(marker_id, mission.room_id)
 
+    def marker_for_node(self, node_name: str) -> int:
+        """Resolve a route node through the loaded Laravel map snapshot."""
+
+        with self._lock:
+            route_planner = self._route_planner
+        if route_planner is None:
+            raise MissionRouteUnavailableError(
+                "No Laravel navigation map is loaded for this mission"
+            )
+        node = route_planner.navigation_map.node_named(node_name)
+        if node is None:
+            raise NavigationMapError(
+                f"Node {node_name} is not present in Laravel's map"
+            )
+        return node.marker_id
+
     @property
     def destination_node(self) -> PhysicalNode | None:
         with self._lock:

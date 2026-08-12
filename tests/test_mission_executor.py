@@ -126,6 +126,7 @@ def test_accept_resolves_destination_from_laravel_map_without_hardware() -> None
 
     assert mission.id == 8
     assert executor.destination_node == PhysicalNode(2, "ROOM_1", "room", 11)
+    assert executor.marker_for_node("ROOM_1") == 11
     assert plan.decision is RouteDecision.LEFT
     assert plan.next_node == "ROOM_1"
     assert map_calls == ["load"]

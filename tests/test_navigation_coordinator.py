@@ -82,9 +82,15 @@ class FakeCamera:
     def __init__(self, *detections: MarkerDetectionResult) -> None:
         self.detections = list(detections)
         self.calls = 0
+        self.expected_marker_ids: list[int | None] = []
 
-    def detect(self) -> MarkerDetectionResult:
+    def detect(
+        self,
+        *,
+        expected_marker_id: int | None = None,
+    ) -> MarkerDetectionResult:
         self.calls += 1
+        self.expected_marker_ids.append(expected_marker_id)
         if not self.detections:
             raise AssertionError("No camera detection was configured")
         if len(self.detections) == 1:
@@ -271,6 +277,68 @@ def test_duplicate_event_dispatches_once_and_completion_rearms() -> None:
     service.process_serial_line(INTERSECTION_EVENT)
 
     assert hardware.navigation == ["STRAIGHT", "LEFT"]
+    assert camera.expected_marker_ids == [None, 1]
+
+
+def test_ambiguous_marker_selection_sends_zero_hardware_commands() -> None:
+    hardware = HardwareRecorder()
+    ambiguous = MarkerDetectionResult(
+        camera_available=True,
+        detected=True,
+        confirmed=False,
+        marker_id=0,
+        area=30000,
+        second_marker_id=1,
+        second_area=28000,
+        area_ratio=30000 / 28000,
+        ambiguous=True,
+        selection_error="AMBIGUOUS_MARKERS",
+    )
+    service = coordinator(going_executor(2), FakeCamera(ambiguous), hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == []
+    assert hardware.line == []
+    assert service.status()["last_error"] == "AMBIGUOUS_MARKERS"
+    assert service.status()["last_selection_ambiguous"] is True
+    assert service.status()["last_second_marker_id"] == 1
+
+
+def test_unexpected_route_marker_sends_zero_hardware_commands() -> None:
+    hardware = HardwareRecorder()
+    unexpected = MarkerDetectionResult(
+        camera_available=True,
+        detected=True,
+        confirmed=False,
+        marker_id=0,
+        area=50000,
+        expected_marker_id=1,
+        selection_error="UNEXPECTED_MARKER",
+    )
+    service = coordinator(going_executor(2), FakeCamera(unexpected), hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == []
+    assert service.status()["last_error"] == "UNEXPECTED_MARKER"
+
+
+def test_expected_room_marker_is_used_for_arrival_after_previous_decision() -> None:
+    executor = going_executor(1)
+    hardware = HardwareRecorder()
+    camera = FakeCamera(confirmed_marker(0), confirmed_marker(11))
+    service = coordinator(executor, camera, hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+    assert service.status()["expected_marker_id"] == 11
+    service.process_serial_line(INTERSECTION_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert camera.expected_marker_ids == [None, 11]
+    assert hardware.navigation == ["LEFT"]
+    assert hardware.line == ["stop"]
+    assert executor.state is MissionExecutionState.ARRIVED_AT_ROOM
 
 
 def test_failed_maneuver_is_reported_and_does_not_rearm() -> None:

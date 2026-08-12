@@ -39,6 +39,7 @@ The API reads these optional environment variables:
 | `MISSION_SCHEDULER_INTERVAL_SECONDS` | `5.0` seconds |
 | `MISSION_AUTO_EXECUTION_ENABLED` | `false` (reserved; does not auto-start yet) |
 | `NAVIGATION_AUTO_ENABLED` | `false` (intersection events are observable but cannot move the robot) |
+| `ARUCO_MIN_AREA_RATIO` | `1.4` (minimum largest/second-largest marker dominance) |
 | `MISSION_CLAIM_LEASE_SECONDS` | `60` seconds (Laravel stale-claim recovery) |
 
 ## Validation
@@ -77,6 +78,14 @@ approximately 12 FPS. The preview draws marker boxes, IDs, estimated areas, and
 camera resolution on a copy of each frame. `POST /camera/detect` continues to
 apply `DICT_4X4_50`, approved-marker filtering, minimum area, and consecutive
 frame confirmation to the unmodified buffered frames.
+
+Approved ArUco candidates are ranked by image area because the installed
+markers share one printed size. Candidates below `ARUCO_MIN_MARKER_AREA` are
+discarded. When two remain, the largest must be at least
+`ARUCO_MIN_AREA_RATIO` times the second largest or the frame is reported as
+ambiguous and confirmation resets. After a route decision, the coordinator
+also requires the marker of the expected next node resolved from the loaded
+Laravel map; it never replaces a larger unexpected marker with a smaller one.
 
 ## DS1302 RTC API
 

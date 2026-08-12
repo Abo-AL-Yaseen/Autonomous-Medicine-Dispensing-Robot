@@ -321,10 +321,15 @@ class FakeCameraService:
             "height": 480,
             "confirm_frames": 3,
             "min_marker_area": 2500.0,
+            "min_area_ratio": 1.4,
             "error": None if self.available else "CAMERA_UNAVAILABLE",
         }
 
-    def detect(self) -> MarkerDetectionResult:
+    def detect(
+        self,
+        *,
+        expected_marker_id: int | None = None,
+    ) -> MarkerDetectionResult:
         self.detect_calls += 1
         return self.detection
 
@@ -415,6 +420,7 @@ def client(
         assert settings.device == "/dev/video0"
         assert settings.confirm_frames == 3
         assert settings.min_marker_area == 2500.0
+        assert settings.min_area_ratio == 1.4
         return fake_camera  # type: ignore[return-value]
 
     application = create_app(
@@ -491,6 +497,7 @@ def test_camera_status_reports_independent_camera_configuration(
         "height": 480,
         "confirm_frames": 3,
         "min_marker_area": 2500.0,
+        "min_area_ratio": 1.4,
         "error": None,
     }
 
@@ -594,6 +601,12 @@ def test_navigation_status_reports_auto_disabled_by_default(
         "last_decision": None,
         "last_command": None,
         "last_error": None,
+        "expected_marker_id": None,
+        "last_marker_area": None,
+        "last_second_marker_id": None,
+        "last_second_marker_area": None,
+        "last_area_ratio": None,
+        "last_selection_ambiguous": False,
     }
 
 
