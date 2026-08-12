@@ -1,9 +1,8 @@
 import { getMedicines } from "@/src/services/laravel/medicineService";
-import { createMission } from "@/src/services/laravel/missionService";
+import { startImmediateDelivery } from "@/src/services/deliveryService";
 import { startRobotNavigation as startLaravelNavigation } from "@/src/services/laravel/navigationService";
 import { getLaravelRobotStatus } from "@/src/services/laravel/robotStatusService";
 import { getRooms } from "@/src/services/laravel/roomService";
-import { requireMissionId } from "@/src/services/apiAdapters";
 import {
     startLineFollowing,
     stopLineFollowing,
@@ -32,17 +31,7 @@ export const startDelivery = async (payload: {
   room_id: number;
   medicine_id: number;
   quantity: number;
-}) => {
-  const mission = await createMission(payload);
-  const missionId = requireMissionId(mission.id);
-  const startResult = await startLaravelNavigation(missionId);
-  return {
-    ok: true,
-    status: mission.status ?? "delivery started",
-    mission,
-    startResult,
-  };
-};
+}) => startImmediateDelivery(payload);
 
 export const loadRooms = () => getRooms();
 export const loadMedicines = () => getMedicines();

@@ -78,6 +78,42 @@ export interface CreateMissionRequest {
   scheduled_at?: string | null;
 }
 
+export type MissionExecutorState =
+  | "IDLE"
+  | "READY_FOR_EXECUTION"
+  | "STARTING"
+  | "GOING_TO_ROOM"
+  | "ARRIVED_AT_ROOM"
+  | "FAILED";
+
+export interface MissionExecutorStatus {
+  state: MissionExecutorState;
+  mission_id: number | null;
+  last_error: string | null;
+}
+
+export interface RobotRtcResponse {
+  success: boolean;
+  datetime: string;
+  source: string;
+  timezone: string;
+}
+
+export interface SchedulerTickResponse {
+  success: boolean;
+  result: string;
+  mission_id: number | null;
+  message: string | null;
+  executor: MissionExecutorStatus;
+}
+
+export interface ExecutorStartResponse {
+  success: boolean;
+  result: string;
+  message: string | null;
+  executor: MissionExecutorStatus;
+}
+
 export interface NavigationDecision {
   decision?: string;
   action?: string;

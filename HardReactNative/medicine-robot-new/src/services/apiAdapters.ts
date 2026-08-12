@@ -5,12 +5,17 @@ import type {
   MedicineDispensePayload,
   MedicineDispenseResponse,
   Mission,
+  MissionExecutorState,
+  MissionExecutorStatus,
   MovementResponse,
+  ExecutorStartResponse,
   RobotHardwareStatus,
   RobotMode,
   RobotPingResponse,
+  RobotRtcResponse,
   RobotStatus,
   Room,
+  SchedulerTickResponse,
   WaterDispenseResponse,
 } from "../types";
 
@@ -70,6 +75,115 @@ const optionalNullableString = (
     context,
     `expected '${field}' to be a string or null.`,
   );
+};
+
+const nullableMissionId = (
+  value: unknown,
+  context: string,
+): number | null =>
+  value === null
+    ? null
+    : requireInteger(value, context, "mission_id");
+
+const missionExecutorStates: readonly MissionExecutorState[] = [
+  "IDLE",
+  "READY_FOR_EXECUTION",
+  "STARTING",
+  "GOING_TO_ROOM",
+  "ARRIVED_AT_ROOM",
+  "FAILED",
+];
+
+export const normalizeMissionExecutorStatus = (
+  payload: unknown,
+): MissionExecutorStatus => {
+  const value = requireRecord(payload, "FastAPI executor status");
+  const state = requireString(
+    value.state,
+    "FastAPI executor status",
+    "state",
+  );
+  if (!missionExecutorStates.includes(state as MissionExecutorState)) {
+    return invalidResponse(
+      "FastAPI executor status",
+      `unsupported executor state '${state}'.`,
+    );
+  }
+
+  return {
+    state: state as MissionExecutorState,
+    mission_id: nullableMissionId(
+      value.mission_id,
+      "FastAPI executor status",
+    ),
+    last_error:
+      optionalNullableString(
+        value.last_error,
+        "FastAPI executor status",
+        "last_error",
+      ) ?? null,
+  };
+};
+
+export const normalizeRobotRtc = (payload: unknown): RobotRtcResponse => {
+  const value = requireRecord(payload, "FastAPI RTC");
+  const datetime = requireString(value.datetime, "FastAPI RTC", "datetime");
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(datetime)) {
+    return invalidResponse(
+      "FastAPI RTC",
+      "expected 'datetime' to be a timezone-naive ISO wall-clock.",
+    );
+  }
+
+  return {
+    success: requireBoolean(value.success, "FastAPI RTC", "success"),
+    datetime,
+    source: requireString(value.source, "FastAPI RTC", "source"),
+    timezone: requireString(value.timezone, "FastAPI RTC", "timezone"),
+  };
+};
+
+export const robotRtcToLaravelSchedule = (datetime: string): string => {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(datetime)) {
+    throw new Error("Robot RTC returned an invalid wall-clock value.");
+  }
+
+  return datetime.replace("T", " ");
+};
+
+export const normalizeSchedulerTick = (
+  payload: unknown,
+): SchedulerTickResponse => {
+  const value = requireRecord(payload, "FastAPI scheduler tick");
+  return {
+    success: requireBoolean(value.success, "FastAPI scheduler tick", "success"),
+    result: requireString(value.result, "FastAPI scheduler tick", "result"),
+    mission_id: nullableMissionId(value.mission_id, "FastAPI scheduler tick"),
+    message:
+      optionalNullableString(
+        value.message,
+        "FastAPI scheduler tick",
+        "message",
+      ) ?? null,
+    executor: normalizeMissionExecutorStatus(value.executor),
+  };
+};
+
+export const normalizeExecutorStart = (
+  payload: unknown,
+): ExecutorStartResponse => {
+  const value = requireRecord(payload, "FastAPI executor start");
+  return {
+    success: requireBoolean(value.success, "FastAPI executor start", "success"),
+    result: requireString(value.result, "FastAPI executor start", "result"),
+    message:
+      optionalNullableString(
+        value.message,
+        "FastAPI executor start",
+        "message",
+      ) ?? null,
+    executor: normalizeMissionExecutorStatus(value.executor),
+  };
 };
 
 export const unwrapLaravelResource = (

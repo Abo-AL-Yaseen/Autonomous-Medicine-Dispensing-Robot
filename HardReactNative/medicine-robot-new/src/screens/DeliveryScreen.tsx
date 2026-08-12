@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Ionicons } from "@expo/vector-icons";
 import { DateTimePickerAndroid } from "@react-native-community/datetimepicker";
 import {
@@ -54,6 +54,7 @@ export default function DeliveryScreen() {
   const [loadingMedicines, setLoadingMedicines] = useState(true);
   const [creatingMission, setCreatingMission] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const submissionInProgress = useRef(false);
 
   const robotStatus = useRobotStatus();
 
@@ -207,6 +208,8 @@ export default function DeliveryScreen() {
   };
 
   const handleStartDelivery = async () => {
+    if (submissionInProgress.current) return;
+
     const roomId = Number(selectedRoom);
     const medicineId = Number(selectedMedicine);
 
@@ -235,6 +238,7 @@ export default function DeliveryScreen() {
       }
     }
 
+    submissionInProgress.current = true;
     try {
       setCreatingMission(true);
       setError(null);
@@ -270,7 +274,14 @@ export default function DeliveryScreen() {
         return;
       }
 
-      await startDelivery(payload);
+      const delivery = await startDelivery(payload);
+      if (
+        delivery.executor.success !== true ||
+        delivery.executor.result !== "STARTED" ||
+        delivery.executor.executor.state !== "GOING_TO_ROOM"
+      ) {
+        throw new Error("FastAPI did not confirm that the mission started.");
+      }
       setMissionState("Moving");
       Alert.alert(
         "Mission Started",
@@ -283,7 +294,12 @@ export default function DeliveryScreen() {
           : "Unable to start the delivery mission.";
       setError(message);
       setMissionState("Waiting");
+      Alert.alert(
+        scheduleForLater ? "Mission Not Scheduled" : "Mission Not Started",
+        message,
+      );
     } finally {
+      submissionInProgress.current = false;
       setCreatingMission(false);
     }
   };

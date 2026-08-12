@@ -6,6 +6,7 @@ import {
   buildMedicineDispensePayload,
   buildRobotScheduleDateTime,
   normalizeFastApiDispense,
+  normalizeExecutorStart,
   normalizeFastApiHealth,
   normalizeFastApiStatus,
   normalizeFastApiWaterDispense,
@@ -15,8 +16,11 @@ import {
   normalizeNavigationStartErrorMessage,
   normalizeRoom,
   normalizeRooms,
+  normalizeRobotRtc,
+  normalizeSchedulerTick,
   normalizeSuccessResponse,
   requireMissionId,
+  robotRtcToLaravelSchedule,
   resolveRobotHardwareStatus,
   unwrapLaravelResource,
 } from "../src/services/apiAdapters.ts";
@@ -294,6 +298,64 @@ test("builds robot wall-clock schedule text without reading phone time", () => {
   assert.throws(
     () => buildRobotScheduleDateTime("2026-02-30", "20:30"),
     /valid scheduled date/i,
+  );
+});
+
+test("normalizes robot RTC and preserves its wall-clock for Laravel", () => {
+  const rtc = normalizeRobotRtc({
+    success: true,
+    datetime: "2026-08-12T12:30:45",
+    source: "DS1302",
+    timezone: "Asia/Hebron",
+  });
+
+  assert.equal(
+    robotRtcToLaravelSchedule(rtc.datetime),
+    "2026-08-12 12:30:45",
+  );
+});
+
+test("normalizes scheduler and executor confirmations", () => {
+  const ready = normalizeSchedulerTick({
+    success: true,
+    result: "READY_FOR_EXECUTION",
+    mission_id: 42,
+    message: null,
+    executor: {
+      state: "READY_FOR_EXECUTION",
+      mission_id: 42,
+      last_error: null,
+    },
+  });
+  const started = normalizeExecutorStart({
+    success: true,
+    result: "STARTED",
+    message: null,
+    executor: {
+      state: "GOING_TO_ROOM",
+      mission_id: 42,
+      last_error: null,
+    },
+  });
+
+  assert.equal(ready.executor.state, "READY_FOR_EXECUTION");
+  assert.equal(started.executor.state, "GOING_TO_ROOM");
+});
+
+test("rejects an unknown executor state instead of assuming movement", () => {
+  assert.throws(
+    () =>
+      normalizeExecutorStart({
+        success: true,
+        result: "STARTED",
+        message: null,
+        executor: {
+          state: "MOVING_MAYBE",
+          mission_id: 42,
+          last_error: null,
+        },
+      }),
+    /unsupported executor state/i,
   );
 });
 
