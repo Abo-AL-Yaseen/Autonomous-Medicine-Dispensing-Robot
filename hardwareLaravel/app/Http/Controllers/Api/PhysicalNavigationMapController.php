@@ -51,11 +51,21 @@ class PhysicalNavigationMapController extends Controller
                 'direction' => $connection->direction,
             ]);
 
+        $returnRoutes = Room::query()
+            ->orderBy('room_number')
+            ->get()
+            ->map(fn (Room $room): array => [
+                'room_id' => $room->id,
+                'room_number' => $room->room_number,
+                'steps' => config('navigation.return_routes.'.$room->room_number, []),
+            ]);
+
         return response()->json([
             'success' => true,
             'rooms' => $rooms,
             'nodes' => $nodes,
             'connections' => $connections,
+            'return_routes' => $returnRoutes,
         ]);
     }
 }

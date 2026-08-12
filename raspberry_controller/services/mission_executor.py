@@ -10,14 +10,17 @@ from enum import Enum
 from .laravel_api_client import ClaimedMission
 from .navigation import (
     LaravelRoutePlanner,
+    NavigationMapError,
     PhysicalNavigationMap,
     PhysicalNode,
+    RouteDecision,
     RoutePlan,
 )
 
 
 LINE_FOLLOW_STARTED_ACK = "ACK|LINE_FOLLOW_STARTED"
 LINE_FOLLOW_STOPPED_ACK = "ACK|LINE_FOLLOW_STOPPED"
+U_TURN_STARTED_ACK = "ACK|U_TURN_STARTED"
 
 
 class MissionExecutionState(str, Enum):
@@ -26,6 +29,8 @@ class MissionExecutionState(str, Enum):
     STARTING = "STARTING"
     GOING_TO_ROOM = "GOING_TO_ROOM"
     ARRIVED_AT_ROOM = "ARRIVED_AT_ROOM"
+    RETURNING_HOME = "RETURNING_HOME"
+    ARRIVED_HOME = "ARRIVED_HOME"
     FAILED = "FAILED"
 
 
@@ -37,6 +42,14 @@ class MissionStartResult(str, Enum):
     INVALID_MISSION = "INVALID_MISSION"
     LINE_FOLLOW_START_FAILED = "LINE_FOLLOW_START_FAILED"
     MISSION_STATUS_UPDATE_FAILED = "MISSION_STATUS_UPDATE_FAILED"
+
+
+class MissionReturnResult(str, Enum):
+    RETURN_STARTED = "RETURN_STARTED"
+    RETURN_NOT_ALLOWED = "RETURN_NOT_ALLOWED"
+    HARDWARE_UNAVAILABLE = "HARDWARE_UNAVAILABLE"
+    RETURN_ROUTE_UNAVAILABLE = "RETURN_ROUTE_UNAVAILABLE"
+    U_TURN_START_FAILED = "U_TURN_START_FAILED"
 
 
 class MissionRouteUnavailableError(RuntimeError):
@@ -57,6 +70,20 @@ class MissionStartOutcome:
         }
 
 
+@dataclass(frozen=True)
+class MissionReturnOutcome:
+    result: MissionReturnResult
+    success: bool
+    message: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "success": self.success,
+            "result": self.result.value,
+            "message": self.message,
+        }
+
+
 class MissionExecutor:
     """Start line following, then durably mark the claimed mission in progress."""
 
@@ -66,6 +93,7 @@ class MissionExecutor:
         hardware_available: Callable[[], bool] = lambda: False,
         start_line_follow: Callable[[], str] | None = None,
         stop_line_follow: Callable[[], str] | None = None,
+        u_turn: Callable[[], str] | None = None,
         mark_mission_in_progress: Callable[[ClaimedMission], None] | None = None,
         load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
         auto_execution_enabled: bool = False,
@@ -77,6 +105,7 @@ class MissionExecutor:
         self._hardware_available = hardware_available
         self._start_line_follow = start_line_follow
         self._stop_line_follow = stop_line_follow
+        self._u_turn = u_turn
         self._mark_mission_in_progress = mark_mission_in_progress
         self._load_navigation_map = load_navigation_map
         self._route_planner: LaravelRoutePlanner | None = None
@@ -145,6 +174,22 @@ class MissionExecutor:
 
         return mission, route_planner.plan(marker_id, mission.room_id)
 
+    def plan_return_route(self, marker_id: int) -> tuple[ClaimedMission, RoutePlan]:
+        """Plan the retained mission's Laravel-defined route to NODE_0."""
+
+        with self._lock:
+            mission = self._mission
+            route_planner = self._route_planner
+
+        if mission is None:
+            raise MissionRouteUnavailableError("No mission is loaded")
+        if route_planner is None:
+            raise MissionRouteUnavailableError(
+                "No Laravel navigation map is loaded for this mission"
+            )
+
+        return mission, route_planner.plan_return(marker_id, mission.room_id)
+
     def marker_for_node(self, node_name: str) -> int:
         """Resolve a route node through the loaded Laravel map snapshot."""
 
@@ -175,6 +220,79 @@ class MissionExecutor:
                     "MissionExecutor is not going to a room"
                 )
             self._state = MissionExecutionState.ARRIVED_AT_ROOM
+
+    def start_return_home(self) -> MissionReturnOutcome:
+        """Validate ARRIVED_AT_ROOM and start exactly one existing U-turn."""
+
+        with self._lock:
+            if self._state is not MissionExecutionState.ARRIVED_AT_ROOM:
+                return MissionReturnOutcome(
+                    MissionReturnResult.RETURN_NOT_ALLOWED,
+                    False,
+                    f"MissionExecutor is {self._state.value}.",
+                )
+            mission = self._mission
+            destination_node = self._destination_node
+            try:
+                hardware_is_available = self._hardware_available()
+            except Exception:
+                hardware_is_available = False
+            if not hardware_is_available:
+                self._last_error = "Robot hardware is unavailable."
+                return MissionReturnOutcome(
+                    MissionReturnResult.HARDWARE_UNAVAILABLE,
+                    False,
+                    self._last_error,
+                )
+
+        if mission is None or destination_node is None:
+            return MissionReturnOutcome(
+                MissionReturnResult.RETURN_ROUTE_UNAVAILABLE,
+                False,
+                "Mission destination context is unavailable.",
+            )
+
+        try:
+            if self._u_turn is None:
+                raise RuntimeError("U-turn operation is not configured")
+            with self._lock:
+                if self._state is not MissionExecutionState.ARRIVED_AT_ROOM:
+                    return MissionReturnOutcome(
+                        MissionReturnResult.RETURN_NOT_ALLOWED,
+                        False,
+                        f"MissionExecutor is {self._state.value}.",
+                    )
+                # Claim the return transition before hardware I/O so a second
+                # request cannot dispatch another U-turn concurrently.
+                self._state = MissionExecutionState.RETURNING_HOME
+                self._last_error = None
+            acknowledgement = self._u_turn()
+            if acknowledgement != U_TURN_STARTED_ACK:
+                raise RuntimeError(
+                    f"Unexpected U-turn acknowledgement: {acknowledgement!r}"
+                )
+        except Exception as exc:
+            message = self._stop_after_failure(f"U-turn start failed: {exc}")
+            with self._lock:
+                self._state = MissionExecutionState.FAILED
+                self._last_error = message
+            return MissionReturnOutcome(
+                MissionReturnResult.U_TURN_START_FAILED,
+                False,
+                message,
+            )
+
+        return MissionReturnOutcome(MissionReturnResult.RETURN_STARTED, True)
+
+    def mark_arrived_home(self) -> None:
+        """Record return arrival while retaining mission diagnostic context."""
+
+        with self._lock:
+            if self._state is not MissionExecutionState.RETURNING_HOME:
+                raise MissionRouteUnavailableError(
+                    "MissionExecutor is not returning home"
+                )
+            self._state = MissionExecutionState.ARRIVED_HOME
 
     def start_ready_mission(self) -> MissionStartOutcome:
         """Perform only READY -> line follow -> in_progress -> GOING_TO_ROOM."""

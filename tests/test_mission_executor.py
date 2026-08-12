@@ -15,7 +15,9 @@ from raspberry_controller.services.navigation import (
     PhysicalNavigationMap,
     PhysicalNode,
     PhysicalRoom,
+    ReturnRoute,
     RouteDecision,
+    RouteStep,
 )
 from raspberry_controller.services.mission_scheduler import (
     MissionScheduler,
@@ -107,6 +109,12 @@ def navigation_map_for_room_one() -> PhysicalNavigationMap:
         ),
         connections=(
             DirectedConnection("NODE_0", "ROOM_1", RouteDecision.LEFT),
+        ),
+        return_routes=(
+            ReturnRoute(
+                1,
+                (RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),),
+            ),
         ),
     )
 
@@ -284,3 +292,60 @@ def test_execution_step_calls_no_out_of_scope_hardware() -> None:
     assert dependencies.dispense_calls == []
     assert dependencies.water_calls == []
     assert dependencies.return_home_calls == []
+
+
+def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:
+    dependencies = FakeExecutionDependencies()
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+    )
+    mission = valid_mission()
+    assert executor.accept(mission) is True
+    assert executor.start_ready_mission().success is True
+    executor.mark_arrived_at_room()
+
+    first = executor.start_return_home()
+    second = executor.start_return_home()
+
+    assert first.success is True
+    assert first.result.value == "RETURN_STARTED"
+    assert second.success is False
+    assert second.result.value == "RETURN_NOT_ALLOWED"
+    assert u_turn_calls == ["u_turn"]
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+    assert executor.mission_id == mission.id
+    assert dependencies.updated_missions == [mission]
+    assert dependencies.dispense_calls == []
+    assert dependencies.water_calls == []
+
+
+def test_return_home_invalid_state_and_hardware_failure_do_not_turn() -> None:
+    dependencies = FakeExecutionDependencies()
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+    )
+
+    invalid_state = executor.start_return_home()
+    assert invalid_state.result.value == "RETURN_NOT_ALLOWED"
+
+    assert executor.accept(valid_mission()) is True
+    assert executor.start_ready_mission().success is True
+    executor.mark_arrived_at_room()
+    dependencies.available = False
+    unavailable = executor.start_return_home()
+
+    assert unavailable.result.value == "HARDWARE_UNAVAILABLE"
+    assert executor.state is MissionExecutionState.ARRIVED_AT_ROOM
+    assert u_turn_calls == []

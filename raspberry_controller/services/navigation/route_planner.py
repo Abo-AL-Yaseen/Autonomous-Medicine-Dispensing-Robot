@@ -8,6 +8,7 @@ from enum import Enum
 
 
 class RouteDecision(str, Enum):
+    U_TURN = "U_TURN"
     LEFT = "LEFT"
     RIGHT = "RIGHT"
     STRAIGHT = "STRAIGHT"
@@ -48,10 +49,17 @@ class DirectedConnection:
 
 
 @dataclass(frozen=True)
+class ReturnRoute:
+    room_id: int
+    steps: tuple["RouteStep", ...]
+
+
+@dataclass(frozen=True)
 class PhysicalNavigationMap:
     rooms: tuple[PhysicalRoom, ...]
     nodes: tuple[PhysicalNode, ...]
     connections: tuple[DirectedConnection, ...]
+    return_routes: tuple[ReturnRoute, ...] = ()
 
     def node_for_marker(self, marker_id: int) -> PhysicalNode | None:
         return next(
@@ -64,6 +72,12 @@ class PhysicalNavigationMap:
 
     def room_by_id(self, room_id: int) -> PhysicalRoom | None:
         return next((room for room in self.rooms if room.id == room_id), None)
+
+    def return_route_for_room(self, room_id: int) -> ReturnRoute | None:
+        return next(
+            (route for route in self.return_routes if route.room_id == room_id),
+            None,
+        )
 
 
 @dataclass(frozen=True)
@@ -159,6 +173,61 @@ class LaravelRoutePlanner:
                 f"Room {room_id} has an invalid destination mapping"
             )
         return node
+
+    def plan_return(self, current_marker_id: int, room_id: int) -> RoutePlan:
+        current_node = self.navigation_map.node_for_marker(current_marker_id)
+        if current_node is None:
+            raise UnknownMarkerError(
+                f"Marker {current_marker_id} is not present in Laravel's map"
+            )
+
+        home_node = self.navigation_map.node_for_marker(0)
+        if home_node is None or home_node.name != "NODE_0":
+            raise NavigationMapError("Laravel's map has no NODE_0 marker 0")
+
+        if current_node.name == home_node.name:
+            return RoutePlan(
+                current_node=current_node,
+                destination_node=home_node,
+                decision=RouteDecision.ARRIVED,
+                next_node=None,
+                steps=(),
+            )
+
+        route = self.navigation_map.return_route_for_room(room_id)
+        if route is None:
+            return RoutePlan(
+                current_node=current_node,
+                destination_node=home_node,
+                decision=RouteDecision.NO_ROUTE,
+                next_node=None,
+                steps=(),
+            )
+
+        try:
+            index = next(
+                index
+                for index, step in enumerate(route.steps)
+                if step.from_node == current_node.name
+            )
+        except StopIteration:
+            return RoutePlan(
+                current_node=current_node,
+                destination_node=home_node,
+                decision=RouteDecision.NO_ROUTE,
+                next_node=None,
+                steps=(),
+            )
+
+        steps = route.steps[index:]
+        step = steps[0]
+        return RoutePlan(
+            current_node=current_node,
+            destination_node=home_node,
+            decision=step.direction,
+            next_node=step.to_node,
+            steps=steps,
+        )
 
     def _shortest_path(
         self,

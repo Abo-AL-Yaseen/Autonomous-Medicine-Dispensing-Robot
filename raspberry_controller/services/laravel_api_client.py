@@ -12,7 +12,9 @@ from .navigation import (
     PhysicalNavigationMap,
     PhysicalNode,
     PhysicalRoom,
+    ReturnRoute,
     RouteDecision,
+    RouteStep,
 )
 
 
@@ -230,6 +232,10 @@ def _parse_navigation_map(payload: object) -> PhysicalNavigationMap:
     raw_nodes = _list(payload.get("nodes"), "nodes")
     raw_rooms = _list(payload.get("rooms"), "rooms")
     raw_connections = _list(payload.get("connections"), "connections")
+    raw_return_routes = _list(
+        payload.get("return_routes", []),
+        "return_routes",
+    )
 
     nodes: list[PhysicalNode] = []
     node_names: set[str] = set()
@@ -339,7 +345,11 @@ def _parse_navigation_map(payload: object) -> PhysicalNavigationMap:
             raise LaravelApiError(
                 "Laravel navigation map contains an unsupported direction"
             ) from exc
-        if direction in {RouteDecision.ARRIVED, RouteDecision.NO_ROUTE}:
+        if direction in {
+            RouteDecision.U_TURN,
+            RouteDecision.ARRIVED,
+            RouteDecision.NO_ROUTE,
+        }:
             raise LaravelApiError(
                 "Laravel navigation map contains a non-traversal direction"
             )
@@ -358,10 +368,74 @@ def _parse_navigation_map(payload: object) -> PhysicalNavigationMap:
             )
         )
 
+    return_routes: list[ReturnRoute] = []
+    return_room_ids: set[int] = set()
+    for route_index, raw_route in enumerate(raw_return_routes):
+        route = _object(raw_route, f"return_routes.{route_index}")
+        room_id = _positive_int(
+            route.get("room_id"),
+            f"return_routes.{route_index}.room_id",
+        )
+        if room_id not in room_ids or room_id in return_room_ids:
+            raise LaravelApiError(
+                "Laravel navigation map contains an invalid return route room"
+            )
+        return_room_ids.add(room_id)
+        raw_steps = _list(
+            route.get("steps"),
+            f"return_routes.{route_index}.steps",
+        )
+        steps: list[RouteStep] = []
+        previous_to_node: str | None = None
+        for step_index, raw_step in enumerate(raw_steps):
+            step = _object(
+                raw_step,
+                f"return_routes.{route_index}.steps.{step_index}",
+            )
+            from_node = _nonempty_string(
+                step.get("from_node"),
+                f"return_routes.{route_index}.steps.{step_index}.from_node",
+            )
+            to_node = _nonempty_string(
+                step.get("to_node"),
+                f"return_routes.{route_index}.steps.{step_index}.to_node",
+            )
+            if from_node not in nodes_by_name or to_node not in nodes_by_name:
+                raise LaravelApiError(
+                    "Laravel return route references an unknown node"
+                )
+            if previous_to_node is not None and previous_to_node != from_node:
+                raise LaravelApiError("Laravel return route is not contiguous")
+            try:
+                direction = RouteDecision(
+                    _nonempty_string(
+                        step.get("direction"),
+                        f"return_routes.{route_index}.steps.{step_index}.direction",
+                    )
+                )
+            except ValueError as exc:
+                raise LaravelApiError(
+                    "Laravel return route contains an unsupported direction"
+                ) from exc
+            if direction in {RouteDecision.ARRIVED, RouteDecision.NO_ROUTE}:
+                raise LaravelApiError(
+                    "Laravel return route contains a non-traversal direction"
+                )
+            if (step_index == 0) != (direction is RouteDecision.U_TURN):
+                raise LaravelApiError(
+                    "Laravel return route must begin with exactly one U_TURN"
+                )
+            steps.append(RouteStep(from_node, direction, to_node))
+            previous_to_node = to_node
+        if not steps or steps[-1].to_node != "NODE_0":
+            raise LaravelApiError("Laravel return route must end at NODE_0")
+        return_routes.append(ReturnRoute(room_id, tuple(steps)))
+
     return PhysicalNavigationMap(
         rooms=tuple(rooms),
         nodes=tuple(nodes),
         connections=tuple(connections),
+        return_routes=tuple(return_routes),
     )
 
 

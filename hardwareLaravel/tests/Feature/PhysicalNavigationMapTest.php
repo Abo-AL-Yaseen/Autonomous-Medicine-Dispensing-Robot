@@ -124,6 +124,60 @@ class PhysicalNavigationMapTest extends TestCase
         ];
     }
 
+    public static function approvedReturnRoutes(): array
+    {
+        return [
+            '1' => [
+                ['ROOM_1', 'U_TURN', 'NODE_0'],
+            ],
+            '2' => [
+                ['ROOM_2', 'U_TURN', 'NODE_2'],
+                ['NODE_2', 'LEFT', 'NODE_1'],
+                ['NODE_1', 'RIGHT', 'NODE_0'],
+            ],
+            '3' => [
+                ['ROOM_3', 'U_TURN', 'NODE_2'],
+                ['NODE_2', 'RIGHT', 'NODE_1'],
+                ['NODE_1', 'RIGHT', 'NODE_0'],
+            ],
+            '4' => [
+                ['ROOM_4', 'U_TURN', 'NODE_1'],
+                ['NODE_1', 'LEFT', 'NODE_0'],
+            ],
+            '5' => [
+                ['ROOM_5', 'U_TURN', 'NODE_1'],
+                ['NODE_1', 'STRAIGHT', 'NODE_0'],
+            ],
+        ];
+    }
+
+    public function test_return_routes_are_laravel_owned_and_reference_official_nodes(): void
+    {
+        $response = $this->getJson('/api/navigation/map')->assertOk();
+
+        $actual = collect($response->json('return_routes'))
+            ->mapWithKeys(fn (array $route): array => [
+                $route['room_number'] => collect($route['steps'])
+                    ->map(fn (array $step): array => [
+                        $step['from_node'],
+                        $step['direction'],
+                        $step['to_node'],
+                    ])
+                    ->all(),
+            ])
+            ->all();
+
+        $this->assertSame(self::approvedReturnRoutes(), $actual);
+
+        $nodeCodes = Node::query()->pluck('node_code')->all();
+        foreach ($response->json('return_routes') as $route) {
+            foreach ($route['steps'] as $step) {
+                $this->assertContains($step['from_node'], $nodeCodes);
+                $this->assertContains($step['to_node'], $nodeCodes);
+            }
+        }
+    }
+
     public function test_room_api_exposes_its_navigation_node_and_marker(): void
     {
         $room = Room::query()->where('room_number', '3')->firstOrFail();
@@ -153,6 +207,7 @@ class PhysicalNavigationMapTest extends TestCase
             ->assertJsonCount(5, 'rooms')
             ->assertJsonCount(8, 'nodes')
             ->assertJsonCount(7, 'connections')
+            ->assertJsonCount(5, 'return_routes')
             ->assertJsonPath('rooms.3.room_number', '4')
             ->assertJsonPath('rooms.3.destination_node.node_name', 'ROOM_4')
             ->assertJsonPath('rooms.3.destination_node.marker_id', 14);
@@ -166,6 +221,16 @@ class PhysicalNavigationMapTest extends TestCase
             ['from_node' => 'NODE_2', 'to_node' => 'ROOM_3', 'direction' => 'LEFT'],
             ['from_node' => 'NODE_2', 'to_node' => 'ROOM_2', 'direction' => 'RIGHT'],
         ], $response->json('connections'));
+
+        $this->assertSame([
+            'room_id' => Room::query()->where('room_number', '2')->value('id'),
+            'room_number' => '2',
+            'steps' => [
+                ['from_node' => 'ROOM_2', 'to_node' => 'NODE_2', 'direction' => 'U_TURN'],
+                ['from_node' => 'NODE_2', 'to_node' => 'NODE_1', 'direction' => 'LEFT'],
+                ['from_node' => 'NODE_1', 'to_node' => 'NODE_0', 'direction' => 'RIGHT'],
+            ],
+        ], $response->json('return_routes.1'));
 
         $this->assertSame($countsBefore, [
             Room::query()->count(),

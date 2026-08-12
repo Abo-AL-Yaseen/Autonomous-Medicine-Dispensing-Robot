@@ -24,13 +24,16 @@ from raspberry_controller.services.navigation.route_planner import (
     PhysicalNavigationMap,
     PhysicalNode,
     PhysicalRoom,
+    ReturnRoute,
     RouteDecision,
+    RouteStep,
 )
 
 
 INTERSECTION_EVENT = "EVENT|INTERSECTION|PATTERN=11111"
 INTERSECTION_COMPLETE = "EVENT|INTERSECTION_COMPLETE|DIRECTION=LEFT"
 INTERSECTION_FAILED = "EVENT|INTERSECTION_FAILED|DIRECTION=LEFT"
+U_TURN_COMPLETE = "EVENT|U_TURN_COMPLETE|PATTERN=11011"
 
 
 def approved_navigation_map() -> PhysicalNavigationMap:
@@ -63,7 +66,28 @@ def approved_navigation_map() -> PhysicalNavigationMap:
         DirectedConnection("NODE_2", "ROOM_3", RouteDecision.LEFT),
         DirectedConnection("NODE_2", "ROOM_2", RouteDecision.RIGHT),
     )
-    return PhysicalNavigationMap(rooms, nodes, connections)
+    return_routes = (
+        ReturnRoute(1, (RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),)),
+        ReturnRoute(2, (
+            RouteStep("ROOM_2", RouteDecision.U_TURN, "NODE_2"),
+            RouteStep("NODE_2", RouteDecision.LEFT, "NODE_1"),
+            RouteStep("NODE_1", RouteDecision.RIGHT, "NODE_0"),
+        )),
+        ReturnRoute(3, (
+            RouteStep("ROOM_3", RouteDecision.U_TURN, "NODE_2"),
+            RouteStep("NODE_2", RouteDecision.RIGHT, "NODE_1"),
+            RouteStep("NODE_1", RouteDecision.RIGHT, "NODE_0"),
+        )),
+        ReturnRoute(4, (
+            RouteStep("ROOM_4", RouteDecision.U_TURN, "NODE_1"),
+            RouteStep("NODE_1", RouteDecision.LEFT, "NODE_0"),
+        )),
+        ReturnRoute(5, (
+            RouteStep("ROOM_5", RouteDecision.U_TURN, "NODE_1"),
+            RouteStep("NODE_1", RouteDecision.STRAIGHT, "NODE_0"),
+        )),
+    )
+    return PhysicalNavigationMap(rooms, nodes, connections, return_routes)
 
 
 def mission_for_room(room_id: int) -> ClaimedMission:
@@ -116,6 +140,10 @@ class HardwareRecorder:
         self.line.append("stop")
         return "ACK|LINE_FOLLOW_STOPPED"
 
+    def u_turn(self) -> str:
+        self.navigation.append("U_TURN")
+        return "ACK|U_TURN_STARTED"
+
 
 def confirmed_marker(marker_id: int) -> MarkerDetectionResult:
     return MarkerDetectionResult(
@@ -134,17 +162,31 @@ def going_executor(
     room_id: int,
     *,
     load_map: Callable[[], PhysicalNavigationMap] | None = approved_navigation_map,
+    u_turn: Callable[[], str] | None = None,
 ) -> MissionExecutor:
     executor = MissionExecutor(
         hardware_available=lambda: True,
         start_line_follow=lambda: "ACK|LINE_FOLLOW_STARTED",
         stop_line_follow=lambda: "ACK|LINE_FOLLOW_STOPPED",
+        u_turn=u_turn,
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=load_map,
     )
     assert executor.accept(mission_for_room(room_id)) is True
     assert executor.start_ready_mission().success is True
     assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    return executor
+
+
+def arrived_executor(
+    room_id: int,
+    hardware: HardwareRecorder,
+) -> MissionExecutor:
+    executor = going_executor(
+        room_id,
+        u_turn=hardware.u_turn,
+    )
+    executor.mark_arrived_at_room()
     return executor
 
 
@@ -462,6 +504,112 @@ def test_arrived_stops_line_follow_but_does_not_deliver_or_release_mission() -> 
     assert executor.state is MissionExecutionState.ARRIVED_AT_ROOM
     assert executor.mission_id == mission_id
     assert service.status()["state"] == "ARRIVED_AT_ROOM"
+
+
+def test_return_home_requires_arrived_state_and_sends_no_command_otherwise() -> None:
+    hardware = HardwareRecorder()
+    executor = going_executor(1, u_turn=hardware.u_turn)
+    service = coordinator(executor, FakeCamera(), hardware)
+
+    result = service.begin_return_home()
+
+    assert result["success"] is False
+    assert result["result"] == "RETURN_NOT_ALLOWED"
+    assert hardware.navigation == []
+
+
+def test_return_u_turn_runs_once_and_stale_arrival_event_cannot_move() -> None:
+    hardware = HardwareRecorder()
+    camera = FakeCamera(confirmed_marker(0))
+    executor = arrived_executor(1, hardware)
+    service = coordinator(executor, camera, hardware)
+
+    first = service.begin_return_home()
+    second = service.begin_return_home()
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert first["result"] == "RETURN_STARTED"
+    assert second["result"] == "RETURN_NOT_ALLOWED"
+    assert hardware.navigation == ["U_TURN"]
+    assert camera.calls == 0
+    assert service.status()["expected_marker_id"] == 0
+
+
+@pytest.mark.parametrize(
+    ("room_id", "room_marker", "next_marker", "decision", "following_marker"),
+    [
+        (2, 12, 2, "LEFT", 1),
+        (3, 13, 2, "RIGHT", 1),
+        (4, 14, 1, "LEFT", 0),
+        (5, 15, 1, "STRAIGHT", 0),
+    ],
+)
+def test_returning_home_accepts_route_decisions_and_advances_expected_marker(
+    room_id: int,
+    room_marker: int,
+    next_marker: int,
+    decision: str,
+    following_marker: int,
+) -> None:
+    hardware = HardwareRecorder()
+    camera = FakeCamera(confirmed_marker(next_marker))
+    executor = arrived_executor(room_id, hardware)
+    service = coordinator(executor, camera, hardware)
+
+    result = service.begin_return_home()
+    assert result["expected_marker_id"] == next_marker
+    service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+    assert camera.expected_marker_ids == [next_marker]
+    assert hardware.navigation == ["U_TURN", decision]
+    assert service.status()["expected_marker_id"] == following_marker
+
+
+def test_unexpected_marker_while_returning_fails_without_direction_command() -> None:
+    hardware = HardwareRecorder()
+    unexpected = MarkerDetectionResult(
+        camera_available=True,
+        detected=True,
+        confirmed=False,
+        marker_id=1,
+        area=50000,
+        expected_marker_id=2,
+        selection_error="UNEXPECTED_MARKER",
+    )
+    executor = arrived_executor(2, hardware)
+    service = coordinator(executor, FakeCamera(unexpected), hardware)
+
+    service.begin_return_home()
+    service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == ["U_TURN"]
+    assert service.status()["last_error"] == "UNEXPECTED_MARKER"
+
+
+def test_marker_zero_stops_and_marks_arrived_home_without_completing_mission() -> None:
+    hardware = HardwareRecorder()
+    executor = arrived_executor(1, hardware)
+    mission_id = executor.mission_id
+    service = coordinator(executor, FakeCamera(confirmed_marker(0)), hardware)
+
+    service.begin_return_home()
+    service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == ["U_TURN"]
+    assert hardware.line == ["stop"]
+    assert hardware.dispense == []
+    assert hardware.water == []
+    assert executor.state is MissionExecutionState.ARRIVED_HOME
+    assert executor.mission_id == mission_id
+    assert service.status()["state"] == "ARRIVED_HOME"
+    assert service.status()["last_marker_id"] == 0
+    assert service.status()["last_node"] == "NODE_0"
+    assert service.status()["last_decision"] == "ARRIVED"
+    assert service.status()["last_error"] is None
 
 
 def test_disabled_preview_never_moves_or_changes_executor_state() -> None:

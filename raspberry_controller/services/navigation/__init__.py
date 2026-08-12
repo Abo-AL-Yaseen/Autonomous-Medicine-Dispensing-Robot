@@ -8,6 +8,7 @@ from .route_planner import (
     PhysicalRoom,
     RouteDecision,
     RoutePlan,
+    ReturnRoute,
     RouteStep,
     UnknownMarkerError,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "PhysicalRoom",
     "RouteDecision",
     "RoutePlan",
+    "ReturnRoute",
     "RouteStep",
     "UnknownMarkerError",
 ]

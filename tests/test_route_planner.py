@@ -10,7 +10,9 @@ from raspberry_controller.services.navigation import (
     PhysicalNavigationMap,
     PhysicalNode,
     PhysicalRoom,
+    ReturnRoute,
     RouteDecision,
+    RouteStep,
     UnknownMarkerError,
 )
 
@@ -45,7 +47,28 @@ def approved_navigation_map() -> PhysicalNavigationMap:
         DirectedConnection("NODE_2", "ROOM_3", RouteDecision.LEFT),
         DirectedConnection("NODE_2", "ROOM_2", RouteDecision.RIGHT),
     )
-    return PhysicalNavigationMap(rooms, nodes, connections)
+    return_routes = (
+        ReturnRoute(1, (RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),)),
+        ReturnRoute(2, (
+            RouteStep("ROOM_2", RouteDecision.U_TURN, "NODE_2"),
+            RouteStep("NODE_2", RouteDecision.LEFT, "NODE_1"),
+            RouteStep("NODE_1", RouteDecision.RIGHT, "NODE_0"),
+        )),
+        ReturnRoute(3, (
+            RouteStep("ROOM_3", RouteDecision.U_TURN, "NODE_2"),
+            RouteStep("NODE_2", RouteDecision.RIGHT, "NODE_1"),
+            RouteStep("NODE_1", RouteDecision.RIGHT, "NODE_0"),
+        )),
+        ReturnRoute(4, (
+            RouteStep("ROOM_4", RouteDecision.U_TURN, "NODE_1"),
+            RouteStep("NODE_1", RouteDecision.LEFT, "NODE_0"),
+        )),
+        ReturnRoute(5, (
+            RouteStep("ROOM_5", RouteDecision.U_TURN, "NODE_1"),
+            RouteStep("NODE_1", RouteDecision.STRAIGHT, "NODE_0"),
+        )),
+    )
+    return PhysicalNavigationMap(rooms, nodes, connections, return_routes)
 
 
 @pytest.mark.parametrize(
@@ -144,3 +167,42 @@ def test_missing_directed_path_returns_no_route() -> None:
     assert plan.destination_node.name == "ROOM_4"
     assert plan.decision is RouteDecision.NO_ROUTE
     assert plan.steps == ()
+
+
+@pytest.mark.parametrize(
+    ("room_id", "marker_id", "expected_steps"),
+    [
+        (1, 11, [("ROOM_1", "U_TURN", "NODE_0")]),
+        (2, 12, [
+            ("ROOM_2", "U_TURN", "NODE_2"),
+            ("NODE_2", "LEFT", "NODE_1"),
+            ("NODE_1", "RIGHT", "NODE_0"),
+        ]),
+        (3, 13, [
+            ("ROOM_3", "U_TURN", "NODE_2"),
+            ("NODE_2", "RIGHT", "NODE_1"),
+            ("NODE_1", "RIGHT", "NODE_0"),
+        ]),
+        (4, 14, [
+            ("ROOM_4", "U_TURN", "NODE_1"),
+            ("NODE_1", "LEFT", "NODE_0"),
+        ]),
+        (5, 15, [
+            ("ROOM_5", "U_TURN", "NODE_1"),
+            ("NODE_1", "STRAIGHT", "NODE_0"),
+        ]),
+    ],
+)
+def test_exact_approved_return_routes(
+    room_id: int,
+    marker_id: int,
+    expected_steps: list[tuple[str, str, str]],
+) -> None:
+    planner = LaravelRoutePlanner(approved_navigation_map())
+    plan = planner.plan_return(marker_id, room_id)
+
+    assert [
+        (step.from_node, step.direction.value, step.to_node)
+        for step in plan.steps
+    ] == expected_steps
+    assert planner.plan_return(0, room_id).decision is RouteDecision.ARRIVED

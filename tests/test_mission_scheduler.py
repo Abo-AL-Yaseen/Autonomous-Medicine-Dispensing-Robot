@@ -474,6 +474,19 @@ def test_laravel_client_loads_the_read_only_navigation_map_contract() -> None:
                         "direction": "LEFT",
                     }
                 ],
+                "return_routes": [
+                    {
+                        "room_id": 1,
+                        "room_number": "1",
+                        "steps": [
+                            {
+                                "from_node": "ROOM_1",
+                                "to_node": "NODE_0",
+                                "direction": "U_TURN",
+                            }
+                        ],
+                    }
+                ],
             },
         )
 
@@ -491,6 +504,7 @@ def test_laravel_client_loads_the_read_only_navigation_map_contract() -> None:
     assert navigation_map.node_for_marker(0).name == "NODE_0"  # type: ignore[union-attr]
     assert navigation_map.room_by_id(1).destination_node == "ROOM_1"  # type: ignore[union-attr]
     assert navigation_map.connections[0].direction.value == "LEFT"
+    assert navigation_map.return_routes[0].steps[0].direction.value == "U_TURN"
 
 
 def test_laravel_client_maps_timeout_to_clear_error() -> None:

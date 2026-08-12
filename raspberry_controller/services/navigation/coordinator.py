@@ -20,6 +20,8 @@ from .route_planner import NavigationMapError, RouteDecision, UnknownMarkerError
 INTERSECTION_EVENT_PREFIX = "EVENT|INTERSECTION|"
 INTERSECTION_COMPLETE_PREFIX = "EVENT|INTERSECTION_COMPLETE|"
 INTERSECTION_FAILED_PREFIX = "EVENT|INTERSECTION_FAILED|"
+U_TURN_COMPLETE_PREFIX = "EVENT|U_TURN_COMPLETE|"
+U_TURN_FAILED_PREFIX = "EVENT|U_TURN_FAILED"
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,8 @@ class NavigationCoordinatorState(str, Enum):
     PROCESSING_INTERSECTION = "PROCESSING_INTERSECTION"
     COMMAND_SENT = "COMMAND_SENT"
     ARRIVED_AT_ROOM = "ARRIVED_AT_ROOM"
+    RETURNING_HOME = "RETURNING_HOME"
+    ARRIVED_HOME = "ARRIVED_HOME"
     ERROR = "ERROR"
 
 
@@ -140,10 +144,92 @@ class NavigationCoordinator:
             self._record_error("INTERSECTION_MANEUVER_FAILED")
             return
 
+        if line.startswith(U_TURN_COMPLETE_PREFIX):
+            with self._lock:
+                if self._executor.state is MissionExecutionState.RETURNING_HOME:
+                    self._armed = True
+                    self._state = NavigationCoordinatorState.RETURNING_HOME
+                    self._last_error = None
+            return
+
+        if line.startswith(U_TURN_FAILED_PREFIX):
+            with self._lock:
+                self._last_intersection_event = line
+            self._record_error("U_TURN_MANEUVER_FAILED")
+            return
+
         if not line.startswith(INTERSECTION_EVENT_PREFIX):
             return
 
         self._process_intersection(line, execute_command=True, enforce_debounce=True)
+
+    def begin_return_home(self) -> dict[str, object]:
+        """Start one validated room U-turn and prepare return marker tracking."""
+
+        with self._processing_lock:
+            if self._executor.state is not MissionExecutionState.ARRIVED_AT_ROOM:
+                return {
+                    "success": False,
+                    "result": "RETURN_NOT_ALLOWED",
+                    "message": (
+                        f"MissionExecutor is {self._executor.state.value}."
+                    ),
+                    "executor": self._executor.status(),
+                }
+            destination = self._executor.destination_node
+            try:
+                if destination is None:
+                    raise MissionRouteUnavailableError(
+                        "Mission destination context is unavailable."
+                    )
+                _, plan = self._executor.plan_return_route(destination.marker_id)
+                if (
+                    plan.decision is not RouteDecision.U_TURN
+                    or plan.next_node is None
+                ):
+                    raise MissionRouteUnavailableError(
+                        "Return route does not begin with U_TURN."
+                    )
+                expected_marker_id = self._executor.marker_for_node(
+                    plan.next_node
+                )
+            except (MissionRouteUnavailableError, NavigationMapError) as exc:
+                return {
+                    "success": False,
+                    "result": "RETURN_ROUTE_UNAVAILABLE",
+                    "message": str(exc),
+                    "executor": self._executor.status(),
+                }
+
+            # Disarm before sending U_TURN. Its asynchronous completion can
+            # follow the ACK immediately, and must be allowed to re-arm us.
+            with self._lock:
+                self._armed = False
+                self._expected_marker_id = expected_marker_id
+                self._expected_mission_id = self._executor.mission_id
+                self._last_command = None
+                self._last_error = None
+                self._state = NavigationCoordinatorState.RETURNING_HOME
+
+            outcome = self._executor.start_return_home()
+            if not outcome.success:
+                with self._lock:
+                    self._expected_marker_id = None
+                    self._last_error = outcome.result.value
+                    self._state = NavigationCoordinatorState.ERROR
+                return {
+                    **outcome.as_dict(),
+                    "executor": self._executor.status(),
+                }
+
+            with self._lock:
+                self._last_command = "U_TURN"
+                self._last_error = None
+            return {
+                **outcome.as_dict(),
+                "expected_marker_id": expected_marker_id,
+                "executor": self._executor.status(),
+            }
 
     def preview_test_intersection(self) -> dict[str, object]:
         """Evaluate a synthetic event without ever dispatching a command."""
@@ -245,7 +331,11 @@ class NavigationCoordinator:
                     self._armed = False
                 self._state = NavigationCoordinatorState.PROCESSING_INTERSECTION
 
-            if self._executor.state is not MissionExecutionState.GOING_TO_ROOM:
+            executor_state = self._executor.state
+            if executor_state not in {
+                MissionExecutionState.GOING_TO_ROOM,
+                MissionExecutionState.RETURNING_HOME,
+            }:
                 self._record_error("EXECUTOR_NOT_GOING_TO_ROOM")
                 return
 
@@ -284,7 +374,10 @@ class NavigationCoordinator:
                 return
 
             try:
-                _, plan = self._executor.plan_route(detection.marker_id)
+                if executor_state is MissionExecutionState.RETURNING_HOME:
+                    _, plan = self._executor.plan_return_route(detection.marker_id)
+                else:
+                    _, plan = self._executor.plan_route(detection.marker_id)
             except UnknownMarkerError:
                 self._record_error("UNKNOWN_MARKER")
                 return
@@ -319,10 +412,17 @@ class NavigationCoordinator:
                     self._stop_line_follow()
                 except Exception:
                     stop_error = "LINE_FOLLOW_STOP_FAILED"
-                self._executor.mark_arrived_at_room()
+                if executor_state is MissionExecutionState.RETURNING_HOME:
+                    self._executor.mark_arrived_home()
+                else:
+                    self._executor.mark_arrived_at_room()
                 with self._lock:
                     self._expected_marker_id = None
-                    self._state = NavigationCoordinatorState.ARRIVED_AT_ROOM
+                    self._state = (
+                        NavigationCoordinatorState.ARRIVED_HOME
+                        if executor_state is MissionExecutionState.RETURNING_HOME
+                        else NavigationCoordinatorState.ARRIVED_AT_ROOM
+                    )
                     self._last_error = stop_error
                 return
 

@@ -32,7 +32,9 @@ from raspberry_controller.services.navigation import (
     PhysicalNavigationMap,
     PhysicalNode,
     PhysicalRoom,
+    ReturnRoute,
     RouteDecision,
+    RouteStep,
 )
 from raspberry_controller.services.mission_scheduler import SchedulerSettings
 
@@ -281,7 +283,14 @@ def _navigation_map_fixture() -> PhysicalNavigationMap:
         DirectedConnection("NODE_2", "ROOM_3", RouteDecision.LEFT),
         DirectedConnection("NODE_2", "ROOM_2", RouteDecision.RIGHT),
     )
-    return PhysicalNavigationMap(rooms, nodes, connections)
+    return_routes = tuple(
+        ReturnRoute(
+            room_id,
+            (RouteStep(f"ROOM_{room_id}", RouteDecision.U_TURN, "NODE_0"),),
+        )
+        for room_id in range(1, 6)
+    )
+    return PhysicalNavigationMap(rooms, nodes, connections, return_routes)
 
 
 class FakeCameraService:
@@ -452,6 +461,7 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/scheduler/tick" in body["endpoints"]
     assert "/executor/status" in body["endpoints"]
     assert "/executor/start" in body["endpoints"]
+    assert "/executor/return-home" in body["endpoints"]
     assert "/water/dispense" in body["endpoints"]
     assert "/movement/stop" in body["endpoints"]
     assert "/movement/manual/forward" in body["endpoints"]
@@ -936,6 +946,18 @@ def test_executor_start_uses_high_level_line_follow_then_laravel(
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
     assert fake_hardware.return_home_calls == []
+
+
+def test_executor_return_home_rejects_non_arrived_state_without_movement(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.post("/executor/return-home")
+
+    assert response.status_code == 409
+    assert response.json()["result"] == "RETURN_NOT_ALLOWED"
+    assert fake_hardware.navigation_calls == []
+    assert fake_hardware.line_calls == []
 
 
 def test_executor_start_does_nothing_when_hardware_is_unavailable(

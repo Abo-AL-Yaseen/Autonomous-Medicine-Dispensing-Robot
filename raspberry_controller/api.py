@@ -36,6 +36,7 @@ from .services.mission_service import MissionService
 from .services.laravel_api_client import ClaimedMission, LaravelApiClient
 from .services.mission_executor import (
     MissionExecutor,
+    MissionReturnResult,
     MissionRouteUnavailableError,
     MissionStartResult,
 )
@@ -264,6 +265,7 @@ def create_app(
             hardware_available=hardware_available,
             start_line_follow=start_executor_line_follow,
             stop_line_follow=stop_executor_line_follow,
+            u_turn=lambda: run_navigation_hardware(controller.u_turn),
             mark_mission_in_progress=laravel_client.start_claimed_mission,
             load_navigation_map=laravel_client.get_navigation_map,
             auto_execution_enabled=scheduler_settings.auto_execution_enabled,
@@ -368,6 +370,7 @@ def create_app(
                 "/scheduler/tick",
                 "/executor/status",
                 "/executor/start",
+                "/executor/return-home",
                 "/dispense",
                 "/water/dispense",
                 "/movement/forward",
@@ -514,6 +517,21 @@ def create_app(
                 "executor": executor.status(),
             },
         )
+
+    @application.post("/executor/return-home")
+    def executor_return_home(request: Request) -> JSONResponse:
+        coordinator: NavigationCoordinator = (
+            request.app.state.navigation_coordinator
+        )
+        result = coordinator.begin_return_home()
+        status_code = {
+            MissionReturnResult.RETURN_STARTED.value: 200,
+            MissionReturnResult.RETURN_NOT_ALLOWED.value: 409,
+            MissionReturnResult.HARDWARE_UNAVAILABLE.value: 503,
+            MissionReturnResult.RETURN_ROUTE_UNAVAILABLE.value: 422,
+            MissionReturnResult.U_TURN_START_FAILED.value: 502,
+        }.get(str(result["result"]), 500)
+        return JSONResponse(status_code=status_code, content=result)
 
     @application.post("/dispense")
     def dispense(payload: DispenseRequest, request: Request) -> dict[str, object]:
