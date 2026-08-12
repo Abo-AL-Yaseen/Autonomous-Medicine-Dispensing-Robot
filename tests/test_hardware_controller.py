@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from datetime import datetime
+from queue import Empty, Queue
+from typing import Iterator
 
 import pytest
 
@@ -13,6 +16,11 @@ from raspberry_controller.hardware_controller import (
     RobotHardwareController,
     SerialController,
     UnexpectedSerialResponse,
+)
+from raspberry_controller.services.laravel_api_client import ClaimedMission
+from raspberry_controller.services.mission_executor import (
+    MissionExecutionState,
+    MissionExecutor,
 )
 
 
@@ -27,6 +35,10 @@ class RecordingSerialController:
 
     def send_command(self, command: str) -> None:
         self.commands.append(command)
+
+    @contextmanager
+    def response_transaction(self) -> Iterator[None]:
+        yield
 
     def wait_for_response(
         self,
@@ -407,6 +419,27 @@ class FakeSerialConnection:
         self.is_open = False
 
 
+class CommandResponsiveSerialConnection(FakeSerialConnection):
+    """Release scripted ESP32 lines only after their command is written."""
+
+    def __init__(self, responses: dict[bytes, list[bytes]]) -> None:
+        super().__init__([])
+        self.command_responses = responses
+        self.pending_lines: Queue[bytes] = Queue()
+
+    def write(self, payload: bytes) -> None:
+        super().write(payload)
+        for line in self.command_responses.get(payload, []):
+            self.pending_lines.put(line)
+
+    def readline(self) -> bytes:
+        self.readline_threads.append(threading.current_thread().name)
+        try:
+            return self.pending_lines.get(timeout=self.timeout)
+        except Empty:
+            return b""
+
+
 def test_async_line_event_is_skipped_before_valid_response() -> None:
     connection = FakeSerialConnection(
         [
@@ -477,6 +510,109 @@ def test_one_persistent_reader_dispatches_event_and_command_response() -> None:
         "EVENT|INTERSECTION|PATTERN=00000"
     )
     assert set(connection.readline_threads) == {"serial-reader-mock"}
+    esp32.close()
+
+
+def test_line_follow_ack_then_intersection_event_are_routed_independently() -> None:
+    connection = CommandResponsiveSerialConnection(
+        {
+            b"START_LINE_FOLLOW\n": [
+                b"ACK|LINE_FOLLOW_STARTED\n"
+                b"EVENT|INTERSECTION|PATTERN=00000\n",
+            ],
+            b"STOP_LINE_FOLLOW\n": [b"ACK|LINE_FOLLOW_STOPPED\n"],
+        }
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.1)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.start_line_follow() == "ACK|LINE_FOLLOW_STARTED"
+    assert controller.get_esp32_event(0.1) == (
+        "EVENT|INTERSECTION|PATTERN=00000"
+    )
+    assert controller.stop_line_follow() == "ACK|LINE_FOLLOW_STOPPED"
+    assert connection.writes == [
+        b"START_LINE_FOLLOW\n",
+        b"STOP_LINE_FOLLOW\n",
+    ]
+    assert set(connection.readline_threads) == {"serial-reader-mock"}
+    esp32.close()
+
+
+def test_fragmented_line_follow_ack_is_buffered_until_newline() -> None:
+    connection = CommandResponsiveSerialConnection(
+        {
+            b"START_LINE_FOLLOW\n": [
+                b"ACK|LINE_FOLLOW_",
+                b"STARTED\n",
+            ],
+            b"STOP_LINE_FOLLOW\n": [
+                b"ACK|LINE_FOLLOW_",
+                b"STOPPED\n",
+            ],
+        }
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.1)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.start_line_follow() == "ACK|LINE_FOLLOW_STARTED"
+    assert controller.stop_line_follow() == "ACK|LINE_FOLLOW_STOPPED"
+    assert controller.get_esp32_event(0.01) is None
+    esp32.close()
+
+
+def test_mission_executor_start_preserves_immediate_intersection_event() -> None:
+    connection = CommandResponsiveSerialConnection(
+        {
+            b"START_LINE_FOLLOW\n": [
+                b"ACK|LINE_FOLLOW_STARTED\n"
+                b"EVENT|INTERSECTION|PATTERN=00000\n",
+            ],
+        }
+    )
+    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.1)
+    esp32._connection = connection
+    controller = RobotHardwareController(
+        esp32=esp32,
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+    started_missions: list[int] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=controller.start_line_follow,
+        stop_line_follow=controller.stop_line_follow,
+        mark_mission_in_progress=lambda mission: started_missions.append(
+            mission.id
+        ),
+    )
+    mission = ClaimedMission(
+        id=42,
+        room_id=1,
+        medicine_id=2,
+        quantity=1,
+        room_number="1",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-12T09:00:00+00:00",
+    )
+
+    assert executor.accept(mission) is True
+    outcome = executor.start_ready_mission()
+
+    assert outcome.success is True
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert started_missions == [42]
+    assert controller.get_esp32_event(0.1) == (
+        "EVENT|INTERSECTION|PATTERN=00000"
+    )
+    assert connection.writes == [b"START_LINE_FOLLOW\n"]
     esp32.close()
 
 

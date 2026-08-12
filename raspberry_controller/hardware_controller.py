@@ -9,8 +9,9 @@ import queue
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 
 ESP32_PORT = (
@@ -25,6 +26,7 @@ ESP32_STARTUP_DELAY_SECONDS = 4.0
 ARDUINO_UNO_STARTUP_DELAY_SECONDS = 2.0
 DEFAULT_READ_TIMEOUT_SECONDS = 10.0
 SERIAL_POLL_TIMEOUT_SECONDS = 0.25
+MAX_SERIAL_LINE_BYTES = 4096
 
 
 class HardwareControllerError(RuntimeError):
@@ -84,6 +86,8 @@ class SerialController:
         self._reader_lock = threading.Lock()
         self._reader_thread: threading.Thread | None = None
         self._reader_error: SerialConnectionError | None = None
+        self._response_state_lock = threading.Lock()
+        self._active_response_queue: queue.Queue[str] | None = None
 
     def open(self) -> None:
         """Open the port, wait for a possible board reset, and discard boot text."""
@@ -216,6 +220,8 @@ class SerialController:
             raise ValueError("overall_timeout must be positive")
         deadline = time.monotonic() + timeout
         last_non_empty_response: str | None = None
+        with self._response_state_lock:
+            response_queue = self._active_response_queue or self._response_queue
 
         while True:
             remaining_time = deadline - time.monotonic()
@@ -224,7 +230,7 @@ class SerialController:
 
             # Keep each read short so asynchronous lines cannot extend the deadline.
             try:
-                response = self._response_queue.get(
+                response = response_queue.get(
                     timeout=min(SERIAL_POLL_TIMEOUT_SECONDS, remaining_time)
                 )
             except queue.Empty:
@@ -260,6 +266,22 @@ class SerialController:
             )
         raise SerialResponseTimeout(timeout_message)
 
+    @contextmanager
+    def response_transaction(self) -> Iterator[None]:
+        """Register the command response destination before command bytes are sent."""
+
+        transaction_queue: queue.Queue[str] = queue.Queue()
+        with self._response_state_lock:
+            if self._active_response_queue is not None:
+                raise RuntimeError("A serial response transaction is already active")
+            self._active_response_queue = transaction_queue
+        try:
+            yield
+        finally:
+            with self._response_state_lock:
+                if self._active_response_queue is transaction_queue:
+                    self._active_response_queue = None
+
     def get_async_line(self, timeout: float = 0.0) -> str | None:
         """Return one line dispatched by the sole serial reader as telemetry."""
 
@@ -293,6 +315,7 @@ class SerialController:
             self._reader_thread.start()
 
     def _reader_loop(self, connection: Any) -> None:
+        pending_bytes = bytearray()
         while not self._reader_stop.is_set():
             connection.timeout = min(
                 SERIAL_POLL_TIMEOUT_SECONDS,
@@ -312,14 +335,31 @@ class SerialController:
                 self._reader_stop.wait(0.001)
                 continue
 
-            line = raw_line.decode("ascii", errors="replace").rstrip("\r\n")
-            if not line:
-                continue
+            pending_bytes.extend(raw_line)
+            while b"\n" in pending_bytes:
+                raw_complete_line, _, remainder = pending_bytes.partition(b"\n")
+                pending_bytes = bytearray(remainder)
+                line = raw_complete_line.decode(
+                    "ascii",
+                    errors="replace",
+                ).rstrip("\r")
+                if line:
+                    self._dispatch_complete_line(line)
 
-            if self._is_async_line(line):
-                self._event_queue.put(line)
-            else:
-                self._response_queue.put(line)
+            if len(pending_bytes) > MAX_SERIAL_LINE_BYTES:
+                self._reader_error = SerialConnectionError(
+                    f"SERIAL_LINE_TOO_LONG|PORT={_clean_field(self.port)}"
+                )
+                return
+
+    def _dispatch_complete_line(self, line: str) -> None:
+        if self._is_async_line(line):
+            self._event_queue.put(line)
+            return
+
+        with self._response_state_lock:
+            response_queue = self._active_response_queue or self._response_queue
+        response_queue.put(line)
 
     @staticmethod
     def _is_async_line(line: str) -> bool:
@@ -340,7 +380,9 @@ class SerialController:
     def _reset_dispatcher(self) -> None:
         self._reader_stop.set()
         self._reader_thread = None
-        self._response_queue = queue.Queue()
+        with self._response_state_lock:
+            self._response_queue = queue.Queue()
+            self._active_response_queue = None
         self._event_queue = queue.Queue()
         self._reader_error = None
 
@@ -695,16 +737,19 @@ class RobotHardwareController:
         acknowledgement = f"ACK|WATER|DURATION_MS={duration_ms}"
         completion = f"DONE|WATER|DURATION_MS={duration_ms}"
         with self._esp32_transaction_lock:
-            self.esp32.send_command(command)
-            self.esp32.wait_for_response(
-                acknowledgement,
-                response_prefix="ACK|WATER|",
-            )
-            self.esp32.wait_for_response(
-                completion,
-                response_prefix="DONE|WATER|",
-                overall_timeout=(duration_ms / 1000) + self.esp32.read_timeout,
-            )
+            with self.esp32.response_transaction():
+                self.esp32.send_command(command)
+                self.esp32.wait_for_response(
+                    acknowledgement,
+                    response_prefix="ACK|WATER|",
+                )
+                self.esp32.wait_for_response(
+                    completion,
+                    response_prefix="DONE|WATER|",
+                    overall_timeout=(
+                        (duration_ms / 1000) + self.esp32.read_timeout
+                    ),
+                )
 
         return {"duration_ms": duration_ms}
 
@@ -727,35 +772,36 @@ class RobotHardwareController:
 
         with self._arduino_transaction_lock:
             for _ in range(pill_count):
-                try:
-                    self.arduino_uno.send_command(command)
-                except HardwareControllerError as exc:
-                    self._raise_dispense_error(
-                        box_number,
-                        completed_pills,
-                        "SEND",
-                        exc,
-                    )
+                with self.arduino_uno.response_transaction():
+                    try:
+                        self.arduino_uno.send_command(command)
+                    except HardwareControllerError as exc:
+                        self._raise_dispense_error(
+                            box_number,
+                            completed_pills,
+                            "SEND",
+                            exc,
+                        )
 
-                try:
-                    self.arduino_uno.wait_for_response(acknowledgement)
-                except HardwareControllerError as exc:
-                    self._raise_dispense_error(
-                        box_number,
-                        completed_pills,
-                        "ACK",
-                        exc,
-                    )
+                    try:
+                        self.arduino_uno.wait_for_response(acknowledgement)
+                    except HardwareControllerError as exc:
+                        self._raise_dispense_error(
+                            box_number,
+                            completed_pills,
+                            "ACK",
+                            exc,
+                        )
 
-                try:
-                    self.arduino_uno.wait_for_response(completion)
-                except HardwareControllerError as exc:
-                    self._raise_dispense_error(
-                        box_number,
-                        completed_pills,
-                        "DONE",
-                        exc,
-                    )
+                    try:
+                        self.arduino_uno.wait_for_response(completion)
+                    except HardwareControllerError as exc:
+                        self._raise_dispense_error(
+                            box_number,
+                            completed_pills,
+                            "DONE",
+                            exc,
+                        )
 
                 completed_pills += 1
 
@@ -780,14 +826,15 @@ class RobotHardwareController:
             else self._arduino_transaction_lock
         )
         with transaction_lock:
-            controller.send_command(command)
-            if validator is None and response_prefix is None:
-                return controller.wait_for_response(expected)
-            return controller.wait_for_response(
-                expected,
-                validator=validator,
-                response_prefix=response_prefix,
-            )
+            with controller.response_transaction():
+                controller.send_command(command)
+                if validator is None and response_prefix is None:
+                    return controller.wait_for_response(expected)
+                return controller.wait_for_response(
+                    expected,
+                    validator=validator,
+                    response_prefix=response_prefix,
+                )
 
     @staticmethod
     def _is_valid_line_reading(response: str) -> bool:
