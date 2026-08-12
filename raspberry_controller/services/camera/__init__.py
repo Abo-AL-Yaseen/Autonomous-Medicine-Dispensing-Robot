@@ -5,6 +5,7 @@ from .aruco_camera_service import (
     ARUCO_DICTIONARY_NAME,
     ArucoCameraService,
     CameraSettings,
+    FreshConfirmationSession,
     MarkerDetectionResult,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "ARUCO_DICTIONARY_NAME",
     "ArucoCameraService",
     "CameraSettings",
+    "FreshConfirmationSession",
     "MarkerDetectionResult",
 ]

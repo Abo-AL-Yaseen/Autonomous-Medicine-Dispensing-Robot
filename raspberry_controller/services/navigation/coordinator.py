@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from ..camera import ArucoCameraService
+from ..camera import ArucoCameraService, FreshConfirmationSession
 from ..mission_executor import (
     MissionExecutionState,
     MissionExecutor,
@@ -125,6 +125,9 @@ class NavigationCoordinator:
         self._last_second_marker_area: int | None = None
         self._last_area_ratio: float | None = None
         self._last_selection_ambiguous = False
+        self._intersection_event_sequence: int | None = None
+        self._first_detection_sequence_used: int | None = None
+        self._confirmed_detection_sequences: tuple[int, ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -329,6 +332,9 @@ class NavigationCoordinator:
             self._last_second_marker_area = None
             self._last_area_ratio = None
             self._last_selection_ambiguous = False
+            self._intersection_event_sequence = None
+            self._first_detection_sequence_used = None
+            self._confirmed_detection_sequences = ()
             self._state = NavigationCoordinatorState.DISABLED
 
     def status(self) -> dict[str, object]:
@@ -350,6 +356,13 @@ class NavigationCoordinator:
                 "last_second_marker_area": self._last_second_marker_area,
                 "last_area_ratio": self._last_area_ratio,
                 "last_selection_ambiguous": self._last_selection_ambiguous,
+                "intersection_event_sequence": self._intersection_event_sequence,
+                "first_detection_sequence_used": (
+                    self._first_detection_sequence_used
+                ),
+                "confirmed_detection_sequences": list(
+                    self._confirmed_detection_sequences
+                ),
             }
 
     def _event_loop(self) -> None:
@@ -401,18 +414,26 @@ class NavigationCoordinator:
                 self._ignore_stale_events_while_idle = False
 
             # Rooms 2 and 3 share the NODE_0 -> NODE_1 -> NODE_2 corridor.
-            # Their view of marker 2 can begin before NODE_1 is physically
-            # reached, so their outbound decision deliberately starts a new
-            # detection window at the serial intersection event.  The map
-            # still determines the actual current node and next direction.
-            post_event_sequence: int | None = None
-            if (
+            # After the ESP32 intersection event has put it in stopped
+            # processing, start an atomic new camera confirmation session.
+            # The map still determines the actual current node and direction.
+            requires_post_stop_confirmation = (
                 executor_state is MissionExecutionState.GOING_TO_ROOM
                 and self._executor.room_id in {2, 3}
-            ):
-                post_event_sequence = (
-                    self._camera_service.current_frame_sequence()
-                )
+            )
+            if requires_post_stop_confirmation:
+                # Do not leave any pre-event marker as navigation evidence if
+                # the fresh session fails before it yields a result.
+                with self._lock:
+                    self._last_marker_id = None
+                    self._last_marker_area = None
+                    self._last_second_marker_id = None
+                    self._last_second_marker_area = None
+                    self._last_area_ratio = None
+                    self._last_selection_ambiguous = False
+                    self._intersection_event_sequence = None
+                    self._first_detection_sequence_used = None
+                    self._confirmed_detection_sequences = ()
 
             mission_id = self._executor.mission_id
             with self._lock:
@@ -421,11 +442,34 @@ class NavigationCoordinator:
                     self._expected_mission_id = mission_id
                 expected_marker_id = self._expected_marker_id
 
-            detection = self._camera_service.detect(
-                expected_marker_id=expected_marker_id,
-                after_sequence=post_event_sequence,
-            )
+            fresh_session: FreshConfirmationSession | None = None
+            if requires_post_stop_confirmation:
+                fresh_session = (
+                    self._camera_service.detect_from_new_confirmation_session(
+                        expected_marker_id=expected_marker_id,
+                    )
+                )
+                detection = fresh_session.detection
+            else:
+                detection = self._camera_service.detect(
+                    expected_marker_id=expected_marker_id,
+                )
             with self._lock:
+                self._intersection_event_sequence = (
+                    fresh_session.boundary_sequence
+                    if fresh_session is not None
+                    else None
+                )
+                self._first_detection_sequence_used = (
+                    fresh_session.first_detection_sequence
+                    if fresh_session is not None
+                    else None
+                )
+                self._confirmed_detection_sequences = (
+                    fresh_session.detection_sequences
+                    if fresh_session is not None
+                    else ()
+                )
                 self._last_marker_id = detection.marker_id
                 self._last_marker_area = detection.area
                 self._last_second_marker_id = detection.second_marker_id

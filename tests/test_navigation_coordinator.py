@@ -9,7 +9,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from raspberry_controller.services.camera import MarkerDetectionResult
+from raspberry_controller.services.camera import (
+    FreshConfirmationSession,
+    MarkerDetectionResult,
+)
 from raspberry_controller.services.laravel_api_client import ClaimedMission
 from raspberry_controller.services.mission_executor import (
     MissionExecutionState,
@@ -108,10 +111,8 @@ class FakeCamera:
         self.calls = 0
         self.expected_marker_ids: list[int | None] = []
         self.after_sequences: list[int | None] = []
+        self.fresh_confirmation_sessions: list[int | None] = []
         self.frame_sequence = 100
-
-    def current_frame_sequence(self) -> int:
-        return self.frame_sequence
 
     def detect(
         self,
@@ -127,6 +128,24 @@ class FakeCamera:
         if len(self.detections) == 1:
             return self.detections[0]
         return self.detections.pop(0)
+
+    def detect_from_new_confirmation_session(
+        self,
+        *,
+        expected_marker_id: int | None = None,
+    ) -> FreshConfirmationSession:
+        self.fresh_confirmation_sessions.append(expected_marker_id)
+        detection = self.detect(expected_marker_id=expected_marker_id)
+        sequences = (
+            (101, 102, 103)
+            if detection.confirmed
+            else (101, 102)
+        )
+        return FreshConfirmationSession(
+            detection=detection,
+            boundary_sequence=self.frame_sequence,
+            detection_sequences=sequences,
+        )
 
 
 class HardwareRecorder:
@@ -363,9 +382,13 @@ def test_room_two_and_three_ignore_early_marker_two_and_use_fresh_marker_one(
 
     assert hardware.navigation == ["LEFT"]
     assert camera.expected_marker_ids == [None, None]
-    assert camera.after_sequences == [None, 100]
+    assert camera.after_sequences == [None, None]
+    assert camera.fresh_confirmation_sessions == [None]
     assert service.status()["last_marker_id"] == 1
     assert service.status()["last_node"] == "NODE_1"
+    assert service.status()["intersection_event_sequence"] == 100
+    assert service.status()["first_detection_sequence_used"] == 101
+    assert service.status()["confirmed_detection_sequences"] == [101, 102, 103]
 
 
 @pytest.mark.parametrize(
@@ -385,6 +408,7 @@ def test_room_one_four_and_five_keep_existing_detection_timing(
 
     assert hardware.navigation == [expected_command]
     assert camera.after_sequences == [None]
+    assert camera.fresh_confirmation_sessions == []
 
 
 def test_room_two_area_first_selection_is_applied_after_intersection_event() -> None:
@@ -405,7 +429,8 @@ def test_room_two_area_first_selection_is_applied_after_intersection_event() -> 
     service.process_serial_line(INTERSECTION_EVENT)
 
     assert hardware.navigation == ["LEFT"]
-    assert camera.after_sequences == [100]
+    assert camera.after_sequences == [None]
+    assert camera.fresh_confirmation_sessions == [None]
     assert service.status()["last_marker_id"] == 1
     assert service.status()["last_second_marker_id"] == 2
 
@@ -427,7 +452,8 @@ def test_room_three_without_fresh_confirmation_fails_without_movement() -> None:
     service.process_serial_line(INTERSECTION_EVENT)
 
     assert hardware.navigation == []
-    assert camera.after_sequences == [100]
+    assert camera.after_sequences == [None]
+    assert camera.fresh_confirmation_sessions == [None]
     assert service.status()["last_error"] == "MARKER_NOT_CONFIRMED"
 
 
@@ -455,7 +481,8 @@ def test_ambiguous_marker_selection_sends_zero_hardware_commands() -> None:
     assert service.status()["last_error"] == "AMBIGUOUS_MARKERS"
     assert service.status()["last_selection_ambiguous"] is True
     assert service.status()["last_second_marker_id"] == 1
-    assert camera.after_sequences == [100]
+    assert camera.after_sequences == [None]
+    assert camera.fresh_confirmation_sessions == [None]
 
 
 def test_unexpected_route_marker_sends_zero_hardware_commands() -> None:

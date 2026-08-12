@@ -20,6 +20,7 @@ from raspberry_controller.hardware_controller import SerialConnectionError
 from raspberry_controller.services.camera import (
     ArucoCameraService,
     CameraSettings,
+    FreshConfirmationSession,
     MarkerDetectionResult,
 )
 from raspberry_controller.services.laravel_api_client import ClaimedMission
@@ -347,8 +348,16 @@ class FakeCameraService:
         self.detect_calls += 1
         return self.detection
 
-    def current_frame_sequence(self) -> int:
-        return 1
+    def detect_from_new_confirmation_session(
+        self,
+        *,
+        expected_marker_id: int | None = None,
+    ) -> FreshConfirmationSession:
+        return FreshConfirmationSession(
+            detection=self.detect(expected_marker_id=expected_marker_id),
+            boundary_sequence=1,
+            detection_sequences=(2, 3, 4),
+        )
 
     def get_preview_jpeg(
         self,
@@ -625,6 +634,9 @@ def test_navigation_status_reports_auto_disabled_by_default(
         "last_second_marker_area": None,
         "last_area_ratio": None,
         "last_selection_ambiguous": False,
+        "intersection_event_sequence": None,
+        "first_detection_sequence_used": None,
+        "confirmed_detection_sequences": [],
     }
 
 

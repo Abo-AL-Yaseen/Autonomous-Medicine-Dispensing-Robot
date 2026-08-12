@@ -94,6 +94,23 @@ class MarkerDetectionResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class FreshConfirmationSession:
+    """One marker decision acquired strictly after a fresh frame boundary."""
+
+    detection: MarkerDetectionResult
+    boundary_sequence: int
+    detection_sequences: tuple[int, ...]
+
+    @property
+    def first_detection_sequence(self) -> int | None:
+        return (
+            self.detection_sequences[0]
+            if self.detection_sequences
+            else None
+        )
+
+
 class ArucoCameraService:
     """Own one camera resource and detect approved, sufficiently large markers.
 
@@ -240,59 +257,104 @@ class ArucoCameraService:
         """
 
         with self._detection_lock:
-            if not self._camera_is_available():
-                return MarkerDetectionResult(
-                    camera_available=False,
-                    detected=False,
-                    confirmed=False,
-                )
-
             if after_sequence is not None:
                 # A candidate from before the physical event cannot count
                 # toward that event's navigation decision.
                 self._reset_confirmation()
-            detection_after_sequence = _later_sequence(
-                self._last_detection_sequence,
-                after_sequence,
+            result, _ = self._detect_frames_locked(
+                expected_marker_id=expected_marker_id,
+                after_sequence=after_sequence,
+                include_last_detection_sequence=True,
             )
-            result = MarkerDetectionResult(
-                camera_available=True,
-                detected=False,
-                confirmed=False,
+            return result
+
+    def detect_from_new_confirmation_session(
+        self,
+        *,
+        expected_marker_id: int | None = None,
+    ) -> FreshConfirmationSession:
+        """Start an atomic, post-boundary confirmation session.
+
+        The candidate reset, boundary capture, and frame consumption all use
+        the same detection lock.  No earlier detection can contribute a
+        confirmation frame, and no other detector call can slip between the
+        reset and the boundary capture.
+        """
+
+        with self._detection_lock:
+            self._reset_confirmation()
+            with self._frame_condition:
+                boundary_sequence = self._frame_sequence
+            detection, detection_sequences = self._detect_frames_locked(
+                expected_marker_id=expected_marker_id,
+                after_sequence=boundary_sequence,
+                include_last_detection_sequence=False,
             )
-            for _ in range(self.settings.confirm_frames):
-                try:
-                    next_frame = self._next_detection_frame(
-                        detection_after_sequence,
-                        timeout=DEFAULT_FRAME_WAIT_SECONDS,
-                    )
-                    if next_frame is None:
-                        raise RuntimeError("camera frame unavailable")
-                    sequence, frame = next_frame
-                    self._last_detection_sequence = sequence
-                    detection_after_sequence = sequence
-                    result = self._detect_frame(
-                        frame,
-                        expected_marker_id=expected_marker_id,
-                    )
-                except Exception:
-                    self._set_last_error("CAMERA_READ_FAILED")
-                    self._reset_confirmation()
-                    return MarkerDetectionResult(
+            return FreshConfirmationSession(
+                detection=detection,
+                boundary_sequence=boundary_sequence,
+                detection_sequences=detection_sequences,
+            )
+
+    def _detect_frames_locked(
+        self,
+        *,
+        expected_marker_id: int | None,
+        after_sequence: int | None,
+        include_last_detection_sequence: bool,
+    ) -> tuple[MarkerDetectionResult, tuple[int, ...]]:
+        if not self._camera_is_available():
+            return (
+                MarkerDetectionResult(
+                    camera_available=False,
+                    detected=False,
+                    confirmed=False,
+                ),
+                (),
+            )
+
+        detection_after_sequence = (
+            _later_sequence(self._last_detection_sequence, after_sequence)
+            if include_last_detection_sequence
+            else after_sequence
+        )
+        detection_sequences: list[int] = []
+        result = MarkerDetectionResult(
+            camera_available=True,
+            detected=False,
+            confirmed=False,
+        )
+        for _ in range(self.settings.confirm_frames):
+            try:
+                next_frame = self._next_detection_frame(
+                    detection_after_sequence,
+                    timeout=DEFAULT_FRAME_WAIT_SECONDS,
+                )
+                if next_frame is None:
+                    raise RuntimeError("camera frame unavailable")
+                sequence, frame = next_frame
+                self._last_detection_sequence = sequence
+                detection_after_sequence = sequence
+                detection_sequences.append(sequence)
+                result = self._detect_frame(
+                    frame,
+                    expected_marker_id=expected_marker_id,
+                )
+            except Exception:
+                self._set_last_error("CAMERA_READ_FAILED")
+                self._reset_confirmation()
+                return (
+                    MarkerDetectionResult(
                         camera_available=self._camera_is_available(),
                         detected=False,
                         confirmed=False,
-                    )
-                if result.confirmed:
-                    break
+                    ),
+                    tuple(detection_sequences),
+                )
+            if result.confirmed:
+                break
 
-            return result
-
-    def current_frame_sequence(self) -> int:
-        """Return the newest captured frame sequence without consuming it."""
-
-        with self._frame_condition:
-            return self._frame_sequence
+        return result, tuple(detection_sequences)
 
     def process_detections(
         self,
