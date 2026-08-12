@@ -130,6 +130,8 @@ class HardwareRecorder:
         self.water: list[object] = []
         self.return_home: list[object] = []
         self.command_event = threading.Event()
+        self.dispense_event = threading.Event()
+        self.return_started_event = threading.Event()
 
     def command(self, direction: str) -> str:
         self.navigation.append(direction)
@@ -142,7 +144,17 @@ class HardwareRecorder:
 
     def u_turn(self) -> str:
         self.navigation.append("U_TURN")
+        self.return_started_event.set()
         return "ACK|U_TURN_STARTED"
+
+    def dispense_medicine(self, box_number: int, quantity: int) -> dict[str, int]:
+        self.dispense.append((box_number, quantity))
+        self.dispense_event.set()
+        return {
+            "box_number": box_number,
+            "requested_pills": quantity,
+            "dispensed_pills": quantity,
+        }
 
 
 def confirmed_marker(marker_id: int) -> MarkerDetectionResult:
@@ -163,12 +175,14 @@ def going_executor(
     *,
     load_map: Callable[[], PhysicalNavigationMap] | None = approved_navigation_map,
     u_turn: Callable[[], str] | None = None,
+    dispense_medicine: Callable[[int, int], dict[str, int]] | None = None,
 ) -> MissionExecutor:
     executor = MissionExecutor(
         hardware_available=lambda: True,
         start_line_follow=lambda: "ACK|LINE_FOLLOW_STARTED",
         stop_line_follow=lambda: "ACK|LINE_FOLLOW_STOPPED",
         u_turn=u_turn,
+        dispense_medicine=dispense_medicine,
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=load_map,
     )
@@ -185,6 +199,7 @@ def arrived_executor(
     executor = going_executor(
         room_id,
         u_turn=hardware.u_turn,
+        dispense_medicine=hardware.dispense_medicine,
     )
     executor.mark_arrived_at_room()
     return executor
@@ -196,9 +211,13 @@ def coordinator(
     hardware: HardwareRecorder,
     *,
     enabled: bool = True,
+    arrived_home_observation_seconds: float = 1.0,
 ) -> NavigationCoordinator:
     return NavigationCoordinator(
-        settings=NavigationCoordinatorSettings(enabled=enabled),
+        settings=NavigationCoordinatorSettings(
+            enabled=enabled,
+            arrived_home_observation_seconds=arrived_home_observation_seconds,
+        ),
         executor=executor,
         camera_service=camera,  # type: ignore[arg-type]
         next_serial_event=lambda timeout: None,
@@ -367,8 +386,12 @@ def test_unexpected_route_marker_sends_zero_hardware_commands() -> None:
 
 
 def test_expected_room_marker_is_used_for_arrival_after_previous_decision() -> None:
-    executor = going_executor(1)
     hardware = HardwareRecorder()
+    executor = going_executor(
+        1,
+        u_turn=hardware.u_turn,
+        dispense_medicine=hardware.dispense_medicine,
+    )
     camera = FakeCamera(confirmed_marker(0), confirmed_marker(11))
     service = coordinator(executor, camera, hardware)
 
@@ -378,9 +401,13 @@ def test_expected_room_marker_is_used_for_arrival_after_previous_decision() -> N
     service.process_serial_line(INTERSECTION_EVENT)
 
     assert camera.expected_marker_ids == [None, 11]
-    assert hardware.navigation == ["LEFT"]
+    assert hardware.dispense_event.wait(timeout=1.0)
+    assert hardware.return_started_event.wait(timeout=1.0)
+    assert hardware.navigation == ["LEFT", "U_TURN"]
     assert hardware.line == ["stop"]
-    assert executor.state is MissionExecutionState.ARRIVED_AT_ROOM
+    assert hardware.dispense == [(1, 1)]
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+    assert service.status()["expected_marker_id"] == 0
 
 
 def test_failed_maneuver_is_reported_and_does_not_rearm() -> None:
@@ -484,10 +511,14 @@ def test_missing_mission_and_wrong_executor_state_send_no_command(
     assert service.status()["last_error"] == "EXECUTOR_NOT_GOING_TO_ROOM"
 
 
-def test_arrived_stops_line_follow_but_does_not_deliver_or_release_mission() -> None:
-    executor = going_executor(1)
-    mission_id = executor.mission_id
+def test_arrived_automatically_dispenses_and_retains_mission() -> None:
     hardware = HardwareRecorder()
+    executor = going_executor(
+        1,
+        u_turn=hardware.u_turn,
+        dispense_medicine=hardware.dispense_medicine,
+    )
+    mission_id = executor.mission_id
     service = coordinator(
         executor,
         FakeCamera(confirmed_marker(11)),
@@ -496,14 +527,162 @@ def test_arrived_stops_line_follow_but_does_not_deliver_or_release_mission() -> 
 
     service.process_serial_line(INTERSECTION_EVENT)
 
-    assert hardware.navigation == []
+    assert hardware.dispense_event.wait(timeout=1.0)
+    assert hardware.return_started_event.wait(timeout=1.0)
+    assert hardware.navigation == ["U_TURN"]
     assert hardware.line == ["stop"]
-    assert hardware.dispense == []
+    assert hardware.dispense == [(1, 1)]
     assert hardware.water == []
     assert hardware.return_home == []
-    assert executor.state is MissionExecutionState.ARRIVED_AT_ROOM
+    assert executor.state is MissionExecutionState.RETURNING_HOME
     assert executor.mission_id == mission_id
-    assert service.status()["state"] == "ARRIVED_AT_ROOM"
+    assert service.status()["state"] == "RETURNING_HOME"
+
+
+def test_room_arrival_exposes_dispensing_while_uno_is_busy() -> None:
+    hardware = HardwareRecorder()
+    release_dispense = threading.Event()
+
+    def blocking_dispense(box_number: int, quantity: int) -> dict[str, int]:
+        hardware.dispense.append((box_number, quantity))
+        hardware.dispense_event.set()
+        assert release_dispense.wait(timeout=1.0)
+        return {
+            "box_number": box_number,
+            "requested_pills": quantity,
+            "dispensed_pills": quantity,
+        }
+
+    executor = going_executor(
+        1,
+        u_turn=hardware.u_turn,
+        dispense_medicine=blocking_dispense,
+    )
+    service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.dispense_event.wait(timeout=1.0)
+    assert executor.status()["state"] == "DISPENSING"
+    assert service.status()["state"] == "DISPENSING"
+    assert hardware.navigation == []
+
+    release_dispense.set()
+    assert hardware.return_started_event.wait(timeout=1.0)
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+
+
+def test_duplicate_room_arrival_never_dispenses_or_turns_twice() -> None:
+    hardware = HardwareRecorder()
+    executor = going_executor(
+        1,
+        u_turn=hardware.u_turn,
+        dispense_medicine=hardware.dispense_medicine,
+    )
+    service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.dispense_event.wait(timeout=1.0)
+    assert hardware.return_started_event.wait(timeout=1.0)
+    assert hardware.dispense == [(1, 1)]
+    assert hardware.navigation == ["U_TURN"]
+
+
+def test_dispense_quantity_two_must_complete_two_before_return() -> None:
+    hardware = HardwareRecorder()
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=lambda: "ACK|LINE_FOLLOW_STARTED",
+        stop_line_follow=lambda: "ACK|LINE_FOLLOW_STOPPED",
+        u_turn=hardware.u_turn,
+        dispense_medicine=hardware.dispense_medicine,
+        mark_mission_in_progress=lambda mission: None,
+        load_navigation_map=approved_navigation_map,
+    )
+    mission = mission_for_room(1)
+    mission = ClaimedMission(
+        mission.id,
+        mission.room_id,
+        mission.medicine_id,
+        2,
+        room_number=mission.room_number,
+        dispenser_box=mission.dispenser_box,
+        schedule_claimed_at=mission.schedule_claimed_at,
+    )
+    executor.accept(mission)
+    executor.start_ready_mission()
+    service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.dispense_event.wait(timeout=1.0)
+    assert hardware.return_started_event.wait(timeout=1.0)
+    assert hardware.dispense == [(1, 2)]
+    assert hardware.navigation == ["U_TURN"]
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "exception"])
+def test_dispense_failure_enters_failed_and_never_starts_return(
+    failure: str,
+) -> None:
+    hardware = HardwareRecorder()
+
+    def fail_dispense(box_number: int, quantity: int) -> dict[str, int]:
+        hardware.dispense.append((box_number, quantity))
+        hardware.dispense_event.set()
+        if failure == "exception":
+            raise RuntimeError("UNO unavailable")
+        return {
+            "box_number": box_number,
+            "requested_pills": quantity,
+            "dispensed_pills": quantity - 1,
+        }
+
+    executor = going_executor(
+        1,
+        u_turn=hardware.u_turn,
+        dispense_medicine=fail_dispense,
+    )
+    service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.dispense_event.wait(timeout=1.0)
+    service.stop()
+    assert executor.state is MissionExecutionState.FAILED
+    assert executor.status()["last_error"].startswith("DISPENSE_FAILED:")
+    assert hardware.navigation == []
+    assert hardware.water == []
+    assert service.status()["last_error"] == "DISPENSE_FAILED"
+
+
+def test_room_one_full_automatic_arrival_dispense_return_home_chain() -> None:
+    hardware = HardwareRecorder()
+    executor = going_executor(
+        1,
+        u_turn=hardware.u_turn,
+        dispense_medicine=hardware.dispense_medicine,
+    )
+    mission_id = executor.mission_id
+    camera = FakeCamera(confirmed_marker(11), confirmed_marker(0))
+    service = coordinator(executor, camera, hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+    assert hardware.return_started_event.wait(timeout=1.0)
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+
+    service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert executor.state is MissionExecutionState.ARRIVED_HOME
+    assert executor.mission_id == mission_id
+    assert hardware.dispense == [(1, 1)]
+    assert hardware.navigation == ["U_TURN"]
+    assert hardware.line == ["stop", "stop"]
+    assert hardware.water == []
+    assert service.status()["state"] == "ARRIVED_HOME"
 
 
 def test_return_home_requires_arrived_state_and_sends_no_command_otherwise() -> None:
@@ -610,6 +789,82 @@ def test_marker_zero_stops_and_marks_arrived_home_without_completing_mission() -
     assert service.status()["last_node"] == "NODE_0"
     assert service.status()["last_decision"] == "ARRIVED"
     assert service.status()["last_error"] is None
+
+
+def test_arrived_home_is_observable_then_rearms_cleanly_without_stale_motion() -> None:
+    hardware = HardwareRecorder()
+    executor = arrived_executor(1, hardware)
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(0)),
+        hardware,
+        arrived_home_observation_seconds=0.01,
+    )
+
+    service.begin_return_home()
+    service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    # The confirmed NODE_0 arrival is available before the asynchronous reset.
+    assert executor.state is MissionExecutionState.ARRIVED_HOME
+    assert service.status()["state"] == "ARRIVED_HOME"
+    assert service.status()["last_node"] == "NODE_0"
+
+    finalization_thread = service._home_finalization_thread
+    assert finalization_thread is not None
+    finalization_thread.join(timeout=1.0)
+
+    assert executor.status()["state"] == "IDLE"
+    assert executor.mission_id is None
+    assert service.status()["armed"] is True
+    assert service.status()["expected_marker_id"] is None
+    assert service.status()["last_marker_id"] == 0
+    assert service.status()["last_node"] == "NODE_0"
+    assert service.status()["last_decision"] == "ARRIVED"
+
+    service.process_serial_line(INTERSECTION_EVENT)
+    assert hardware.navigation == ["U_TURN"]
+    assert service.status()["armed"] is True
+    assert service.status()["last_error"] is None
+
+
+def test_second_mission_starts_cleanly_after_arrived_home_cleanup() -> None:
+    hardware = HardwareRecorder()
+    executor = arrived_executor(1, hardware)
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(0), confirmed_marker(0)),
+        hardware,
+        arrived_home_observation_seconds=0.01,
+    )
+
+    service.begin_return_home()
+    service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+    finalization_thread = service._home_finalization_thread
+    assert finalization_thread is not None
+    finalization_thread.join(timeout=1.0)
+
+    second_mission = mission_for_room(1)
+    second_mission = ClaimedMission(
+        id=second_mission.id + 1000,
+        room_id=second_mission.room_id,
+        medicine_id=second_mission.medicine_id,
+        quantity=second_mission.quantity,
+        room_number=second_mission.room_number,
+        dispenser_box=second_mission.dispenser_box,
+        schedule_claimed_at=second_mission.schedule_claimed_at,
+    )
+    assert executor.accept(second_mission) is True
+    assert executor.start_ready_mission().success is True
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert hardware.navigation == ["U_TURN", "LEFT"]
+    assert hardware.line == ["stop"]
+    assert hardware.dispense == []
+    assert hardware.water == []
 
 
 def test_disabled_preview_never_moves_or_changes_executor_state() -> None:

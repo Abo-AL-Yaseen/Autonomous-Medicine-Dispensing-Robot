@@ -156,6 +156,35 @@ class LaravelApiClient:
         ):
             raise LaravelApiError("Laravel mission start response was invalid")
 
+    def complete_claimed_mission(self, mission: ClaimedMission) -> None:
+        """Use Laravel's official arrival endpoint to complete this mission."""
+
+        try:
+            response = self._client.post(
+                "robot/navigation/arrived",
+                json={"mission_id": mission.id},
+            )
+            response.raise_for_status()
+        except httpx.RequestError as exc:
+            raise LaravelApiUnavailable(
+                "Laravel mission completion API is unavailable"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise LaravelApiError(
+                "Laravel mission completion failed with HTTP "
+                f"{exc.response.status_code}"
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise LaravelApiError(
+                "Laravel mission completion response was not valid JSON"
+            ) from exc
+
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            raise LaravelApiError("Laravel mission completion response was invalid")
+
     def get_navigation_map(self) -> PhysicalNavigationMap:
         """Fetch and validate Laravel's authoritative physical map snapshot."""
 

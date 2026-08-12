@@ -31,6 +31,7 @@ class FakeLaravelClient:
         self.claimed_mission: ClaimedMission | None = None
         self.error: Exception | None = None
         self.calls: list[tuple[datetime, str]] = []
+        self.completed_missions: list[ClaimedMission] = []
         self.closed = False
 
     def claim_due_mission(
@@ -48,6 +49,9 @@ class FakeLaravelClient:
 
     def start_claimed_mission(self, mission: ClaimedMission) -> None:
         raise AssertionError("Scheduler must not start mission execution")
+
+    def complete_claimed_mission(self, mission: ClaimedMission) -> None:
+        self.completed_missions.append(mission)
 
 
 class SafeSchedulerHardware:
@@ -194,20 +198,19 @@ def test_idle_executor_may_claim_a_due_mission() -> None:
     }
 
 
-def test_due_mission_may_be_claimed_after_executor_returns_to_idle() -> None:
+def test_due_mission_may_be_claimed_after_arrived_home_cleanup() -> None:
     hardware = SafeSchedulerHardware()
     laravel = FakeLaravelClient()
-    executor = MissionExecutor()
-    executor.accept(ClaimedMission(8, 1, 2, 4))
+    first_mission = ClaimedMission(8, 1, 2, 4)
+    executor = MissionExecutor(mark_mission_completed=laravel.complete_claimed_mission)
+    executor.accept(first_mission)
+    with executor._lock:
+        executor._state = MissionExecutionState.ARRIVED_HOME
     scheduler, _ = build_scheduler(hardware, laravel, executor)
 
     busy = scheduler.tick()
 
-    # Mission completion/reset belongs to a later phase. Simulate that future
-    # lifecycle transition here without adding a production completion API.
-    with executor._lock:
-        executor._mission = None
-        executor._state = MissionExecutionState.IDLE
+    assert executor.finalize_arrived_home() is True
 
     next_mission = ClaimedMission(9, 1, 2, 1)
     laravel.claimed_mission = next_mission
@@ -216,6 +219,7 @@ def test_due_mission_may_be_claimed_after_executor_returns_to_idle() -> None:
     assert busy.result is SchedulerResult.EXECUTOR_BUSY
     assert claimed.result is SchedulerResult.READY_FOR_EXECUTION
     assert laravel.calls == [(hardware.rtc, "Asia/Hebron")]
+    assert laravel.completed_missions == [first_mission]
     assert executor.mission_id == next_mission.id
 
 
@@ -429,6 +433,27 @@ def test_laravel_client_starts_only_the_exact_claimed_mission() -> None:
 
     try:
         client.start_claimed_mission(mission)
+    finally:
+        client.close()
+
+
+def test_laravel_client_completes_the_exact_arrived_mission() -> None:
+    mission = ClaimedMission(8, 1, 2, 4)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/robot/navigation/arrived"
+        assert json.loads(request.content) == {"mission_id": 8}
+        return httpx.Response(200, json={"success": True})
+
+    client = LaravelApiClient(
+        "http://laravel.test/api",
+        0.2,
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        client.complete_claimed_mission(mission)
     finally:
         client.close()
 

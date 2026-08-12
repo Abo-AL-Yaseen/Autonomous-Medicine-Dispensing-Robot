@@ -227,6 +227,7 @@ class FakeLaravelClient:
         self.claimed_mission: ClaimedMission | None = None
         self.calls: list[tuple[datetime, str]] = []
         self.start_calls: list[ClaimedMission] = []
+        self.complete_calls: list[ClaimedMission] = []
         self.start_error: Exception | None = None
         self.map_calls = 0
         self.navigation_map = _navigation_map_fixture()
@@ -244,6 +245,9 @@ class FakeLaravelClient:
         self.start_calls.append(mission)
         if self.start_error:
             raise self.start_error
+
+    def complete_claimed_mission(self, mission: ClaimedMission) -> None:
+        self.complete_calls.append(mission)
 
     def get_navigation_map(self) -> PhysicalNavigationMap:
         self.map_calls += 1
@@ -958,6 +962,28 @@ def test_executor_return_home_rejects_non_arrived_state_without_movement(
     assert response.json()["result"] == "RETURN_NOT_ALLOWED"
     assert fake_hardware.navigation_calls == []
     assert fake_hardware.line_calls == []
+
+
+def test_executor_dispense_reuses_api_hardware_and_manual_return_endpoint(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor: MissionExecutor = client.app.state.mission_executor
+    mission = executable_mission()
+    assert executor.accept(mission) is True
+    assert client.post("/executor/start").status_code == 200
+    executor.mark_arrived_at_room()
+
+    dispense = executor.dispense_at_room()
+    returned = client.post("/executor/return-home")
+
+    assert dispense.success is True
+    assert returned.status_code == 200
+    assert returned.json()["result"] == "RETURN_STARTED"
+    assert returned.json()["executor"]["state"] == "RETURNING_HOME"
+    assert fake_hardware.dispense_calls == [(1, 4)]
+    assert fake_hardware.navigation_calls == ["u-turn"]
+    assert fake_hardware.water_calls == []
 
 
 def test_executor_start_does_nothing_when_hardware_is_unavailable(

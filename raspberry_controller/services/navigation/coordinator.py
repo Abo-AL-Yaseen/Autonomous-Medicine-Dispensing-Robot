@@ -27,15 +27,33 @@ U_TURN_FAILED_PREFIX = "EVENT|U_TURN_FAILED"
 @dataclass(frozen=True)
 class NavigationCoordinatorSettings:
     enabled: bool = False
+    arrived_home_observation_seconds: float = 1.0
 
     @classmethod
     def from_environment(cls) -> "NavigationCoordinatorSettings":
         value = os.getenv("NAVIGATION_AUTO_ENABLED", "false").strip().lower()
         if value in {"1", "true", "yes", "on"}:
-            return cls(enabled=True)
-        if value in {"0", "false", "no", "off"}:
-            return cls(enabled=False)
-        raise ValueError("NAVIGATION_AUTO_ENABLED must be a boolean")
+            enabled = True
+        elif value in {"0", "false", "no", "off"}:
+            enabled = False
+        else:
+            raise ValueError("NAVIGATION_AUTO_ENABLED must be a boolean")
+        try:
+            observation_seconds = float(
+                os.getenv("ARRIVED_HOME_OBSERVATION_SECONDS", "1.0")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "ARRIVED_HOME_OBSERVATION_SECONDS must be a number"
+            ) from exc
+        if observation_seconds < 0:
+            raise ValueError(
+                "ARRIVED_HOME_OBSERVATION_SECONDS must be non-negative"
+            )
+        return cls(
+            enabled=enabled,
+            arrived_home_observation_seconds=observation_seconds,
+        )
 
 
 class NavigationCoordinatorState(str, Enum):
@@ -44,6 +62,7 @@ class NavigationCoordinatorState(str, Enum):
     PROCESSING_INTERSECTION = "PROCESSING_INTERSECTION"
     COMMAND_SENT = "COMMAND_SENT"
     ARRIVED_AT_ROOM = "ARRIVED_AT_ROOM"
+    DISPENSING = "DISPENSING"
     RETURNING_HOME = "RETURNING_HOME"
     ARRIVED_HOME = "ARRIVED_HOME"
     ERROR = "ERROR"
@@ -79,8 +98,14 @@ class NavigationCoordinator:
         self._stop_line_follow = stop_line_follow
         self._lock = threading.Lock()
         self._processing_lock = threading.Lock()
+        self._post_arrival_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._post_arrival_thread: threading.Thread | None = None
+        self._post_arrival_mission_id: int | None = None
+        self._home_finalization_thread: threading.Thread | None = None
+        self._home_finalization_mission_id: int | None = None
+        self._ignore_stale_events_while_idle = False
         self._armed = True
         self._state = (
             NavigationCoordinatorState.WAITING_FOR_INTERSECTION
@@ -122,9 +147,39 @@ class NavigationCoordinator:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
         self._thread = None
+        post_arrival_thread = self._post_arrival_thread
+        if (
+            post_arrival_thread is not None
+            and post_arrival_thread is not threading.current_thread()
+        ):
+            post_arrival_thread.join()
+        self._post_arrival_thread = None
+        home_finalization_thread = self._home_finalization_thread
+        if (
+            home_finalization_thread is not None
+            and home_finalization_thread is not threading.current_thread()
+        ):
+            home_finalization_thread.join()
+        self._home_finalization_thread = None
 
     def process_serial_line(self, line: str) -> None:
         """Process one line already dispatched by the sole serial reader."""
+
+        # Arrival cleanup leaves the serial reader alive.  Ignore residual
+        # completion/intersection lines until another mission actually starts,
+        # so a late line from the prior mission cannot alter the clean state.
+        with self._lock:
+            ignore_stale_event = (
+                self._ignore_stale_events_while_idle
+                and self._executor.state
+                in {
+                    MissionExecutionState.IDLE,
+                    MissionExecutionState.READY_FOR_EXECUTION,
+                    MissionExecutionState.STARTING,
+                }
+            )
+        if ignore_stale_event and self._is_intersection_event(line):
+            return
 
         if not self.enabled and self._is_intersection_event(line):
             self._observe_disabled_event(line)
@@ -167,7 +222,10 @@ class NavigationCoordinator:
         """Start one validated room U-turn and prepare return marker tracking."""
 
         with self._processing_lock:
-            if self._executor.state is not MissionExecutionState.ARRIVED_AT_ROOM:
+            if self._executor.state not in {
+                MissionExecutionState.ARRIVED_AT_ROOM,
+                MissionExecutionState.DISPENSE_COMPLETED,
+            }:
                 return {
                     "success": False,
                     "result": "RETURN_NOT_ALLOWED",
@@ -339,6 +397,9 @@ class NavigationCoordinator:
                 self._record_error("EXECUTOR_NOT_GOING_TO_ROOM")
                 return
 
+            with self._lock:
+                self._ignore_stale_events_while_idle = False
+
             mission_id = self._executor.mission_id
             with self._lock:
                 if self._expected_mission_id != mission_id:
@@ -424,6 +485,13 @@ class NavigationCoordinator:
                         else NavigationCoordinatorState.ARRIVED_AT_ROOM
                     )
                     self._last_error = stop_error
+                if executor_state is MissionExecutionState.RETURNING_HOME:
+                    self._start_home_finalization()
+                if (
+                    executor_state is MissionExecutionState.GOING_TO_ROOM
+                    and stop_error is None
+                ):
+                    self._start_post_arrival_workflow()
                 return
 
             command = self._commands.get(plan.decision)
@@ -465,3 +533,74 @@ class NavigationCoordinator:
         with self._lock:
             self._state = NavigationCoordinatorState.ERROR
             self._last_error = code
+
+    def _start_home_finalization(self) -> None:
+        """Keep the confirmed home arrival observable, then release it."""
+
+        mission_id = self._executor.mission_id
+        with self._post_arrival_lock:
+            if (
+                mission_id is None
+                or self._home_finalization_mission_id == mission_id
+            ):
+                return
+            self._home_finalization_mission_id = mission_id
+            self._home_finalization_thread = threading.Thread(
+                target=self._finalize_arrived_home,
+                name="mission-home-finalization",
+                daemon=True,
+            )
+            self._home_finalization_thread.start()
+
+    def _finalize_arrived_home(self) -> None:
+        if self._stop_event.wait(self._settings.arrived_home_observation_seconds):
+            return
+        if not self._executor.finalize_arrived_home():
+            with self._lock:
+                self._state = NavigationCoordinatorState.ARRIVED_HOME
+                self._last_error = self._executor.status()["last_error"]
+            return
+
+        with self._lock:
+            self._armed = True
+            self._expected_marker_id = None
+            self._expected_mission_id = None
+            self._last_command = None
+            self._last_error = None
+            # Keep last_marker_id/NODE_0/ARRIVED as the proof of physical
+            # arrival while making the coordinator ready for the next route.
+            self._state = (
+                NavigationCoordinatorState.WAITING_FOR_INTERSECTION
+                if self.enabled
+                else NavigationCoordinatorState.DISABLED
+            )
+            self._ignore_stale_events_while_idle = True
+
+    def _start_post_arrival_workflow(self) -> None:
+        """Start one background workflow without blocking ESP32 event reads."""
+
+        mission_id = self._executor.mission_id
+        with self._post_arrival_lock:
+            if mission_id is None or self._post_arrival_mission_id == mission_id:
+                return
+            self._post_arrival_mission_id = mission_id
+            self._post_arrival_thread = threading.Thread(
+                target=self._run_post_arrival_workflow,
+                name="mission-post-arrival",
+                daemon=True,
+            )
+            self._post_arrival_thread.start()
+
+    def _run_post_arrival_workflow(self) -> None:
+        """Dispense once, then reuse the validated return-home transition."""
+
+        with self._lock:
+            self._state = NavigationCoordinatorState.DISPENSING
+        dispense = self._executor.dispense_at_room()
+        if not dispense.success:
+            self._record_error(dispense.result.value)
+            return
+
+        returned = self.begin_return_home()
+        if not returned.get("success"):
+            self._record_error(str(returned.get("result", "RETURN_START_FAILED")))

@@ -29,6 +29,8 @@ class MissionExecutionState(str, Enum):
     STARTING = "STARTING"
     GOING_TO_ROOM = "GOING_TO_ROOM"
     ARRIVED_AT_ROOM = "ARRIVED_AT_ROOM"
+    DISPENSING = "DISPENSING"
+    DISPENSE_COMPLETED = "DISPENSE_COMPLETED"
     RETURNING_HOME = "RETURNING_HOME"
     ARRIVED_HOME = "ARRIVED_HOME"
     FAILED = "FAILED"
@@ -50,6 +52,12 @@ class MissionReturnResult(str, Enum):
     HARDWARE_UNAVAILABLE = "HARDWARE_UNAVAILABLE"
     RETURN_ROUTE_UNAVAILABLE = "RETURN_ROUTE_UNAVAILABLE"
     U_TURN_START_FAILED = "U_TURN_START_FAILED"
+
+
+class MissionDispenseResult(str, Enum):
+    DISPENSE_COMPLETED = "DISPENSE_COMPLETED"
+    DISPENSE_NOT_ALLOWED = "DISPENSE_NOT_ALLOWED"
+    DISPENSE_FAILED = "DISPENSE_FAILED"
 
 
 class MissionRouteUnavailableError(RuntimeError):
@@ -84,6 +92,20 @@ class MissionReturnOutcome:
         }
 
 
+@dataclass(frozen=True)
+class MissionDispenseOutcome:
+    result: MissionDispenseResult
+    success: bool
+    message: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "success": self.success,
+            "result": self.result.value,
+            "message": self.message,
+        }
+
+
 class MissionExecutor:
     """Start line following, then durably mark the claimed mission in progress."""
 
@@ -94,7 +116,9 @@ class MissionExecutor:
         start_line_follow: Callable[[], str] | None = None,
         stop_line_follow: Callable[[], str] | None = None,
         u_turn: Callable[[], str] | None = None,
+        dispense_medicine: Callable[[int, int], dict[str, int]] | None = None,
         mark_mission_in_progress: Callable[[ClaimedMission], None] | None = None,
+        mark_mission_completed: Callable[[ClaimedMission], None] | None = None,
         load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
         auto_execution_enabled: bool = False,
     ) -> None:
@@ -106,7 +130,9 @@ class MissionExecutor:
         self._start_line_follow = start_line_follow
         self._stop_line_follow = stop_line_follow
         self._u_turn = u_turn
+        self._dispense_medicine = dispense_medicine
         self._mark_mission_in_progress = mark_mission_in_progress
+        self._mark_mission_completed = mark_mission_completed
         self._load_navigation_map = load_navigation_map
         self._route_planner: LaravelRoutePlanner | None = None
         self._destination_node: PhysicalNode | None = None
@@ -225,7 +251,10 @@ class MissionExecutor:
         """Validate ARRIVED_AT_ROOM and start exactly one existing U-turn."""
 
         with self._lock:
-            if self._state is not MissionExecutionState.ARRIVED_AT_ROOM:
+            if self._state not in {
+                MissionExecutionState.ARRIVED_AT_ROOM,
+                MissionExecutionState.DISPENSE_COMPLETED,
+            }:
                 return MissionReturnOutcome(
                     MissionReturnResult.RETURN_NOT_ALLOWED,
                     False,
@@ -256,7 +285,10 @@ class MissionExecutor:
             if self._u_turn is None:
                 raise RuntimeError("U-turn operation is not configured")
             with self._lock:
-                if self._state is not MissionExecutionState.ARRIVED_AT_ROOM:
+                if self._state not in {
+                    MissionExecutionState.ARRIVED_AT_ROOM,
+                    MissionExecutionState.DISPENSE_COMPLETED,
+                }:
                     return MissionReturnOutcome(
                         MissionReturnResult.RETURN_NOT_ALLOWED,
                         False,
@@ -284,6 +316,69 @@ class MissionExecutor:
 
         return MissionReturnOutcome(MissionReturnResult.RETURN_STARTED, True)
 
+    def dispense_at_room(self) -> MissionDispenseOutcome:
+        """Dispense the retained mission once, validating the UNO summary."""
+
+        with self._lock:
+            if self._state is not MissionExecutionState.ARRIVED_AT_ROOM:
+                return MissionDispenseOutcome(
+                    MissionDispenseResult.DISPENSE_NOT_ALLOWED,
+                    False,
+                    f"MissionExecutor is {self._state.value}.",
+                )
+            mission = self._mission
+            if mission is None:
+                self._state = MissionExecutionState.FAILED
+                self._last_error = "Mission context is unavailable."
+                return MissionDispenseOutcome(
+                    MissionDispenseResult.DISPENSE_FAILED,
+                    False,
+                    self._last_error,
+                )
+            box_number = mission.dispenser_box
+            quantity = mission.quantity
+            if box_number not in (1, 2) or quantity <= 0:
+                self._state = MissionExecutionState.FAILED
+                self._last_error = "Mission dispenser data is invalid."
+                return MissionDispenseOutcome(
+                    MissionDispenseResult.DISPENSE_FAILED,
+                    False,
+                    self._last_error,
+                )
+            self._state = MissionExecutionState.DISPENSING
+            self._last_error = None
+
+        try:
+            if self._dispense_medicine is None:
+                raise RuntimeError("Medicine dispense operation is not configured")
+            result = self._dispense_medicine(box_number, quantity)
+            if (
+                result.get("box_number") != box_number
+                or result.get("requested_pills") != quantity
+                or result.get("dispensed_pills") != quantity
+            ):
+                raise RuntimeError(
+                    "Dispenser completed quantity does not match the mission"
+                )
+        except Exception as exc:
+            message = f"DISPENSE_FAILED: {exc}"
+            with self._lock:
+                self._state = MissionExecutionState.FAILED
+                self._last_error = message
+            return MissionDispenseOutcome(
+                MissionDispenseResult.DISPENSE_FAILED,
+                False,
+                message,
+            )
+
+        with self._lock:
+            self._state = MissionExecutionState.DISPENSE_COMPLETED
+            self._last_error = None
+        return MissionDispenseOutcome(
+            MissionDispenseResult.DISPENSE_COMPLETED,
+            True,
+        )
+
     def mark_arrived_home(self) -> None:
         """Record return arrival while retaining mission diagnostic context."""
 
@@ -293,6 +388,49 @@ class MissionExecutor:
                     "MissionExecutor is not returning home"
                 )
             self._state = MissionExecutionState.ARRIVED_HOME
+
+    def finalize_arrived_home(self) -> bool:
+        """Complete the confirmed mission and release its runtime context.
+
+        Arrival remains visible as ``ARRIVED_HOME`` until this method is
+        called by the navigation coordinator after its observation interval.
+        A Laravel completion failure deliberately retains the mission rather
+        than allowing a second mission to be claimed over an in-progress one.
+        """
+
+        with self._lock:
+            if self._state is not MissionExecutionState.ARRIVED_HOME:
+                return False
+            mission = self._mission
+            if mission is None:
+                self._state = MissionExecutionState.FAILED
+                self._last_error = "Mission context is unavailable at home arrival."
+                return False
+
+        try:
+            if self._mark_mission_completed is not None:
+                self._mark_mission_completed(mission)
+        except Exception as exc:
+            with self._lock:
+                if (
+                    self._state is MissionExecutionState.ARRIVED_HOME
+                    and self._mission == mission
+                ):
+                    self._last_error = f"Laravel mission completion failed: {exc}"
+            return False
+
+        with self._lock:
+            if (
+                self._state is not MissionExecutionState.ARRIVED_HOME
+                or self._mission != mission
+            ):
+                return False
+            self._mission = None
+            self._route_planner = None
+            self._destination_node = None
+            self._last_error = None
+            self._state = MissionExecutionState.IDLE
+        return True
 
     def start_ready_mission(self) -> MissionStartOutcome:
         """Perform only READY -> line follow -> in_progress -> GOING_TO_ROOM."""

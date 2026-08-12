@@ -349,3 +349,39 @@ def test_return_home_invalid_state_and_hardware_failure_do_not_turn() -> None:
     assert unavailable.result.value == "HARDWARE_UNAVAILABLE"
     assert executor.state is MissionExecutionState.ARRIVED_AT_ROOM
     assert u_turn_calls == []
+
+
+def test_arrived_home_finalization_completes_and_clears_mission_context() -> None:
+    dependencies = FakeExecutionDependencies()
+    completed_missions: list[ClaimedMission] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=lambda: "ACK|U_TURN_STARTED",
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        mark_mission_completed=completed_missions.append,
+        load_navigation_map=navigation_map_for_room_one,
+    )
+    mission = valid_mission()
+    assert executor.accept(mission) is True
+    assert executor.start_ready_mission().success is True
+    executor.mark_arrived_at_room()
+    assert executor.start_return_home().success is True
+    executor.mark_arrived_home()
+
+    assert executor.state is MissionExecutionState.ARRIVED_HOME
+    assert executor.finalize_arrived_home() is True
+    assert completed_missions == [mission]
+    assert executor.status() == {
+        "state": "IDLE",
+        "mission_id": None,
+        "room_id": None,
+        "room_number": None,
+        "target_room": None,
+        "medicine_id": None,
+        "dispenser_box": None,
+        "quantity": None,
+        "last_error": None,
+        "auto_execution_enabled": False,
+    }

@@ -261,12 +261,23 @@ def create_app(
             with hardware_lock:
                 return operation()
 
+        def dispense_executor_medicine(
+            box_number: int,
+            quantity: int,
+        ) -> dict[str, int]:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.dispense(box_number, quantity)
+
         executor = MissionExecutor(
             hardware_available=hardware_available,
             start_line_follow=start_executor_line_follow,
             stop_line_follow=stop_executor_line_follow,
             u_turn=lambda: run_navigation_hardware(controller.u_turn),
+            dispense_medicine=dispense_executor_medicine,
             mark_mission_in_progress=laravel_client.start_claimed_mission,
+            mark_mission_completed=laravel_client.complete_claimed_mission,
             load_navigation_map=laravel_client.get_navigation_map,
             auto_execution_enabled=scheduler_settings.auto_execution_enabled,
         )
