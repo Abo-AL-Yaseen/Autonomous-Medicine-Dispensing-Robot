@@ -266,6 +266,42 @@ def test_same_marker_is_confirmed_after_configured_consecutive_frames() -> None:
     assert result.consecutive_frames == 3
 
 
+def test_fresh_detection_confirmation_uses_only_frames_after_boundary() -> None:
+    service = build_service(FakeCapture([]), confirm_frames=3)
+    # Simulate an early view of marker 2 that was almost confirmed before the
+    # physical intersection event.
+    service.process_detections([[2]], [square(50)])
+    service.process_detections([[2]], [square(50)])
+
+    requested_after_sequences: list[int | None] = []
+    post_event_frames = iter([(101, object()), (102, object()), (103, object())])
+    service._camera_is_available = lambda: True  # type: ignore[method-assign]
+
+    def next_frame(
+        after_sequence: int | None,
+        *,
+        timeout: float,
+    ) -> tuple[int, object]:
+        requested_after_sequences.append(after_sequence)
+        return next(post_event_frames)
+
+    service._next_detection_frame = next_frame  # type: ignore[method-assign]
+    service._detect_frame = (  # type: ignore[method-assign]
+        lambda frame, *, expected_marker_id: service.process_detections(
+            [[1]],
+            [square(50)],
+            expected_marker_id=expected_marker_id,
+        )
+    )
+
+    result = service.detect(after_sequence=100)
+
+    assert requested_after_sequences == [100, 101, 102]
+    assert result.marker_id == 1
+    assert result.confirmed is True
+    assert result.consecutive_frames == 3
+
+
 def test_marker_is_not_confirmed_with_insufficient_consecutive_frames() -> None:
     service = build_service(FakeCapture([]), confirm_frames=3)
 

@@ -231,8 +231,13 @@ class ArucoCameraService:
         self,
         *,
         expected_marker_id: int | None = None,
+        after_sequence: int | None = None,
     ) -> MarkerDetectionResult:
-        """Inspect consecutive frames supplied by the sole camera reader."""
+        """Inspect consecutive frames supplied by the sole camera reader.
+
+        A supplied ``after_sequence`` requires every confirmation frame to be
+        strictly newer than that frame, without pausing capture or streaming.
+        """
 
         with self._detection_lock:
             if not self._camera_is_available():
@@ -242,6 +247,14 @@ class ArucoCameraService:
                     confirmed=False,
                 )
 
+            if after_sequence is not None:
+                # A candidate from before the physical event cannot count
+                # toward that event's navigation decision.
+                self._reset_confirmation()
+            detection_after_sequence = _later_sequence(
+                self._last_detection_sequence,
+                after_sequence,
+            )
             result = MarkerDetectionResult(
                 camera_available=True,
                 detected=False,
@@ -250,13 +263,14 @@ class ArucoCameraService:
             for _ in range(self.settings.confirm_frames):
                 try:
                     next_frame = self._next_detection_frame(
-                        self._last_detection_sequence,
+                        detection_after_sequence,
                         timeout=DEFAULT_FRAME_WAIT_SECONDS,
                     )
                     if next_frame is None:
                         raise RuntimeError("camera frame unavailable")
                     sequence, frame = next_frame
                     self._last_detection_sequence = sequence
+                    detection_after_sequence = sequence
                     result = self._detect_frame(
                         frame,
                         expected_marker_id=expected_marker_id,
@@ -273,6 +287,12 @@ class ArucoCameraService:
                     break
 
             return result
+
+    def current_frame_sequence(self) -> int:
+        """Return the newest captured frame sequence without consuming it."""
+
+        with self._frame_condition:
+            return self._frame_sequence
 
     def process_detections(
         self,
@@ -651,6 +671,17 @@ class ArucoCameraService:
         with self._confirmation_lock:
             self._candidate_id = None
             self._candidate_frames = 0
+
+
+def _later_sequence(
+    first: int | None,
+    second: int | None,
+) -> int | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return max(first, second)
 
 
 def _mjpeg_part(jpeg: bytes) -> bytes:

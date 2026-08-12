@@ -107,14 +107,21 @@ class FakeCamera:
         self.detections = list(detections)
         self.calls = 0
         self.expected_marker_ids: list[int | None] = []
+        self.after_sequences: list[int | None] = []
+        self.frame_sequence = 100
+
+    def current_frame_sequence(self) -> int:
+        return self.frame_sequence
 
     def detect(
         self,
         *,
         expected_marker_id: int | None = None,
+        after_sequence: int | None = None,
     ) -> MarkerDetectionResult:
         self.calls += 1
         self.expected_marker_ids.append(expected_marker_id)
+        self.after_sequences.append(after_sequence)
         if not self.detections:
             raise AssertionError("No camera detection was configured")
         if len(self.detections) == 1:
@@ -341,6 +348,89 @@ def test_duplicate_event_dispatches_once_and_completion_rearms() -> None:
     assert camera.expected_marker_ids == [None, 1]
 
 
+@pytest.mark.parametrize("room_id", [2, 3])
+def test_room_two_and_three_ignore_early_marker_two_and_use_fresh_marker_one(
+    room_id: int,
+) -> None:
+    hardware = HardwareRecorder()
+    camera = FakeCamera(confirmed_marker(2), confirmed_marker(1))
+    # This represents continuous camera/preview activity before the physical
+    # intersection event.  It must not supply the route decision.
+    assert camera.detect().marker_id == 2
+    service = coordinator(going_executor(room_id), camera, hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == ["LEFT"]
+    assert camera.expected_marker_ids == [None, None]
+    assert camera.after_sequences == [None, 100]
+    assert service.status()["last_marker_id"] == 1
+    assert service.status()["last_node"] == "NODE_1"
+
+
+@pytest.mark.parametrize(
+    ("room_id", "marker_id", "expected_command"),
+    [(1, 0, "LEFT"), (4, 0, "STRAIGHT"), (5, 0, "STRAIGHT")],
+)
+def test_room_one_four_and_five_keep_existing_detection_timing(
+    room_id: int,
+    marker_id: int,
+    expected_command: str,
+) -> None:
+    hardware = HardwareRecorder()
+    camera = FakeCamera(confirmed_marker(marker_id))
+    service = coordinator(going_executor(room_id), camera, hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == [expected_command]
+    assert camera.after_sequences == [None]
+
+
+def test_room_two_area_first_selection_is_applied_after_intersection_event() -> None:
+    hardware = HardwareRecorder()
+    dominant_marker_one = MarkerDetectionResult(
+        camera_available=True,
+        detected=True,
+        confirmed=True,
+        marker_id=1,
+        area=50000,
+        second_marker_id=2,
+        second_area=10000,
+        area_ratio=5.0,
+    )
+    camera = FakeCamera(dominant_marker_one)
+    service = coordinator(going_executor(2), camera, hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == ["LEFT"]
+    assert camera.after_sequences == [100]
+    assert service.status()["last_marker_id"] == 1
+    assert service.status()["last_second_marker_id"] == 2
+
+
+def test_room_three_without_fresh_confirmation_fails_without_movement() -> None:
+    hardware = HardwareRecorder()
+    camera = FakeCamera(
+        MarkerDetectionResult(
+            camera_available=True,
+            detected=True,
+            confirmed=False,
+            marker_id=1,
+            area=50000,
+            consecutive_frames=2,
+        )
+    )
+    service = coordinator(going_executor(3), camera, hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == []
+    assert camera.after_sequences == [100]
+    assert service.status()["last_error"] == "MARKER_NOT_CONFIRMED"
+
+
 def test_ambiguous_marker_selection_sends_zero_hardware_commands() -> None:
     hardware = HardwareRecorder()
     ambiguous = MarkerDetectionResult(
@@ -355,7 +445,8 @@ def test_ambiguous_marker_selection_sends_zero_hardware_commands() -> None:
         ambiguous=True,
         selection_error="AMBIGUOUS_MARKERS",
     )
-    service = coordinator(going_executor(2), FakeCamera(ambiguous), hardware)
+    camera = FakeCamera(ambiguous)
+    service = coordinator(going_executor(2), camera, hardware)
 
     service.process_serial_line(INTERSECTION_EVENT)
 
@@ -364,6 +455,7 @@ def test_ambiguous_marker_selection_sends_zero_hardware_commands() -> None:
     assert service.status()["last_error"] == "AMBIGUOUS_MARKERS"
     assert service.status()["last_selection_ambiguous"] is True
     assert service.status()["last_second_marker_id"] == 1
+    assert camera.after_sequences == [100]
 
 
 def test_unexpected_route_marker_sends_zero_hardware_commands() -> None:
@@ -712,6 +804,21 @@ def test_return_u_turn_runs_once_and_stale_arrival_event_cannot_move() -> None:
     assert hardware.navigation == ["U_TURN"]
     assert camera.calls == 0
     assert service.status()["expected_marker_id"] == 0
+
+
+def test_room_two_return_home_keeps_existing_detection_timing() -> None:
+    hardware = HardwareRecorder()
+    camera = FakeCamera(confirmed_marker(0))
+    executor = arrived_executor(2, hardware)
+    service = coordinator(executor, camera, hardware)
+
+    assert service.begin_return_home()["result"] == "RETURN_STARTED"
+    service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == ["U_TURN"]
+    assert camera.after_sequences == [None]
+    assert executor.state is MissionExecutionState.ARRIVED_HOME
 
 
 @pytest.mark.parametrize(

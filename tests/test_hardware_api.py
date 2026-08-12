@@ -342,9 +342,13 @@ class FakeCameraService:
         self,
         *,
         expected_marker_id: int | None = None,
+        after_sequence: int | None = None,
     ) -> MarkerDetectionResult:
         self.detect_calls += 1
         return self.detection
+
+    def current_frame_sequence(self) -> int:
+        return 1
 
     def get_preview_jpeg(
         self,

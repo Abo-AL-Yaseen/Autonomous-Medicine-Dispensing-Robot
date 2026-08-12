@@ -148,6 +148,13 @@ class MissionExecutor:
         with self._lock:
             return self._mission.id if self._mission else None
 
+    @property
+    def room_id(self) -> int | None:
+        """Return the loaded target room without exposing mission mutation."""
+
+        with self._lock:
+            return self._mission.room_id if self._mission else None
+
     def accept(self, mission: ClaimedMission) -> bool:
         """Transition IDLE to READY exactly once for the accepted mission."""
 

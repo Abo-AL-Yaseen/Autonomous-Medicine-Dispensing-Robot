@@ -400,6 +400,20 @@ class NavigationCoordinator:
             with self._lock:
                 self._ignore_stale_events_while_idle = False
 
+            # Rooms 2 and 3 share the NODE_0 -> NODE_1 -> NODE_2 corridor.
+            # Their view of marker 2 can begin before NODE_1 is physically
+            # reached, so their outbound decision deliberately starts a new
+            # detection window at the serial intersection event.  The map
+            # still determines the actual current node and next direction.
+            post_event_sequence: int | None = None
+            if (
+                executor_state is MissionExecutionState.GOING_TO_ROOM
+                and self._executor.room_id in {2, 3}
+            ):
+                post_event_sequence = (
+                    self._camera_service.current_frame_sequence()
+                )
+
             mission_id = self._executor.mission_id
             with self._lock:
                 if self._expected_mission_id != mission_id:
@@ -409,6 +423,7 @@ class NavigationCoordinator:
 
             detection = self._camera_service.detect(
                 expected_marker_id=expected_marker_id,
+                after_sequence=post_event_sequence,
             )
             with self._lock:
                 self._last_marker_id = detection.marker_id
