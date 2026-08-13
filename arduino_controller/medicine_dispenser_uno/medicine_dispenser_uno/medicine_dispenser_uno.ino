@@ -4,6 +4,19 @@
 #define STEPS_PER_REV 2048
 #define PILL_STEPS 256
 
+// Pill-drop IR sensors. Most LM393-style obstacle modules assert LOW when a
+// pill blocks the beam. Change this one value to HIGH after workshop testing
+// if the installed sensors report the opposite polarity.
+const byte PILL_SENSOR_1_PIN = 12;
+const byte PILL_SENSOR_2_PIN = 3;
+const byte PILL_SENSOR_ACTIVE_STATE = LOW;
+
+// Tune these against the installed chute and sensors. The debounce filters
+// contact/noise chatter without adding a long arbitrary delay.
+const unsigned long PILL_SENSOR_DEBOUNCE_MS = 10;
+const unsigned long PILL_SENSOR_CLEAR_TIMEOUT_MS = 100;
+const unsigned long PILL_DETECTION_TIMEOUT_MS = 2000;
+
 // Keep these pin orders matched to the ULN2003 wiring.
 Stepper motor1(STEPS_PER_REV, 4, 6, 5, 7);
 Stepper motor2(STEPS_PER_REV, 8, 10, 9, 11);
@@ -59,6 +72,145 @@ void runBothMotors(int steps) {
   controllerState = IDLE;
 }
 
+enum DispenseResult {
+  DISPENSE_CONFIRMED,
+  DISPENSE_SENSOR_STUCK,
+  DISPENSE_PILL_TIMEOUT
+};
+
+struct SensorTransitionTracker {
+  bool lastDetected;
+  unsigned long changedAt;
+  bool confirmed;
+};
+
+bool pillSensorDetected(byte pin) {
+  return digitalRead(pin) == PILL_SENSOR_ACTIVE_STATE;
+}
+
+bool waitForStableSensorState(
+  byte pin,
+  bool expectedDetected,
+  unsigned long stableMs,
+  unsigned long timeoutMs
+) {
+  bool lastDetected = pillSensorDetected(pin);
+  unsigned long changedAt = millis();
+  unsigned long startedAt = changedAt;
+
+  while (millis() - startedAt < timeoutMs) {
+    bool detected = pillSensorDetected(pin);
+    unsigned long now = millis();
+    if (detected != lastDetected) {
+      lastDetected = detected;
+      changedAt = now;
+    }
+    if (detected == expectedDetected && now - changedAt >= stableMs) {
+      return true;
+    }
+    delay(1);
+  }
+  return false;
+}
+
+void updatePillTransition(
+  byte pin,
+  SensorTransitionTracker *tracker
+) {
+  bool detected = pillSensorDetected(pin);
+  unsigned long now = millis();
+  if (detected != tracker->lastDetected) {
+    tracker->lastDetected = detected;
+    tracker->changedAt = now;
+  }
+  if (
+    detected &&
+    !tracker->confirmed &&
+    now - tracker->changedAt >= PILL_SENSOR_DEBOUNCE_MS
+  ) {
+    tracker->confirmed = true;
+  }
+}
+
+DispenseResult runConfirmedPill(
+  Stepper *motor,
+  byte sensorPin,
+  ControllerState dispensingState
+) {
+  // A blocked sensor before movement is unsafe: do not rotate the disk.
+  if (pillSensorDetected(sensorPin)) {
+    return DISPENSE_SENSOR_STUCK;
+  }
+  if (!waitForStableSensorState(
+        sensorPin,
+        false,
+        PILL_SENSOR_DEBOUNCE_MS,
+        PILL_SENSOR_CLEAR_TIMEOUT_MS
+      )) {
+    return DISPENSE_SENSOR_STUCK;
+  }
+
+  controllerState = dispensingState;
+  SensorTransitionTracker tracker = {false, millis(), false};
+  unsigned long startedAt = millis();
+
+  // Step one increment at a time so both D12 and D3 are polled throughout
+  // the complete existing 256-step dispense motion.
+  for (int step = 0; step < PILL_STEPS; step++) {
+    motor->step(1);
+    updatePillTransition(sensorPin, &tracker);
+  }
+
+  // A pill can leave the disk just after the final step. Keep polling only
+  // until the bounded per-pill deadline; never report motor motion as a pill.
+  while (!tracker.confirmed && millis() - startedAt < PILL_DETECTION_TIMEOUT_MS) {
+    updatePillTransition(sensorPin, &tracker);
+    delay(1);
+  }
+
+  if (!tracker.confirmed) {
+    controllerState = IDLE;
+    return DISPENSE_PILL_TIMEOUT;
+  }
+
+  // Re-arm requires a stable clear sensor so the next command cannot count
+  // the same pill or a sensor that has remained blocked.
+  if (!waitForStableSensorState(
+        sensorPin,
+        false,
+        PILL_SENSOR_DEBOUNCE_MS,
+        PILL_SENSOR_CLEAR_TIMEOUT_MS
+      )) {
+    controllerState = IDLE;
+    return DISPENSE_SENSOR_STUCK;
+  }
+
+  controllerState = IDLE;
+  return DISPENSE_CONFIRMED;
+}
+
+void printDispenseError(const char *command, DispenseResult result) {
+  Serial.print(F("ERROR|"));
+  Serial.print(command);
+  Serial.print(F("|CODE="));
+  if (result == DISPENSE_SENSOR_STUCK) {
+    Serial.println(F("SENSOR_STUCK"));
+  } else {
+    Serial.println(F("PILL_TIMEOUT"));
+  }
+}
+
+void printDispenseBothError(byte box, DispenseResult result) {
+  Serial.print(F("ERROR|DISPENSE_BOTH|BOX="));
+  Serial.print(box);
+  Serial.print(F("|CODE="));
+  if (result == DISPENSE_SENSOR_STUCK) {
+    Serial.println(F("SENSOR_STUCK"));
+  } else {
+    Serial.println(F("PILL_TIMEOUT"));
+  }
+}
+
 void executeCommand(const char *command) {
   if (strcmp(command, "PING") == 0) {
     Serial.println(F("ACK|PING"));
@@ -66,15 +218,49 @@ void executeCommand(const char *command) {
     printStatus();
   } else if (strcmp(command, "DISPENSE_1") == 0) {
     Serial.println(F("ACK|DISPENSE_1"));
-    runMotor1(PILL_STEPS);
-    Serial.println(F("DONE|DISPENSE_1"));
+    DispenseResult result = runConfirmedPill(
+      &motor1,
+      PILL_SENSOR_1_PIN,
+      DISPENSING_1
+    );
+    if (result == DISPENSE_CONFIRMED) {
+      Serial.println(F("DONE|DISPENSE_1"));
+    } else {
+      printDispenseError("DISPENSE_1", result);
+    }
   } else if (strcmp(command, "DISPENSE_2") == 0) {
     Serial.println(F("ACK|DISPENSE_2"));
-    runMotor2(PILL_STEPS);
-    Serial.println(F("DONE|DISPENSE_2"));
+    DispenseResult result = runConfirmedPill(
+      &motor2,
+      PILL_SENSOR_2_PIN,
+      DISPENSING_2
+    );
+    if (result == DISPENSE_CONFIRMED) {
+      Serial.println(F("DONE|DISPENSE_2"));
+    } else {
+      printDispenseError("DISPENSE_2", result);
+    }
   } else if (strcmp(command, "DISPENSE_BOTH") == 0) {
     Serial.println(F("ACK|DISPENSE_BOTH"));
-    runBothMotors(PILL_STEPS);
+    DispenseResult firstResult = runConfirmedPill(
+      &motor1,
+      PILL_SENSOR_1_PIN,
+      DISPENSING_BOTH
+    );
+    if (firstResult != DISPENSE_CONFIRMED) {
+      printDispenseBothError(1, firstResult);
+      return;
+    }
+    delay(500);
+    DispenseResult secondResult = runConfirmedPill(
+      &motor2,
+      PILL_SENSOR_2_PIN,
+      DISPENSING_BOTH
+    );
+    if (secondResult != DISPENSE_CONFIRMED) {
+      printDispenseBothError(2, secondResult);
+      return;
+    }
     Serial.println(F("DONE|DISPENSE_BOTH"));
   } else if (strcmp(command, "1") == 0) {
     Serial.println(F("ACK|1"));
@@ -152,6 +338,8 @@ void setup() {
 
   motor1.setSpeed(12);
   motor2.setSpeed(12);
+  pinMode(PILL_SENSOR_1_PIN, INPUT);
+  pinMode(PILL_SENSOR_2_PIN, INPUT);
 
   Serial.println(F("CONTROLLER|ARDUINO_UNO"));
   Serial.println(F("BAUD|9600"));

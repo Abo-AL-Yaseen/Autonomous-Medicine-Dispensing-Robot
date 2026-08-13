@@ -12,6 +12,7 @@ from typing import Iterator
 import pytest
 
 from raspberry_controller.hardware_controller import (
+    DispenseError,
     HardwareControllerError,
     RobotHardwareController,
     SerialController,
@@ -56,6 +57,28 @@ class RecordingSerialController:
             assert validator(response)
         if response_prefix is not None:
             assert response.startswith(response_prefix)
+        return response
+
+
+class ScriptedArduinoSerialController(RecordingSerialController):
+    """Supply each UNO protocol response or failure in order."""
+
+    def __init__(self, responses: list[str | HardwareControllerError]) -> None:
+        super().__init__()
+        self._scripted_responses = list(responses)
+
+    def wait_for_response(
+        self,
+        expected: str | Sequence[str],
+        *,
+        validator: Callable[[str], bool] | None = None,
+        response_prefix: str | None = None,
+        overall_timeout: float | None = None,
+    ) -> str:
+        self.expected_responses.append(expected)
+        response = self._scripted_responses.pop(0)
+        if isinstance(response, HardwareControllerError):
+            raise response
         return response
 
 
@@ -114,6 +137,84 @@ def test_water_dispense_sends_one_bounded_duration_command() -> None:
 
     assert controller.dispense_water(2000) == {"duration_ms": 2000}
     assert connection.writes == [b"WATER_DISPENSE|MS=2000\n"]
+
+
+def test_dispense_preserves_exact_ack_done_contract_per_confirmed_pill() -> None:
+    arduino = ScriptedArduinoSerialController(
+        [
+            "ACK|DISPENSE_1",
+            "DONE|DISPENSE_1",
+            "ACK|DISPENSE_1",
+            "DONE|DISPENSE_1",
+        ]
+    )
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=arduino,  # type: ignore[arg-type]
+    )
+
+    result = controller.dispense(1, 2)
+
+    assert result == {
+        "box_number": 1,
+        "requested_pills": 2,
+        "dispensed_pills": 2,
+    }
+    assert arduino.commands == ["DISPENSE_1", "DISPENSE_1"]
+    assert arduino.expected_responses == [
+        "ACK|DISPENSE_1",
+        "DONE|DISPENSE_1",
+        "ACK|DISPENSE_1",
+        "DONE|DISPENSE_1",
+    ]
+
+
+def test_dispense_sensor_timeout_is_immediate_and_preserves_partial_count() -> None:
+    arduino = ScriptedArduinoSerialController(
+        [
+            "ACK|DISPENSE_1",
+            "DONE|DISPENSE_1",
+            "ACK|DISPENSE_1",
+            "DONE|DISPENSE_1",
+            "ACK|DISPENSE_1",
+            UnexpectedSerialResponse(
+                "UNEXPECTED_RESPONSE|RECEIVED=ERROR|DISPENSE_1|CODE=PILL_TIMEOUT"
+            ),
+        ]
+    )
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=arduino,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        DispenseError,
+        match=r"DISPENSE_FAILED\|BOX=1\|COMPLETED=2\|STAGE=DONE\|CAUSE=PILL_TIMEOUT",
+    ):
+        controller.dispense(1, 3)
+
+    assert arduino.commands == ["DISPENSE_1", "DISPENSE_1", "DISPENSE_1"]
+
+
+def test_dispense_sensor_stuck_is_immediate_without_completed_pill() -> None:
+    arduino = ScriptedArduinoSerialController(
+        [
+            "ACK|DISPENSE_2",
+            UnexpectedSerialResponse(
+                "UNEXPECTED_RESPONSE|RECEIVED=ERROR|DISPENSE_2|CODE=SENSOR_STUCK"
+            ),
+        ]
+    )
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=arduino,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        DispenseError,
+        match=r"DISPENSE_FAILED\|BOX=2\|COMPLETED=0\|STAGE=DONE\|CAUSE=SENSOR_STUCK",
+    ):
+        controller.dispense(2, 1)
 
 
 @pytest.mark.parametrize(

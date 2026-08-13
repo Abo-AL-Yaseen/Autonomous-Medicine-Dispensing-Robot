@@ -294,6 +294,36 @@ def test_execution_step_calls_no_out_of_scope_hardware() -> None:
     assert dependencies.return_home_calls == []
 
 
+def test_partial_sensor_confirmed_dispense_fails_and_cannot_start_return_home() -> None:
+    dependencies = FakeExecutionDependencies()
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+        dispense_medicine=lambda box, quantity: {
+            "box_number": box,
+            "requested_pills": quantity,
+            "dispensed_pills": quantity - 1,
+        },
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+    )
+    assert executor.accept(valid_mission()) is True
+    assert executor.start_ready_mission().success is True
+    executor.mark_arrived_at_room()
+
+    dispense = executor.dispense_at_room()
+    returned = executor.start_return_home()
+
+    assert dispense.success is False
+    assert dispense.result.value == "DISPENSE_FAILED"
+    assert executor.state is MissionExecutionState.FAILED
+    assert returned.result.value == "RETURN_NOT_ALLOWED"
+    assert u_turn_calls == []
+
+
 def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:
     dependencies = FakeExecutionDependencies()
     u_turn_calls: list[str] = []

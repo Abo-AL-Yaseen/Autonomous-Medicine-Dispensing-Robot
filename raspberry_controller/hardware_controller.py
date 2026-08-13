@@ -800,7 +800,8 @@ class RobotHardwareController:
                             box_number,
                             completed_pills,
                             "DONE",
-                            exc,
+                            self._dispense_sensor_error_code(exc, command)
+                            or exc,
                         )
 
                 completed_pills += 1
@@ -914,16 +915,34 @@ class RobotHardwareController:
         )
 
     @staticmethod
+    def _dispense_sensor_error_code(
+        cause: HardwareControllerError,
+        command: str,
+    ) -> str | None:
+        """Extract UNO sensor failures from an immediate ERROR response."""
+
+        response_prefix = f"RECEIVED=ERROR|{command}|CODE="
+        message = str(cause)
+        start = message.find(response_prefix)
+        if start < 0:
+            return None
+        code = message[start + len(response_prefix) :].split("|", 1)[0]
+        return code if code in {"PILL_TIMEOUT", "SENSOR_STUCK"} else None
+
+    @staticmethod
     def _raise_dispense_error(
         box_number: int,
         completed_pills: int,
         stage: str,
-        cause: HardwareControllerError,
+        cause: HardwareControllerError | str,
     ) -> None:
-        raise DispenseError(
+        error = DispenseError(
             f"DISPENSE_FAILED|BOX={box_number}|COMPLETED={completed_pills}"
             f"|STAGE={stage}|CAUSE={_clean_field(cause)}"
-        ) from cause
+        )
+        if isinstance(cause, BaseException):
+            raise error from cause
+        raise error
 
 
 class MachineReadableArgumentParser(argparse.ArgumentParser):
