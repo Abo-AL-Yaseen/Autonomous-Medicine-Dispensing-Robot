@@ -37,7 +37,8 @@ def test_confirmed_dispense_keeps_256_incremental_steps_and_sensor_errors() -> N
     assert "#define PILL_STEPS 256" in source
     assert "for (int step = 0; step < PILL_STEPS; step++)" in source
     assert "motor->step(1);" in source
-    assert "PILL_SENSOR_DEBOUNCE_MS = 10" in source
+    assert "PILL_DETECT_DEBOUNCE_MS = 1" in source
+    assert "PILL_CLEAR_DEBOUNCE_MS = 10" in source
     assert "PILL_DETECTION_TIMEOUT_MS = 2000" in source
     assert "ERROR|" in source
     assert "SENSOR_STUCK" in source

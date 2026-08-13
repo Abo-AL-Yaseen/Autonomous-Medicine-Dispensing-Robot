@@ -11,9 +11,10 @@ const byte PILL_SENSOR_1_PIN = 12;
 const byte PILL_SENSOR_2_PIN = 3;
 const byte PILL_SENSOR_ACTIVE_STATE = LOW;
 
-// Tune these against the installed chute and sensors. The debounce filters
-// contact/noise chatter without adding a long arbitrary delay.
-const unsigned long PILL_SENSOR_DEBOUNCE_MS = 10;
+// A pill can create a very short LOW pulse. Confirm detection promptly, while
+// keeping a longer clear/re-arm filter before the next dispense command.
+const unsigned long PILL_DETECT_DEBOUNCE_MS = 1;
+const unsigned long PILL_CLEAR_DEBOUNCE_MS = 10;
 const unsigned long PILL_SENSOR_CLEAR_TIMEOUT_MS = 100;
 const unsigned long PILL_DETECTION_TIMEOUT_MS = 2000;
 const unsigned long PILL_SENSOR_MONITOR_MS = 5000;
@@ -130,7 +131,7 @@ void updatePillTransition(
   if (
     detected &&
     !tracker->confirmed &&
-    now - tracker->changedAt >= PILL_SENSOR_DEBOUNCE_MS
+    now - tracker->changedAt >= PILL_DETECT_DEBOUNCE_MS
   ) {
     tracker->confirmed = true;
   }
@@ -148,7 +149,7 @@ DispenseResult runConfirmedPill(
   if (!waitForStableSensorState(
         sensorPin,
         false,
-        PILL_SENSOR_DEBOUNCE_MS,
+        PILL_CLEAR_DEBOUNCE_MS,
         PILL_SENSOR_CLEAR_TIMEOUT_MS
       )) {
     return DISPENSE_SENSOR_STUCK;
@@ -182,7 +183,7 @@ DispenseResult runConfirmedPill(
   if (!waitForStableSensorState(
         sensorPin,
         false,
-        PILL_SENSOR_DEBOUNCE_MS,
+        PILL_CLEAR_DEBOUNCE_MS,
         PILL_SENSOR_CLEAR_TIMEOUT_MS
       )) {
     controllerState = IDLE;
