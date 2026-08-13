@@ -35,6 +35,21 @@ enum ControllerState {
 
 ControllerState controllerState = IDLE;
 
+// These types must appear before the first function definition. Arduino's
+// preprocessor inserts function prototypes there, and those prototypes use
+// both types below.
+enum DispenseResult {
+  DISPENSE_CONFIRMED,
+  DISPENSE_SENSOR_STUCK,
+  DISPENSE_PILL_TIMEOUT
+};
+
+struct SensorTransitionTracker {
+  bool lastDetected;
+  unsigned long changedAt;
+  bool confirmed;
+};
+
 void printStatus() {
   switch (controllerState) {
     case DISPENSING_1:
@@ -71,18 +86,6 @@ void runBothMotors(int steps) {
   motor2.step(steps);
   controllerState = IDLE;
 }
-
-enum DispenseResult {
-  DISPENSE_CONFIRMED,
-  DISPENSE_SENSOR_STUCK,
-  DISPENSE_PILL_TIMEOUT
-};
-
-struct SensorTransitionTracker {
-  bool lastDetected;
-  unsigned long changedAt;
-  bool confirmed;
-};
 
 bool pillSensorDetected(byte pin) {
   return digitalRead(pin) == PILL_SENSOR_ACTIVE_STATE;
