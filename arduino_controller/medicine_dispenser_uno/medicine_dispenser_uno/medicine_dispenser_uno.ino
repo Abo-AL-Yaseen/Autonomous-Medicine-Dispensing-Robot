@@ -52,10 +52,22 @@ struct SensorTransitionTracker {
   volatile bool lowActive;
   volatile bool pulseLatched;
   volatile unsigned long lowStartedAtMicros;
+  volatile unsigned long lastPulseWidthMicros;
 };
 
-SensorTransitionTracker pillSensor1Capture = {false, false, false, 0};
-SensorTransitionTracker pillSensor2Capture = {false, false, false, 0};
+SensorTransitionTracker pillSensor1Capture = {false, false, false, 0, 0};
+SensorTransitionTracker pillSensor2Capture = {false, false, false, 0, 0};
+
+// Temporary PCINT diagnostics. These are intentionally recorded in the ISR
+// but printed only from normal foreground code.
+volatile unsigned long pcint0InvocationCount = 0;
+volatile unsigned long pcint2InvocationCount = 0;
+volatile unsigned long pillSensor1FallingEdgeCount = 0;
+volatile unsigned long pillSensor1RisingEdgeCount = 0;
+volatile unsigned long pillSensor2FallingEdgeCount = 0;
+volatile unsigned long pillSensor2RisingEdgeCount = 0;
+volatile bool pillSensor1ArmedDuringCommand = false;
+volatile bool pillSensor2ArmedDuringCommand = false;
 
 void printStatus() {
   switch (controllerState) {
@@ -151,24 +163,118 @@ void capturePillSensorTransition(
   }
 
   capture->lowActive = false;
-  if (now - capture->lowStartedAtMicros >= PILL_MIN_PULSE_US) {
+  unsigned long pulseWidth = now - capture->lowStartedAtMicros;
+  capture->lastPulseWidthMicros = pulseWidth;
+  if (pulseWidth >= PILL_MIN_PULSE_US) {
     capture->pulseLatched = true;
     capture->armed = false;
   }
 }
 
 ISR(PCINT0_vect) {
+  pcint0InvocationCount++;
+  bool detected = (PINB & _BV(PB4)) == LOW;
+  if (detected) {
+    pillSensor1FallingEdgeCount++;
+  } else {
+    pillSensor1RisingEdgeCount++;
+  }
   capturePillSensorTransition(
     &pillSensor1Capture,
-    (PINB & _BV(PB4)) == LOW
+    detected
   );
 }
 
 ISR(PCINT2_vect) {
+  pcint2InvocationCount++;
+  bool detected = (PIND & _BV(PD3)) == LOW;
+  if (detected) {
+    pillSensor2FallingEdgeCount++;
+  } else {
+    pillSensor2RisingEdgeCount++;
+  }
   capturePillSensorTransition(
     &pillSensor2Capture,
-    (PIND & _BV(PD3)) == LOW
+    detected
   );
+}
+
+void resetPillIrqDebug() {
+  noInterrupts();
+  pcint0InvocationCount = 0;
+  pcint2InvocationCount = 0;
+  pillSensor1FallingEdgeCount = 0;
+  pillSensor1RisingEdgeCount = 0;
+  pillSensor2FallingEdgeCount = 0;
+  pillSensor2RisingEdgeCount = 0;
+  pillSensor1Capture.lastPulseWidthMicros = 0;
+  pillSensor2Capture.lastPulseWidthMicros = 0;
+  pillSensor1ArmedDuringCommand = false;
+  pillSensor2ArmedDuringCommand = false;
+  interrupts();
+}
+
+void printPillIrqDebug() {
+  unsigned long pcint0Count;
+  unsigned long pcint2Count;
+  unsigned long sensor1FallingCount;
+  unsigned long sensor1RisingCount;
+  unsigned long sensor2FallingCount;
+  unsigned long sensor2RisingCount;
+  bool sensor1Armed;
+  bool sensor2Armed;
+  bool sensor1Latched;
+  bool sensor2Latched;
+  bool sensor1ArmedDuringCommand;
+  bool sensor2ArmedDuringCommand;
+  unsigned long sensor1LastPulseWidth;
+  unsigned long sensor2LastPulseWidth;
+
+  noInterrupts();
+  pcint0Count = pcint0InvocationCount;
+  pcint2Count = pcint2InvocationCount;
+  sensor1FallingCount = pillSensor1FallingEdgeCount;
+  sensor1RisingCount = pillSensor1RisingEdgeCount;
+  sensor2FallingCount = pillSensor2FallingEdgeCount;
+  sensor2RisingCount = pillSensor2RisingEdgeCount;
+  sensor1Armed = pillSensor1Capture.armed;
+  sensor2Armed = pillSensor2Capture.armed;
+  sensor1Latched = pillSensor1Capture.pulseLatched;
+  sensor2Latched = pillSensor2Capture.pulseLatched;
+  sensor1ArmedDuringCommand = pillSensor1ArmedDuringCommand;
+  sensor2ArmedDuringCommand = pillSensor2ArmedDuringCommand;
+  sensor1LastPulseWidth = pillSensor1Capture.lastPulseWidthMicros;
+  sensor2LastPulseWidth = pillSensor2Capture.lastPulseWidthMicros;
+  interrupts();
+
+  Serial.print(F("PILL_IRQ_DEBUG|PCINT0="));
+  Serial.print(pcint0Count);
+  Serial.print(F("|PCINT2="));
+  Serial.print(pcint2Count);
+  Serial.print(F("|D12_FALL="));
+  Serial.print(sensor1FallingCount);
+  Serial.print(F("|D12_RISE="));
+  Serial.print(sensor1RisingCount);
+  Serial.print(F("|D3_FALL="));
+  Serial.print(sensor2FallingCount);
+  Serial.print(F("|D3_RISE="));
+  Serial.print(sensor2RisingCount);
+  Serial.print(F("|ARM1="));
+  Serial.print(sensor1Armed ? 1 : 0);
+  Serial.print(F("|ARM2="));
+  Serial.print(sensor2Armed ? 1 : 0);
+  Serial.print(F("|ARMED1="));
+  Serial.print(sensor1ArmedDuringCommand ? 1 : 0);
+  Serial.print(F("|ARMED2="));
+  Serial.print(sensor2ArmedDuringCommand ? 1 : 0);
+  Serial.print(F("|LATCH1="));
+  Serial.print(sensor1Latched ? 1 : 0);
+  Serial.print(F("|LATCH2="));
+  Serial.print(sensor2Latched ? 1 : 0);
+  Serial.print(F("|LAST_US1="));
+  Serial.print(sensor1LastPulseWidth);
+  Serial.print(F("|LAST_US2="));
+  Serial.println(sensor2LastPulseWidth);
 }
 
 void armPillSensorCapture(byte pin) {
@@ -178,6 +284,11 @@ void armPillSensorCapture(byte pin) {
   capture->lowActive = false;
   capture->pulseLatched = false;
   capture->lowStartedAtMicros = 0;
+  if (pin == PILL_SENSOR_1_PIN) {
+    pillSensor1ArmedDuringCommand = true;
+  } else {
+    pillSensor2ArmedDuringCommand = true;
+  }
   interrupts();
 }
 
@@ -321,10 +432,13 @@ void executeCommand(const char *command) {
     printStatus();
   } else if (strcmp(command, "GET_PILL_SENSORS") == 0) {
     printPillSensors();
+  } else if (strcmp(command, "GET_PILL_IRQ_DEBUG") == 0) {
+    printPillIrqDebug();
   } else if (strcmp(command, "MONITOR_PILL_SENSORS") == 0) {
     monitorPillSensors();
   } else if (strcmp(command, "DISPENSE_1") == 0) {
     Serial.println(F("ACK|DISPENSE_1"));
+    resetPillIrqDebug();
     DispenseResult result = runConfirmedPill(
       &motor1,
       PILL_SENSOR_1_PIN,
@@ -337,6 +451,7 @@ void executeCommand(const char *command) {
     }
   } else if (strcmp(command, "DISPENSE_2") == 0) {
     Serial.println(F("ACK|DISPENSE_2"));
+    resetPillIrqDebug();
     DispenseResult result = runConfirmedPill(
       &motor2,
       PILL_SENSOR_2_PIN,
@@ -349,6 +464,7 @@ void executeCommand(const char *command) {
     }
   } else if (strcmp(command, "DISPENSE_BOTH") == 0) {
     Serial.println(F("ACK|DISPENSE_BOTH"));
+    resetPillIrqDebug();
     DispenseResult firstResult = runConfirmedPill(
       &motor1,
       PILL_SENSOR_1_PIN,

@@ -66,10 +66,51 @@ def test_valid_pin_change_pulse_latches_once_and_short_pulse_is_ignored() -> Non
     assert "volatile bool lowActive;" in source
     assert "volatile bool pulseLatched;" in source
     assert "volatile unsigned long lowStartedAtMicros;" in source
-    assert "now - capture->lowStartedAtMicros >= PILL_MIN_PULSE_US" in source
+    assert "pulseWidth >= PILL_MIN_PULSE_US" in source
     assert "capture->pulseLatched = true;" in source
     assert "capture->armed = false;" in source
     assert "if (!capture->armed || capture->pulseLatched)" in source
+
+
+def test_temporary_irq_debug_reports_all_pcint_and_per_sensor_capture_state() -> None:
+    source = sketch_source()
+
+    assert 'strcmp(command, "GET_PILL_IRQ_DEBUG")' in source
+    assert 'F("PILL_IRQ_DEBUG|PCINT0=")' in source
+    for field in (
+        "PCINT2",
+        "D12_FALL",
+        "D12_RISE",
+        "D3_FALL",
+        "D3_RISE",
+        "ARM1",
+        "ARM2",
+        "ARMED1",
+        "ARMED2",
+        "LATCH1",
+        "LATCH2",
+        "LAST_US1",
+        "LAST_US2",
+    ):
+        assert f'F("|{field}=")' in source
+    assert "pcint0InvocationCount++" in source
+    assert "pcint2InvocationCount++" in source
+    assert "pillSensor1FallingEdgeCount++" in source
+    assert "pillSensor1RisingEdgeCount++" in source
+    assert "pillSensor2FallingEdgeCount++" in source
+    assert "pillSensor2RisingEdgeCount++" in source
+    assert "Serial" not in source[source.index("ISR(PCINT0_vect)"):source.index("void resetPillIrqDebug()")]
+
+
+def test_irq_debug_is_reset_at_the_start_of_each_dispense_command() -> None:
+    source = sketch_source()
+
+    dispense_1 = source.index('strcmp(command, "DISPENSE_1")')
+    dispense_2 = source.index('strcmp(command, "DISPENSE_2")')
+    both = source.index('strcmp(command, "DISPENSE_BOTH")')
+    assert "resetPillIrqDebug();" in source[dispense_1:dispense_2]
+    assert "resetPillIrqDebug();" in source[dispense_2:both]
+    assert "resetPillIrqDebug();" in source[both:]
 
 
 def test_dispense_arms_only_its_sensor_and_uses_the_isr_latch_during_motion() -> None:
