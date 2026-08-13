@@ -1,4 +1,5 @@
 #include <Stepper.h>
+#include <avr/interrupt.h>
 #include <string.h>
 
 #define STEPS_PER_REV 2048
@@ -11,9 +12,9 @@ const byte PILL_SENSOR_1_PIN = 12;
 const byte PILL_SENSOR_2_PIN = 3;
 const byte PILL_SENSOR_ACTIVE_STATE = LOW;
 
-// A pill can create a very short LOW pulse. Confirm detection promptly, while
-// keeping a longer clear/re-arm filter before the next dispense command.
-const unsigned long PILL_DETECT_DEBOUNCE_MS = 1;
+// A pill can create a very short LOW pulse. The pin-change ISR records both
+// edges even while Stepper.step() is waiting for the next motor step.
+const unsigned long PILL_MIN_PULSE_US = 200;
 const unsigned long PILL_CLEAR_DEBOUNCE_MS = 10;
 const unsigned long PILL_SENSOR_CLEAR_TIMEOUT_MS = 100;
 const unsigned long PILL_DETECTION_TIMEOUT_MS = 2000;
@@ -47,10 +48,14 @@ enum DispenseResult {
 };
 
 struct SensorTransitionTracker {
-  bool lastDetected;
-  unsigned long changedAt;
-  bool confirmed;
+  volatile bool armed;
+  volatile bool lowActive;
+  volatile bool pulseLatched;
+  volatile unsigned long lowStartedAtMicros;
 };
+
+SensorTransitionTracker pillSensor1Capture = {false, false, false, 0};
+SensorTransitionTracker pillSensor2Capture = {false, false, false, 0};
 
 void printStatus() {
   switch (controllerState) {
@@ -118,23 +123,78 @@ bool waitForStableSensorState(
   return false;
 }
 
-void updatePillTransition(
-  byte pin,
-  SensorTransitionTracker *tracker
+SensorTransitionTracker *captureForSensor(byte pin) {
+  return pin == PILL_SENSOR_1_PIN
+    ? &pillSensor1Capture
+    : &pillSensor2Capture;
+}
+
+void capturePillSensorTransition(
+  SensorTransitionTracker *capture,
+  bool detected
 ) {
-  bool detected = pillSensorDetected(pin);
-  unsigned long now = millis();
-  if (detected != tracker->lastDetected) {
-    tracker->lastDetected = detected;
-    tracker->changedAt = now;
+  if (!capture->armed || capture->pulseLatched) {
+    return;
   }
-  if (
-    detected &&
-    !tracker->confirmed &&
-    now - tracker->changedAt >= PILL_DETECT_DEBOUNCE_MS
-  ) {
-    tracker->confirmed = true;
+
+  unsigned long now = micros();
+  if (detected) {
+    if (!capture->lowActive) {
+      capture->lowActive = true;
+      capture->lowStartedAtMicros = now;
+    }
+    return;
   }
+
+  if (!capture->lowActive) {
+    return;
+  }
+
+  capture->lowActive = false;
+  if (now - capture->lowStartedAtMicros >= PILL_MIN_PULSE_US) {
+    capture->pulseLatched = true;
+    capture->armed = false;
+  }
+}
+
+ISR(PCINT0_vect) {
+  capturePillSensorTransition(
+    &pillSensor1Capture,
+    (PINB & _BV(PB4)) == LOW
+  );
+}
+
+ISR(PCINT2_vect) {
+  capturePillSensorTransition(
+    &pillSensor2Capture,
+    (PIND & _BV(PD3)) == LOW
+  );
+}
+
+void armPillSensorCapture(byte pin) {
+  SensorTransitionTracker *capture = captureForSensor(pin);
+  noInterrupts();
+  capture->armed = true;
+  capture->lowActive = false;
+  capture->pulseLatched = false;
+  capture->lowStartedAtMicros = 0;
+  interrupts();
+}
+
+void disarmPillSensorCapture(byte pin) {
+  SensorTransitionTracker *capture = captureForSensor(pin);
+  noInterrupts();
+  capture->armed = false;
+  capture->lowActive = false;
+  interrupts();
+}
+
+bool pillPulseLatched(byte pin) {
+  SensorTransitionTracker *capture = captureForSensor(pin);
+  noInterrupts();
+  bool latched = capture->pulseLatched;
+  interrupts();
+  return latched;
 }
 
 DispenseResult runConfirmedPill(
@@ -155,25 +215,24 @@ DispenseResult runConfirmedPill(
     return DISPENSE_SENSOR_STUCK;
   }
 
+  armPillSensorCapture(sensorPin);
   controllerState = dispensingState;
-  SensorTransitionTracker tracker = {false, millis(), false};
   unsigned long startedAt = millis();
 
-  // Step one increment at a time so both D12 and D3 are polled throughout
+  // The ISR latch, not polling, captures the matching sensor pulse during
   // the complete existing 256-step dispense motion.
   for (int step = 0; step < PILL_STEPS; step++) {
     motor->step(1);
-    updatePillTransition(sensorPin, &tracker);
   }
 
-  // A pill can leave the disk just after the final step. Keep polling only
-  // until the bounded per-pill deadline; never report motor motion as a pill.
-  while (!tracker.confirmed && millis() - startedAt < PILL_DETECTION_TIMEOUT_MS) {
-    updatePillTransition(sensorPin, &tracker);
+  // A pill can leave the disk just after the final step. Wait only for the
+  // ISR's one-pulse latch until the existing bounded per-pill deadline.
+  while (!pillPulseLatched(sensorPin) && millis() - startedAt < PILL_DETECTION_TIMEOUT_MS) {
     delay(1);
   }
 
-  if (!tracker.confirmed) {
+  if (!pillPulseLatched(sensorPin)) {
+    disarmPillSensorCapture(sensorPin);
     controllerState = IDLE;
     return DISPENSE_PILL_TIMEOUT;
   }
@@ -186,10 +245,12 @@ DispenseResult runConfirmedPill(
         PILL_CLEAR_DEBOUNCE_MS,
         PILL_SENSOR_CLEAR_TIMEOUT_MS
       )) {
+    disarmPillSensorCapture(sensorPin);
     controllerState = IDLE;
     return DISPENSE_SENSOR_STUCK;
   }
 
+  disarmPillSensorCapture(sensorPin);
   controllerState = IDLE;
   return DISPENSE_CONFIRMED;
 }
@@ -386,6 +447,14 @@ void setup() {
   motor2.setSpeed(12);
   pinMode(PILL_SENSOR_1_PIN, INPUT);
   pinMode(PILL_SENSOR_2_PIN, INPUT);
+
+  // D12 = PB4 = PCINT4 (PCINT0_vect); D3 = PD3 = PCINT19
+  // (PCINT2_vect). Keep both groups enabled because each box has its own
+  // physical sensor, while the active dispense command arms only one latch.
+  PCMSK0 |= _BV(PCINT4);
+  PCMSK2 |= _BV(PCINT19);
+  PCIFR |= _BV(PCIF0) | _BV(PCIF2);
+  PCICR |= _BV(PCIE0) | _BV(PCIE2);
 
   Serial.println(F("CONTROLLER|ARDUINO_UNO"));
   Serial.println(F("BAUD|9600"));

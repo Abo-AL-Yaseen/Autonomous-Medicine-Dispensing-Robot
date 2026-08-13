@@ -37,7 +37,7 @@ def test_confirmed_dispense_keeps_256_incremental_steps_and_sensor_errors() -> N
     assert "#define PILL_STEPS 256" in source
     assert "for (int step = 0; step < PILL_STEPS; step++)" in source
     assert "motor->step(1);" in source
-    assert "PILL_DETECT_DEBOUNCE_MS = 1" in source
+    assert "PILL_MIN_PULSE_US = 200" in source
     assert "PILL_CLEAR_DEBOUNCE_MS = 10" in source
     assert "PILL_DETECTION_TIMEOUT_MS = 2000" in source
     assert "ERROR|" in source
@@ -45,6 +45,63 @@ def test_confirmed_dispense_keeps_256_incremental_steps_and_sensor_errors() -> N
     assert "PILL_TIMEOUT" in source
     assert "DONE|DISPENSE_1" in source
     assert "DONE|DISPENSE_2" in source
+
+
+def test_both_pill_sensors_use_their_avr_pin_change_interrupt_groups() -> None:
+    source = sketch_source()
+
+    assert "ISR(PCINT0_vect)" in source
+    assert "(PINB & _BV(PB4)) == LOW" in source
+    assert "ISR(PCINT2_vect)" in source
+    assert "(PIND & _BV(PD3)) == LOW" in source
+    assert "PCMSK0 |= _BV(PCINT4);" in source
+    assert "PCMSK2 |= _BV(PCINT19);" in source
+    assert "PCICR |= _BV(PCIE0) | _BV(PCIE2);" in source
+
+
+def test_valid_pin_change_pulse_latches_once_and_short_pulse_is_ignored() -> None:
+    source = sketch_source()
+
+    assert "volatile bool armed;" in source
+    assert "volatile bool lowActive;" in source
+    assert "volatile bool pulseLatched;" in source
+    assert "volatile unsigned long lowStartedAtMicros;" in source
+    assert "now - capture->lowStartedAtMicros >= PILL_MIN_PULSE_US" in source
+    assert "capture->pulseLatched = true;" in source
+    assert "capture->armed = false;" in source
+    assert "if (!capture->armed || capture->pulseLatched)" in source
+
+
+def test_dispense_arms_only_its_sensor_and_uses_the_isr_latch_during_motion() -> None:
+    source = sketch_source()
+
+    arm_index = source.index("armPillSensorCapture(sensorPin);")
+    step_index = source.index("for (int step = 0; step < PILL_STEPS; step++)")
+    latch_wait_index = source.index("while (!pillPulseLatched(sensorPin)")
+    assert arm_index < step_index < latch_wait_index
+    assert "while (!pillPulseLatched(sensorPin)" in source
+    assert "if (!pillPulseLatched(sensorPin))" in source
+    assert "disarmPillSensorCapture(sensorPin);" in source
+
+
+def test_existing_per_box_ack_done_and_error_protocol_is_preserved() -> None:
+    source = sketch_source()
+
+    assert 'Serial.println(F("ACK|DISPENSE_1"));' in source
+    assert 'Serial.println(F("ACK|DISPENSE_2"));' in source
+    assert 'Serial.println(F("DONE|DISPENSE_1"));' in source
+    assert 'Serial.println(F("DONE|DISPENSE_2"));' in source
+    assert 'Serial.println(F("DONE|DISPENSE_BOTH"));' in source
+    assert 'Serial.print(F("ERROR|"));' in source
+
+
+def test_sensor_starts_blocked_and_sensor_must_clear_before_done() -> None:
+    source = sketch_source()
+
+    assert "if (pillSensorDetected(sensorPin))" in source
+    assert "return DISPENSE_SENSOR_STUCK;" in source
+    assert source.count("PILL_CLEAR_DEBOUNCE_MS") >= 3
+    assert source.count("waitForStableSensorState(") >= 3
 
 
 def test_dispense_both_uses_the_same_sensor_confirmed_path() -> None:
