@@ -53,3 +53,14 @@ def test_dispense_both_uses_the_same_sensor_confirmed_path() -> None:
     assert "ERROR|DISPENSE_BOTH|BOX=" in source
     assert "printDispenseBothError(1, firstResult);" in source
     assert "printDispenseBothError(2, secondResult);" in source
+
+
+def test_temporary_raw_pill_sensor_diagnostics_do_not_use_dispense_helpers() -> None:
+    source = sketch_source()
+
+    assert 'strcmp(command, "GET_PILL_SENSORS")' in source
+    assert 'strcmp(command, "MONITOR_PILL_SENSORS")' in source
+    assert 'F("PILL_SENSORS|D12=")' in source
+    assert 'F("|D3=")' in source
+    assert 'F("PILL_SENSOR|PIN=")' in source
+    assert "PILL_SENSOR_MONITOR_MS = 5000" in source

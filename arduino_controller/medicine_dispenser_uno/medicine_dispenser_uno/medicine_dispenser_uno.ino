@@ -16,6 +16,7 @@ const byte PILL_SENSOR_ACTIVE_STATE = LOW;
 const unsigned long PILL_SENSOR_DEBOUNCE_MS = 10;
 const unsigned long PILL_SENSOR_CLEAR_TIMEOUT_MS = 100;
 const unsigned long PILL_DETECTION_TIMEOUT_MS = 2000;
+const unsigned long PILL_SENSOR_MONITOR_MS = 5000;
 
 // Keep these pin orders matched to the ULN2003 wiring.
 Stepper motor1(STEPS_PER_REV, 4, 6, 5, 7);
@@ -214,11 +215,52 @@ void printDispenseBothError(byte box, DispenseResult result) {
   }
 }
 
+// Temporary diagnostics: these report raw digital inputs only and never move
+// either dispenser. They intentionally do not apply active-state logic or
+// debounce so workshop testing can determine the electrical polarity/pulse.
+void printPillSensors() {
+  Serial.print(F("PILL_SENSORS|D12="));
+  Serial.print(digitalRead(PILL_SENSOR_1_PIN));
+  Serial.print(F("|D3="));
+  Serial.println(digitalRead(PILL_SENSOR_2_PIN));
+}
+
+void printPillSensorChange(byte pin, int state) {
+  Serial.print(F("PILL_SENSOR|PIN="));
+  Serial.print(pin);
+  Serial.print(F("|STATE="));
+  Serial.println(state);
+}
+
+void monitorPillSensors() {
+  int sensor1State = digitalRead(PILL_SENSOR_1_PIN);
+  int sensor2State = digitalRead(PILL_SENSOR_2_PIN);
+  unsigned long startedAt = millis();
+
+  while (millis() - startedAt < PILL_SENSOR_MONITOR_MS) {
+    int currentSensor1State = digitalRead(PILL_SENSOR_1_PIN);
+    int currentSensor2State = digitalRead(PILL_SENSOR_2_PIN);
+
+    if (currentSensor1State != sensor1State) {
+      sensor1State = currentSensor1State;
+      printPillSensorChange(PILL_SENSOR_1_PIN, sensor1State);
+    }
+    if (currentSensor2State != sensor2State) {
+      sensor2State = currentSensor2State;
+      printPillSensorChange(PILL_SENSOR_2_PIN, sensor2State);
+    }
+  }
+}
+
 void executeCommand(const char *command) {
   if (strcmp(command, "PING") == 0) {
     Serial.println(F("ACK|PING"));
   } else if (strcmp(command, "GET_STATUS") == 0) {
     printStatus();
+  } else if (strcmp(command, "GET_PILL_SENSORS") == 0) {
+    printPillSensors();
+  } else if (strcmp(command, "MONITOR_PILL_SENSORS") == 0) {
+    monitorPillSensors();
   } else if (strcmp(command, "DISPENSE_1") == 0) {
     Serial.println(F("ACK|DISPENSE_1"));
     DispenseResult result = runConfirmedPill(
