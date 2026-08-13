@@ -29,6 +29,7 @@ class MissionExecutionState(str, Enum):
     STARTING = "STARTING"
     GOING_TO_ROOM = "GOING_TO_ROOM"
     ARRIVED_AT_ROOM = "ARRIVED_AT_ROOM"
+    WAITING_FOR_HAND = "WAITING_FOR_HAND"
     DISPENSING = "DISPENSING"
     DISPENSE_COMPLETED = "DISPENSE_COMPLETED"
     RETURNING_HOME = "RETURNING_HOME"
@@ -58,6 +59,13 @@ class MissionDispenseResult(str, Enum):
     DISPENSE_COMPLETED = "DISPENSE_COMPLETED"
     DISPENSE_NOT_ALLOWED = "DISPENSE_NOT_ALLOWED"
     DISPENSE_FAILED = "DISPENSE_FAILED"
+
+
+class MissionHandResult(str, Enum):
+    HAND_CONFIRMED = "HAND_CONFIRMED"
+    HAND_NOT_ALLOWED = "HAND_NOT_ALLOWED"
+    HAND_TIMEOUT = "HAND_TIMEOUT"
+    HAND_WAIT_FAILED = "HAND_WAIT_FAILED"
 
 
 class MissionRouteUnavailableError(RuntimeError):
@@ -106,6 +114,20 @@ class MissionDispenseOutcome:
         }
 
 
+@dataclass(frozen=True)
+class MissionHandOutcome:
+    result: MissionHandResult
+    success: bool
+    message: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "success": self.success,
+            "result": self.result.value,
+            "message": self.message,
+        }
+
+
 class MissionExecutor:
     """Start line following, then durably mark the claimed mission in progress."""
 
@@ -116,6 +138,7 @@ class MissionExecutor:
         start_line_follow: Callable[[], str] | None = None,
         stop_line_follow: Callable[[], str] | None = None,
         u_turn: Callable[[], str] | None = None,
+        wait_for_hand: Callable[[float], bool] | None = None,
         dispense_medicine: Callable[[int, int], dict[str, int]] | None = None,
         mark_mission_in_progress: Callable[[ClaimedMission], None] | None = None,
         mark_mission_completed: Callable[[ClaimedMission], None] | None = None,
@@ -130,12 +153,14 @@ class MissionExecutor:
         self._start_line_follow = start_line_follow
         self._stop_line_follow = stop_line_follow
         self._u_turn = u_turn
+        self._wait_for_hand = wait_for_hand
         self._dispense_medicine = dispense_medicine
         self._mark_mission_in_progress = mark_mission_in_progress
         self._mark_mission_completed = mark_mission_completed
         self._load_navigation_map = load_navigation_map
         self._route_planner: LaravelRoutePlanner | None = None
         self._destination_node: PhysicalNode | None = None
+        self._hand_confirmed = False
         self._auto_execution_enabled = auto_execution_enabled
 
     @property
@@ -188,6 +213,7 @@ class MissionExecutor:
             self._route_planner = route_planner
             self._destination_node = destination_node
             self._last_error = None
+            self._hand_confirmed = False
             self._state = MissionExecutionState.READY_FOR_EXECUTION
             return True
 
@@ -253,6 +279,56 @@ class MissionExecutor:
                     "MissionExecutor is not going to a room"
                 )
             self._state = MissionExecutionState.ARRIVED_AT_ROOM
+            self._hand_confirmed = False
+
+    def wait_for_hand_confirmation(self, timeout_seconds: float) -> MissionHandOutcome:
+        """Wait once for the ESP32's debounced hand confirmation at the room."""
+
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+
+        with self._lock:
+            if self._state is not MissionExecutionState.ARRIVED_AT_ROOM:
+                return MissionHandOutcome(
+                    MissionHandResult.HAND_NOT_ALLOWED,
+                    False,
+                    f"MissionExecutor is {self._state.value}.",
+                )
+            self._state = MissionExecutionState.WAITING_FOR_HAND
+            self._hand_confirmed = False
+            self._last_error = None
+
+        try:
+            if self._wait_for_hand is None:
+                raise RuntimeError("Hand wait operation is not configured")
+            confirmed = self._wait_for_hand(timeout_seconds)
+        except Exception as exc:
+            message = f"HAND_WAIT_FAILED: {exc}"
+            with self._lock:
+                self._state = MissionExecutionState.FAILED
+                self._last_error = message
+            return MissionHandOutcome(MissionHandResult.HAND_WAIT_FAILED, False, message)
+
+        if not confirmed:
+            with self._lock:
+                self._state = MissionExecutionState.FAILED
+                self._last_error = MissionHandResult.HAND_TIMEOUT.value
+            return MissionHandOutcome(
+                MissionHandResult.HAND_TIMEOUT,
+                False,
+                MissionHandResult.HAND_TIMEOUT.value,
+            )
+
+        with self._lock:
+            if self._state is not MissionExecutionState.WAITING_FOR_HAND:
+                return MissionHandOutcome(
+                    MissionHandResult.HAND_NOT_ALLOWED,
+                    False,
+                    f"MissionExecutor is {self._state.value}.",
+                )
+            self._hand_confirmed = True
+            self._last_error = None
+        return MissionHandOutcome(MissionHandResult.HAND_CONFIRMED, True)
 
     def start_return_home(self) -> MissionReturnOutcome:
         """Validate ARRIVED_AT_ROOM and start exactly one existing U-turn."""
@@ -327,7 +403,10 @@ class MissionExecutor:
         """Dispense the retained mission once, validating the UNO summary."""
 
         with self._lock:
-            if self._state is not MissionExecutionState.ARRIVED_AT_ROOM:
+            if (
+                self._state is not MissionExecutionState.WAITING_FOR_HAND
+                or not self._hand_confirmed
+            ):
                 return MissionDispenseOutcome(
                     MissionDispenseResult.DISPENSE_NOT_ALLOWED,
                     False,
@@ -353,6 +432,7 @@ class MissionExecutor:
                     self._last_error,
                 )
             self._state = MissionExecutionState.DISPENSING
+            self._hand_confirmed = False
             self._last_error = None
 
         try:

@@ -302,6 +302,7 @@ def test_partial_sensor_confirmed_dispense_fails_and_cannot_start_return_home() 
         start_line_follow=dependencies.start_line_follow,
         stop_line_follow=dependencies.stop_line_follow,
         u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+        wait_for_hand=lambda timeout: True,
         dispense_medicine=lambda box, quantity: {
             "box_number": box,
             "requested_pills": quantity,
@@ -313,6 +314,7 @@ def test_partial_sensor_confirmed_dispense_fails_and_cannot_start_return_home() 
     assert executor.accept(valid_mission()) is True
     assert executor.start_ready_mission().success is True
     executor.mark_arrived_at_room()
+    assert executor.wait_for_hand_confirmation(1.0).success is True
 
     dispense = executor.dispense_at_room()
     returned = executor.start_return_home()
@@ -322,6 +324,101 @@ def test_partial_sensor_confirmed_dispense_fails_and_cannot_start_return_home() 
     assert executor.state is MissionExecutionState.FAILED
     assert returned.result.value == "RETURN_NOT_ALLOWED"
     assert u_turn_calls == []
+
+
+def test_arrival_waits_for_hand_and_blocks_dispense_until_confirmation() -> None:
+    dependencies = FakeExecutionDependencies()
+    hand_checks: list[float] = []
+    dispense_calls: list[tuple[int, int]] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        wait_for_hand=lambda timeout: hand_checks.append(timeout) or True,
+        dispense_medicine=lambda box, quantity: (
+            dispense_calls.append((box, quantity))
+            or {
+                "box_number": box,
+                "requested_pills": quantity,
+                "dispensed_pills": quantity,
+            }
+        ),
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+    )
+    assert executor.accept(valid_mission()) is True
+    assert executor.start_ready_mission().success is True
+    executor.mark_arrived_at_room()
+
+    assert executor.dispense_at_room().result.value == "DISPENSE_NOT_ALLOWED"
+    assert dispense_calls == []
+
+    hand = executor.wait_for_hand_confirmation(12.0)
+    assert hand.success is True
+    assert executor.state is MissionExecutionState.WAITING_FOR_HAND
+
+    assert executor.dispense_at_room().success is True
+    assert hand_checks == [12.0]
+    assert dispense_calls == [(1, 4)]
+
+
+def test_hand_timeout_fails_without_uno_dispense_or_return_home() -> None:
+    dependencies = FakeExecutionDependencies()
+    u_turn_calls: list[str] = []
+    dispense_calls: list[tuple[int, int]] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+        wait_for_hand=lambda timeout: False,
+        dispense_medicine=lambda box, quantity: dispense_calls.append((box, quantity)) or {},
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+    )
+    assert executor.accept(valid_mission()) is True
+    assert executor.start_ready_mission().success is True
+    executor.mark_arrived_at_room()
+
+    hand = executor.wait_for_hand_confirmation(1.0)
+
+    assert hand.result.value == "HAND_TIMEOUT"
+    assert executor.state is MissionExecutionState.FAILED
+    assert executor.status()["last_error"] == "HAND_TIMEOUT"
+    assert executor.dispense_at_room().result.value == "DISPENSE_NOT_ALLOWED"
+    assert executor.start_return_home().result.value == "RETURN_NOT_ALLOWED"
+    assert dispense_calls == []
+    assert u_turn_calls == []
+
+
+def test_duplicate_hand_confirmation_cannot_start_a_second_dispense() -> None:
+    dependencies = FakeExecutionDependencies()
+    dispense_calls: list[tuple[int, int]] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        wait_for_hand=lambda timeout: True,
+        dispense_medicine=lambda box, quantity: (
+            dispense_calls.append((box, quantity))
+            or {
+                "box_number": box,
+                "requested_pills": quantity,
+                "dispensed_pills": quantity,
+            }
+        ),
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+    )
+    assert executor.accept(valid_mission()) is True
+    assert executor.start_ready_mission().success is True
+    executor.mark_arrived_at_room()
+
+    assert executor.wait_for_hand_confirmation(1.0).success is True
+    assert executor.wait_for_hand_confirmation(1.0).result.value == "HAND_NOT_ALLOWED"
+    assert executor.dispense_at_room().success is True
+    assert executor.dispense_at_room().result.value == "DISPENSE_NOT_ALLOWED"
+    assert dispense_calls == [(1, 4)]
 
 
 def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:

@@ -6,6 +6,7 @@ import {
   buildMedicineDispensePayload,
   buildRobotScheduleDateTime,
   normalizeFastApiDispense,
+  normalizeMissionExecutorStatus,
   normalizeExecutorStart,
   normalizeFastApiHealth,
   normalizeFastApiStatus,
@@ -119,6 +120,17 @@ test("normalizes FastAPI health when hardware is connected", () => {
   assert.equal(health.api_reachable, true);
   assert.equal(health.hardware_connected, true);
   assert.equal(health.connection, "Connected");
+});
+
+test("accepts the automatic hand-wait executor state", () => {
+  const status = normalizeMissionExecutorStatus({
+    state: "WAITING_FOR_HAND",
+    mission_id: 42,
+    last_error: null,
+  });
+
+  assert.equal(status.state, "WAITING_FOR_HAND");
+  assert.equal(status.mission_id, 42);
 });
 
 test("normalizes FastAPI health when hardware is disconnected", () => {

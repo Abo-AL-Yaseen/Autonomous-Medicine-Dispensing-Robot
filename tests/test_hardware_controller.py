@@ -97,6 +97,31 @@ def test_get_rtc_uses_machine_readable_contract() -> None:
     assert esp32.commands == ["GET_RTC"]
 
 
+def test_hand_state_and_lcd_workflow_use_esp32_machine_readable_commands() -> None:
+    esp32 = RecordingSerialController(
+        {
+            "GET_HAND": "HAND|DETECTED",
+            "LCD|STATE=HAND_WAITING": "ACK|LCD|STATE=HAND_WAITING",
+        }
+    )
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.get_hand_status() == "HAND|DETECTED"
+    assert (
+        controller.show_medicine_workflow_status("HAND_WAITING")
+        == "ACK|LCD|STATE=HAND_WAITING"
+    )
+    assert esp32.commands == ["GET_HAND", "LCD|STATE=HAND_WAITING"]
+
+
+def test_hand_response_is_not_misrouted_as_an_async_navigation_event() -> None:
+    assert SerialController._is_async_line("HAND|DETECTED") is False
+    assert SerialController._is_async_line("IR|HAND_DETECTED") is True
+
+
 @pytest.mark.parametrize(
     "response",
     [

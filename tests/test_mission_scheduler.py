@@ -401,6 +401,41 @@ def test_laravel_client_sends_wall_clock_claim_contract() -> None:
     )
 
 
+def test_laravel_claimed_ibuprofen_box_two_reaches_raspberry_unchanged() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "claimed": True,
+                "mission": {
+                    "id": 19,
+                    "room": {"id": 1, "room_number": "204"},
+                    "medicine": {"id": 7, "dispenser_box": 2},
+                    "quantity": 1,
+                    "schedule_claimed_at": "2026-08-09T18:40:00+00:00",
+                },
+            },
+        )
+
+    client = LaravelApiClient(
+        "http://laravel.test/api",
+        0.2,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        mission = client.claim_due_mission(
+            datetime(2026, 8, 9, 21, 40, 0),
+            "Asia/Hebron",
+        )
+    finally:
+        client.close()
+
+    assert mission is not None
+    assert mission.medicine_id == 7
+    assert mission.dispenser_box == 2
+
+
 def test_laravel_client_starts_only_the_exact_claimed_mission() -> None:
     mission = ClaimedMission(
         8,

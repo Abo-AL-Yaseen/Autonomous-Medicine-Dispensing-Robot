@@ -372,6 +372,7 @@ class SerialController:
             "ERROR|",
             "STATUS|",
             "RTC|",
+            "HAND|",
             "LINE|",
             "LINE_STATUS|",
         )
@@ -418,6 +419,15 @@ class RobotHardwareController:
         "STATUS|NAVIGATION",
         "STATUS|NAVIGATION_FAILED",
     )
+    HAND_STATUS_RESPONSES = ("HAND|DETECTED", "HAND|WAITING")
+    MEDICINE_LCD_STATES = {
+        "HAND_WAITING",
+        "HAND_DETECTED",
+        "DISPENSING",
+        "MEDICINE_READY",
+        "NO_HAND",
+        "DISPENSE_FAILED",
+    }
     LINE_FOLLOW_STATES = {
         "IDLE",
         "ACQUIRING",
@@ -706,6 +716,44 @@ class RobotHardwareController:
         """Consume ESP32 telemetry without reading the serial connection directly."""
 
         return self.esp32.get_async_line(timeout)
+
+    def get_hand_status(self) -> str:
+        """Read the ESP32's existing debounced hand sensor state."""
+
+        return self._request(
+            self.esp32,
+            "GET_HAND",
+            self.HAND_STATUS_RESPONSES,
+            response_prefix="HAND|",
+        )
+
+    def wait_for_hand(self, timeout_seconds: float) -> bool:
+        """Poll the ESP32 hand state until confirmed or the bounded timeout."""
+
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if self.get_hand_status() == "HAND|DETECTED":
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+
+    def show_medicine_workflow_status(self, state: str) -> str:
+        """Use the ESP32's single LCD implementation for patient prompts."""
+
+        if state not in self.MEDICINE_LCD_STATES:
+            raise ValueError(f"unsupported medicine LCD state: {state!r}")
+        acknowledgement = f"ACK|LCD|STATE={state}"
+        return self._request(
+            self.esp32,
+            f"LCD|STATE={state}",
+            acknowledgement,
+            response_prefix="ACK|LCD|STATE=",
+        )
 
     def get_rtc_datetime(self) -> datetime:
         """Read and strictly parse the DS1302 wall-clock response."""

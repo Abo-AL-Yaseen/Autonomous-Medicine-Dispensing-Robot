@@ -28,6 +28,7 @@ U_TURN_FAILED_PREFIX = "EVENT|U_TURN_FAILED"
 class NavigationCoordinatorSettings:
     enabled: bool = False
     arrived_home_observation_seconds: float = 1.0
+    hand_wait_timeout_seconds: float = 30.0
 
     @classmethod
     def from_environment(cls) -> "NavigationCoordinatorSettings":
@@ -50,9 +51,18 @@ class NavigationCoordinatorSettings:
             raise ValueError(
                 "ARRIVED_HOME_OBSERVATION_SECONDS must be non-negative"
             )
+        try:
+            hand_wait_timeout_seconds = float(
+                os.getenv("HAND_WAIT_TIMEOUT_SECONDS", "30.0")
+            )
+        except ValueError as exc:
+            raise ValueError("HAND_WAIT_TIMEOUT_SECONDS must be a number") from exc
+        if hand_wait_timeout_seconds <= 0:
+            raise ValueError("HAND_WAIT_TIMEOUT_SECONDS must be positive")
         return cls(
             enabled=enabled,
             arrived_home_observation_seconds=observation_seconds,
+            hand_wait_timeout_seconds=hand_wait_timeout_seconds,
         )
 
 
@@ -62,6 +72,7 @@ class NavigationCoordinatorState(str, Enum):
     PROCESSING_INTERSECTION = "PROCESSING_INTERSECTION"
     COMMAND_SENT = "COMMAND_SENT"
     ARRIVED_AT_ROOM = "ARRIVED_AT_ROOM"
+    WAITING_FOR_HAND = "WAITING_FOR_HAND"
     DISPENSING = "DISPENSING"
     RETURNING_HOME = "RETURNING_HOME"
     ARRIVED_HOME = "ARRIVED_HOME"
@@ -82,6 +93,7 @@ class NavigationCoordinator:
         intersection_right: Callable[[], str],
         intersection_straight: Callable[[], str],
         stop_line_follow: Callable[[], str],
+        show_medicine_workflow_status: Callable[[str], str] | None = None,
     ) -> None:
         self._settings = settings
         self._executor = executor
@@ -96,6 +108,9 @@ class NavigationCoordinator:
             ),
         }
         self._stop_line_follow = stop_line_follow
+        self._show_medicine_workflow_status = (
+            show_medicine_workflow_status or (lambda state: "")
+        )
         self._lock = threading.Lock()
         self._processing_lock = threading.Lock()
         self._post_arrival_lock = threading.Lock()
@@ -651,13 +666,51 @@ class NavigationCoordinator:
             self._post_arrival_thread.start()
 
     def _run_post_arrival_workflow(self) -> None:
-        """Dispense once, then reuse the validated return-home transition."""
+        """Wait for a hand, dispense once, then start the validated return."""
+
+        with self._lock:
+            self._state = NavigationCoordinatorState.WAITING_FOR_HAND
+        try:
+            self._show_medicine_workflow_status("HAND_WAITING")
+        except Exception:
+            self._record_error("LCD_STATUS_FAILED")
+            return
+
+        hand = self._executor.wait_for_hand_confirmation(
+            self._settings.hand_wait_timeout_seconds
+        )
+        if not hand.success:
+            try:
+                self._show_medicine_workflow_status(
+                    "NO_HAND" if hand.result.value == "HAND_TIMEOUT" else "DISPENSE_FAILED"
+                )
+            except Exception:
+                pass
+            self._record_error(hand.result.value)
+            return
+
+        try:
+            self._show_medicine_workflow_status("HAND_DETECTED")
+            self._show_medicine_workflow_status("DISPENSING")
+        except Exception:
+            self._record_error("LCD_STATUS_FAILED")
+            return
 
         with self._lock:
             self._state = NavigationCoordinatorState.DISPENSING
         dispense = self._executor.dispense_at_room()
         if not dispense.success:
+            try:
+                self._show_medicine_workflow_status("DISPENSE_FAILED")
+            except Exception:
+                pass
             self._record_error(dispense.result.value)
+            return
+
+        try:
+            self._show_medicine_workflow_status("MEDICINE_READY")
+        except Exception:
+            self._record_error("LCD_STATUS_FAILED")
             return
 
         returned = self.begin_return_home()

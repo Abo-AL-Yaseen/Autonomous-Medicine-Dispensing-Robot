@@ -270,11 +270,23 @@ def create_app(
             with hardware_lock:
                 return controller.dispense(box_number, quantity)
 
+        def wait_for_executor_hand(timeout_seconds: float) -> bool:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            return controller.wait_for_hand(timeout_seconds)
+
+        def show_executor_medicine_status(state: str) -> str:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.show_medicine_workflow_status(state)
+
         executor = MissionExecutor(
             hardware_available=hardware_available,
             start_line_follow=start_executor_line_follow,
             stop_line_follow=stop_executor_line_follow,
             u_turn=lambda: run_navigation_hardware(controller.u_turn),
+            wait_for_hand=wait_for_executor_hand,
             dispense_medicine=dispense_executor_medicine,
             mark_mission_in_progress=laravel_client.start_claimed_mission,
             mark_mission_completed=laravel_client.complete_claimed_mission,
@@ -311,6 +323,7 @@ def create_app(
             stop_line_follow=lambda: run_navigation_hardware(
                 controller.stop_line_follow
             ),
+            show_medicine_workflow_status=show_executor_medicine_status,
         )
         application.state.mission_executor = executor
         application.state.mission_scheduler = scheduler

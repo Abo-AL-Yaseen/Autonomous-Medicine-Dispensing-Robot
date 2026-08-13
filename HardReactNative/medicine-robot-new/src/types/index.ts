@@ -84,6 +84,7 @@ export type MissionExecutorState =
   | "STARTING"
   | "GOING_TO_ROOM"
   | "ARRIVED_AT_ROOM"
+  | "WAITING_FOR_HAND"
   | "FAILED";
 
 export interface MissionExecutorStatus {

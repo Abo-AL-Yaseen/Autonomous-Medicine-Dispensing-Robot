@@ -155,6 +155,7 @@ class HardwareRecorder:
         self.dispense: list[object] = []
         self.water: list[object] = []
         self.return_home: list[object] = []
+        self.medicine_status: list[str] = []
         self.command_event = threading.Event()
         self.dispense_event = threading.Event()
         self.return_started_event = threading.Event()
@@ -182,6 +183,10 @@ class HardwareRecorder:
             "dispensed_pills": quantity,
         }
 
+    def show_medicine_workflow_status(self, state: str) -> str:
+        self.medicine_status.append(state)
+        return f"ACK|LCD|STATE={state}"
+
 
 def confirmed_marker(marker_id: int) -> MarkerDetectionResult:
     return MarkerDetectionResult(
@@ -201,6 +206,7 @@ def going_executor(
     *,
     load_map: Callable[[], PhysicalNavigationMap] | None = approved_navigation_map,
     u_turn: Callable[[], str] | None = None,
+    wait_for_hand: Callable[[float], bool] | None = None,
     dispense_medicine: Callable[[int, int], dict[str, int]] | None = None,
 ) -> MissionExecutor:
     executor = MissionExecutor(
@@ -208,6 +214,7 @@ def going_executor(
         start_line_follow=lambda: "ACK|LINE_FOLLOW_STARTED",
         stop_line_follow=lambda: "ACK|LINE_FOLLOW_STOPPED",
         u_turn=u_turn,
+        wait_for_hand=wait_for_hand or (lambda timeout: True),
         dispense_medicine=dispense_medicine,
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=load_map,
@@ -251,6 +258,7 @@ def coordinator(
         intersection_right=lambda: hardware.command("RIGHT"),
         intersection_straight=lambda: hardware.command("STRAIGHT"),
         stop_line_follow=hardware.stop_line_follow,
+        show_medicine_workflow_status=hardware.show_medicine_workflow_status,
     )
 
 
@@ -716,6 +724,7 @@ def test_dispense_quantity_two_must_complete_two_before_return() -> None:
         start_line_follow=lambda: "ACK|LINE_FOLLOW_STARTED",
         stop_line_follow=lambda: "ACK|LINE_FOLLOW_STOPPED",
         u_turn=hardware.u_turn,
+        wait_for_hand=lambda timeout: True,
         dispense_medicine=hardware.dispense_medicine,
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=approved_navigation_map,
@@ -923,6 +932,69 @@ def test_marker_zero_stops_and_marks_arrived_home_without_completing_mission() -
     assert service.status()["last_node"] == "NODE_0"
     assert service.status()["last_decision"] == "ARRIVED"
     assert service.status()["last_error"] is None
+
+
+def test_arrival_waits_for_hand_before_exactly_one_dispense_and_return() -> None:
+    hardware = HardwareRecorder()
+    hand_started = threading.Event()
+    allow_hand = threading.Event()
+
+    def wait_for_hand(timeout: float) -> bool:
+        hand_started.set()
+        return allow_hand.wait(timeout)
+
+    executor = going_executor(
+        1,
+        u_turn=hardware.u_turn,
+        wait_for_hand=wait_for_hand,
+        dispense_medicine=hardware.dispense_medicine,
+    )
+    service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hand_started.wait(timeout=1.0)
+    assert executor.state is MissionExecutionState.WAITING_FOR_HAND
+    assert service.status()["state"] == "WAITING_FOR_HAND"
+    assert hardware.dispense == []
+    assert hardware.navigation == []
+    assert hardware.medicine_status == ["HAND_WAITING"]
+
+    allow_hand.set()
+
+    assert hardware.dispense_event.wait(timeout=1.0)
+    assert hardware.return_started_event.wait(timeout=1.0)
+    assert hardware.dispense == [(1, 1)]
+    assert hardware.navigation == ["U_TURN"]
+    assert hardware.medicine_status == [
+        "HAND_WAITING",
+        "HAND_DETECTED",
+        "DISPENSING",
+        "MEDICINE_READY",
+    ]
+
+
+def test_hand_timeout_sends_no_dispense_and_does_not_return_home() -> None:
+    hardware = HardwareRecorder()
+    executor = going_executor(
+        1,
+        u_turn=hardware.u_turn,
+        wait_for_hand=lambda timeout: False,
+        dispense_medicine=hardware.dispense_medicine,
+    )
+    service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    thread = service._post_arrival_thread
+    assert thread is not None
+    thread.join(timeout=1.0)
+    assert executor.state is MissionExecutionState.FAILED
+    assert executor.status()["last_error"] == "HAND_TIMEOUT"
+    assert hardware.dispense == []
+    assert hardware.navigation == []
+    assert hardware.medicine_status == ["HAND_WAITING", "NO_HAND"]
+    assert service.status()["last_error"] == "HAND_TIMEOUT"
 
 
 def test_arrived_home_is_observable_then_rearms_cleanly_without_stale_motion() -> None:

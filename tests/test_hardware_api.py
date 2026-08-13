@@ -58,6 +58,9 @@ class FakeHardwareController:
         self.line_start_error: Exception | None = None
         self.camera_calls: list[str] = []
         self.return_home_calls: list[str] = []
+        self.hand_wait_calls: list[float] = []
+        self.medicine_status_calls: list[str] = []
+        self.hand_detected = True
         self.esp32_events: queue.Queue[str] = queue.Queue()
 
     def connect(self) -> None:
@@ -83,6 +86,16 @@ class FakeHardwareController:
             "requested_pills": pill_count,
             "dispensed_pills": pill_count,
         }
+
+    def wait_for_hand(self, timeout_seconds: float) -> bool:
+        self._raise_hardware_error()
+        self.hand_wait_calls.append(timeout_seconds)
+        return self.hand_detected
+
+    def show_medicine_workflow_status(self, state: str) -> str:
+        self._raise_hardware_error()
+        self.medicine_status_calls.append(state)
+        return f"ACK|LCD|STATE={state}"
 
     def get_rtc_datetime(self) -> datetime:
         self._raise_hardware_error()
@@ -989,6 +1002,7 @@ def test_executor_dispense_reuses_api_hardware_and_manual_return_endpoint(
     assert executor.accept(mission) is True
     assert client.post("/executor/start").status_code == 200
     executor.mark_arrived_at_room()
+    assert executor.wait_for_hand_confirmation(1.0).success is True
 
     dispense = executor.dispense_at_room()
     returned = client.post("/executor/return-home")

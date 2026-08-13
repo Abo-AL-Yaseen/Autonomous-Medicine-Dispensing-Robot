@@ -403,6 +403,7 @@ void printRTC();
 void printRTCMachineReadable();
 void setupLCD();
 void lcdShowStatus(String line1, String line2 = "", String line3 = "", String line4 = "");
+void showMedicineWorkflowStatus(const String& state);
 void lcdShowReady();
 void lcdShowError(String message);
 void showRTCOnce();
@@ -2664,6 +2665,22 @@ static void printRTCDateTime(const RtcDateTime& dt) {
   Serial.println(dateTimeString);
 }
 
+void showMedicineWorkflowStatus(const String& state) {
+  if (state == "HAND_WAITING") {
+    lcdShowStatus("Place hand below", "Waiting...");
+  } else if (state == "HAND_DETECTED") {
+    lcdShowStatus("Hand detected");
+  } else if (state == "DISPENSING") {
+    lcdShowStatus("Dispensing...", "Please wait");
+  } else if (state == "MEDICINE_READY") {
+    lcdShowStatus("Medicine ready");
+  } else if (state == "NO_HAND") {
+    lcdShowStatus("No hand detected");
+  } else if (state == "DISPENSE_FAILED") {
+    lcdShowStatus("Dispense failed");
+  }
+}
+
 void setupRTC() {
   rtc.Begin();
   Serial.println("RTC initialized");
@@ -3671,6 +3688,24 @@ void handleTextCommand(const String& command) {
     Serial.println("ACK|PING");
   } else if (normalizedCommand == "GET_STATUS") {
     printControllerStatus();
+  } else if (normalizedCommand == "GET_HAND") {
+    Serial.println(irStableDetected ? "HAND|DETECTED" : "HAND|WAITING");
+  } else if (normalizedCommand.startsWith("LCD|STATE=")) {
+    String state = normalizedCommand.substring(10);
+    if (
+      state != "HAND_WAITING" &&
+      state != "HAND_DETECTED" &&
+      state != "DISPENSING" &&
+      state != "MEDICINE_READY" &&
+      state != "NO_HAND" &&
+      state != "DISPENSE_FAILED"
+    ) {
+      Serial.println("ERROR|INVALID_LCD_STATE");
+      return;
+    }
+    showMedicineWorkflowStatus(state);
+    Serial.print("ACK|LCD|STATE=");
+    Serial.println(state);
   } else if (normalizedCommand == "GET_RTC") {
     printRTCMachineReadable();
   } else if (normalizedCommand.startsWith("MANUAL_")) {
