@@ -20,11 +20,11 @@ def sketch_source() -> str:
     return SKETCH.read_text(encoding="utf-8")
 
 
-def test_pill_sensors_are_mapped_only_to_the_audited_uno_pins() -> None:
+def test_pill_sensors_match_the_verified_physical_box_to_chute_mapping() -> None:
     source = sketch_source()
 
-    assert "const byte PILL_SENSOR_1_PIN = 12;" in source
-    assert "const byte PILL_SENSOR_2_PIN = 3;" in source
+    assert "const byte PILL_SENSOR_1_PIN = 3;" in source
+    assert "const byte PILL_SENSOR_2_PIN = 12;" in source
     assert "&motor1,\n      PILL_SENSOR_1_PIN," in source
     assert "&motor2,\n      PILL_SENSOR_2_PIN," in source
     assert "Stepper motor1(STEPS_PER_REV, 4, 6, 5, 7);" in source
@@ -57,6 +57,10 @@ def test_both_pill_sensors_use_their_avr_pin_change_interrupt_groups() -> None:
     assert "PCMSK0 |= _BV(PCINT4);" in source
     assert "PCMSK2 |= _BV(PCINT19);" in source
     assert "PCICR |= _BV(PCIE0) | _BV(PCIE2);" in source
+    pcint0 = source[source.index("ISR(PCINT0_vect)"):source.index("ISR(PCINT2_vect)")]
+    pcint2 = source[source.index("ISR(PCINT2_vect)"):source.index("void resetPillIrqDebug()")]
+    assert "&pillSensor2Capture" in pcint0
+    assert "&pillSensor1Capture" in pcint2
 
 
 def test_valid_pin_change_pulse_latches_once_and_short_pulse_is_ignored() -> None:
@@ -91,6 +95,12 @@ def test_temporary_irq_debug_reports_all_pcint_and_per_sensor_capture_state() ->
         "LATCH2",
         "LAST_US1",
         "LAST_US2",
+        "PCICR",
+        "PCMSK0",
+        "PCMSK2",
+        "PCIFR",
+        "DDRD",
+        "PIND",
     ):
         assert f'F("|{field}=")' in source
     assert "pcint0InvocationCount++" in source
@@ -111,6 +121,26 @@ def test_irq_debug_is_reset_at_the_start_of_each_dispense_command() -> None:
     assert "resetPillIrqDebug();" in source[dispense_1:dispense_2]
     assert "resetPillIrqDebug();" in source[dispense_2:both]
     assert "resetPillIrqDebug();" in source[both:]
+
+
+def test_atmega328p_d3_uses_pcint19_bit_three_in_pcint_group_two() -> None:
+    source = sketch_source()
+
+    assert "const byte PILL_SENSOR_1_PIN = 3;" in source
+    assert "(PIND & _BV(PD3)) == LOW" in source
+    assert "PCMSK2 |= _BV(PCINT19);" in source
+    assert "PCICR |= _BV(PCIE0) | _BV(PCIE2);" in source
+    assert "PCIFR |= _BV(PCIF0) | _BV(PCIF2);" in source
+    assert "ISR(PCINT2_vect)" in source
+
+
+def test_atmega328p_d12_remains_box_two_pcint4_in_group_zero() -> None:
+    source = sketch_source()
+
+    assert "const byte PILL_SENSOR_2_PIN = 12;" in source
+    assert "(PINB & _BV(PB4)) == LOW" in source
+    assert "PCMSK0 |= _BV(PCINT4);" in source
+    assert "ISR(PCINT0_vect)" in source
 
 
 def test_dispense_arms_only_its_sensor_and_uses_the_isr_latch_during_motion() -> None:

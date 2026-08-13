@@ -8,8 +8,8 @@
 // Pill-drop IR sensors. Most LM393-style obstacle modules assert LOW when a
 // pill blocks the beam. Change this one value to HIGH after workshop testing
 // if the installed sensors report the opposite polarity.
-const byte PILL_SENSOR_1_PIN = 12;
-const byte PILL_SENSOR_2_PIN = 3;
+const byte PILL_SENSOR_1_PIN = 3;
+const byte PILL_SENSOR_2_PIN = 12;
 const byte PILL_SENSOR_ACTIVE_STATE = LOW;
 
 // A pill can create a very short LOW pulse. The pin-change ISR records both
@@ -55,6 +55,7 @@ struct SensorTransitionTracker {
   volatile unsigned long lastPulseWidthMicros;
 };
 
+// Box 1's chute sensor is D3/PCINT19; Box 2's is D12/PCINT4.
 SensorTransitionTracker pillSensor1Capture = {false, false, false, 0, 0};
 SensorTransitionTracker pillSensor2Capture = {false, false, false, 0, 0};
 
@@ -180,7 +181,7 @@ ISR(PCINT0_vect) {
     pillSensor1RisingEdgeCount++;
   }
   capturePillSensorTransition(
-    &pillSensor1Capture,
+    &pillSensor2Capture,
     detected
   );
 }
@@ -194,7 +195,7 @@ ISR(PCINT2_vect) {
     pillSensor2RisingEdgeCount++;
   }
   capturePillSensorTransition(
-    &pillSensor2Capture,
+    &pillSensor1Capture,
     detected
   );
 }
@@ -229,6 +230,12 @@ void printPillIrqDebug() {
   bool sensor2ArmedDuringCommand;
   unsigned long sensor1LastPulseWidth;
   unsigned long sensor2LastPulseWidth;
+  byte pcicr;
+  byte pcmsk0;
+  byte pcmsk2;
+  byte pcifr;
+  byte ddrd;
+  byte pind;
 
   noInterrupts();
   pcint0Count = pcint0InvocationCount;
@@ -245,6 +252,12 @@ void printPillIrqDebug() {
   sensor2ArmedDuringCommand = pillSensor2ArmedDuringCommand;
   sensor1LastPulseWidth = pillSensor1Capture.lastPulseWidthMicros;
   sensor2LastPulseWidth = pillSensor2Capture.lastPulseWidthMicros;
+  pcicr = PCICR;
+  pcmsk0 = PCMSK0;
+  pcmsk2 = PCMSK2;
+  pcifr = PCIFR;
+  ddrd = DDRD;
+  pind = PIND;
   interrupts();
 
   Serial.print(F("PILL_IRQ_DEBUG|PCINT0="));
@@ -274,7 +287,19 @@ void printPillIrqDebug() {
   Serial.print(F("|LAST_US1="));
   Serial.print(sensor1LastPulseWidth);
   Serial.print(F("|LAST_US2="));
-  Serial.println(sensor2LastPulseWidth);
+  Serial.print(sensor2LastPulseWidth);
+  Serial.print(F("|PCICR="));
+  Serial.print(pcicr);
+  Serial.print(F("|PCMSK0="));
+  Serial.print(pcmsk0);
+  Serial.print(F("|PCMSK2="));
+  Serial.print(pcmsk2);
+  Serial.print(F("|PCIFR="));
+  Serial.print(pcifr);
+  Serial.print(F("|DDRD="));
+  Serial.print(ddrd);
+  Serial.print(F("|PIND="));
+  Serial.println(pind);
 }
 
 void armPillSensorCapture(byte pin) {
@@ -564,9 +589,10 @@ void setup() {
   pinMode(PILL_SENSOR_1_PIN, INPUT);
   pinMode(PILL_SENSOR_2_PIN, INPUT);
 
-  // D12 = PB4 = PCINT4 (PCINT0_vect); D3 = PD3 = PCINT19
-  // (PCINT2_vect). Keep both groups enabled because each box has its own
-  // physical sensor, while the active dispense command arms only one latch.
+  // D12 = PB4 = PCINT4 (PCINT0_vect) is Box 2's chute sensor. D3 =
+  // PD3 = PCINT19 (PCINT2_vect) is Box 1's chute sensor. Keep both groups
+  // enabled because each box has its own physical sensor, while the active
+  // dispense command arms only its matching latch.
   PCMSK0 |= _BV(PCINT4);
   PCMSK2 |= _BV(PCINT19);
   PCIFR |= _BV(PCIF0) | _BV(PCIF2);
