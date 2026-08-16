@@ -228,6 +228,7 @@ def going_executor(
         dispense_medicine=dispense_medicine,
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=load_map,
+        require_home_readiness=False,
     )
     assert executor.accept(mission_for_room(room_id)) is True
     assert executor.start_ready_mission().success is True
@@ -255,6 +256,7 @@ def coordinator(
     *,
     enabled: bool = True,
     arrived_home_observation_seconds: float = 1.0,
+    home_line_position_is_valid: Callable[[], bool] = lambda: True,
 ) -> NavigationCoordinator:
     return NavigationCoordinator(
         settings=NavigationCoordinatorSettings(
@@ -269,7 +271,150 @@ def coordinator(
         intersection_straight=lambda: hardware.command("STRAIGHT"),
         stop_line_follow=hardware.stop_line_follow,
         show_medicine_workflow_status=hardware.show_medicine_workflow_status,
+        load_navigation_map=approved_navigation_map,
+        home_line_position_is_valid=home_line_position_is_valid,
     )
+
+
+def home_ready_executor(
+    room_id: int,
+    *,
+    u_turn: Callable[[], str],
+    line_starts: list[str],
+) -> MissionExecutor:
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=lambda: line_starts.append("start") or "ACK|LINE_FOLLOW_STARTED",
+        stop_line_follow=lambda: "ACK|LINE_FOLLOW_STOPPED",
+        u_turn=u_turn,
+        mark_mission_in_progress=lambda mission: None,
+        load_navigation_map=approved_navigation_map,
+        require_home_readiness=True,
+    )
+    assert executor.accept(mission_for_room(room_id)) is True
+    return executor
+
+
+def test_startup_home_confirmation_requires_marker_ten_and_stationary_line() -> None:
+    hardware = HardwareRecorder()
+    line_starts: list[str] = []
+    executor = home_ready_executor(
+        1,
+        u_turn=hardware.u_turn,
+        line_starts=line_starts,
+    )
+    service = coordinator(executor, FakeCamera(confirmed_marker(10)), hardware)
+
+    readiness = service.confirm_home_readiness()
+
+    assert readiness == {
+        "success": True,
+        "ready": True,
+        "marker_id": 10,
+        "line_position_valid": True,
+        "error": None,
+    }
+    assert executor.status()["home_ready"] is True
+    assert service.status()["home_marker_id"] == 10
+    assert line_starts == []
+    assert hardware.navigation == []
+
+
+def test_marker_zero_does_not_count_as_home_and_blocks_outbound_motion() -> None:
+    hardware = HardwareRecorder()
+    line_starts: list[str] = []
+    executor = home_ready_executor(
+        1,
+        u_turn=hardware.u_turn,
+        line_starts=line_starts,
+    )
+    service = coordinator(executor, FakeCamera(confirmed_marker(0)), hardware)
+
+    started = service.begin_outbound_from_home()
+
+    assert started["success"] is False
+    assert started["result"] == "HOME_NOT_CONFIRMED"
+    assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
+    assert executor.status()["home_ready"] is False
+    assert service.status()["home_readiness_error"] == "HOME_NOT_CONFIRMED"
+    assert line_starts == []
+    assert hardware.navigation == []
+
+
+def test_home_marker_without_stationary_line_position_blocks_outbound_motion() -> None:
+    hardware = HardwareRecorder()
+    line_starts: list[str] = []
+    executor = home_ready_executor(
+        1,
+        u_turn=hardware.u_turn,
+        line_starts=line_starts,
+    )
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(10)),
+        hardware,
+        home_line_position_is_valid=lambda: False,
+    )
+
+    started = service.begin_outbound_from_home()
+
+    assert started["result"] == "HOME_NOT_CONFIRMED"
+    assert service.status()["home_readiness_error"] == "HOME_LINE_POSITION_NOT_CONFIRMED"
+    assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
+    assert line_starts == []
+    assert hardware.navigation == []
+
+
+def test_outbound_home_u_turn_completes_once_before_line_follow_and_node_zero() -> None:
+    hardware = HardwareRecorder()
+    line_starts: list[str] = []
+    executor = home_ready_executor(
+        1,
+        u_turn=hardware.u_turn,
+        line_starts=line_starts,
+    )
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(10), confirmed_marker(0)),
+        hardware,
+    )
+
+    started = service.begin_outbound_from_home()
+
+    assert started["result"] == "U_TURN_STARTED"
+    assert started["expected_marker_id"] == 0
+    assert executor.state is MissionExecutionState.STARTING
+    assert hardware.navigation == ["U_TURN"]
+    assert line_starts == []
+
+    service.process_serial_line(U_TURN_COMPLETE)
+
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert line_starts == ["start"]
+    assert service.status()["expected_marker_id"] == 0
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == ["U_TURN", "LEFT"]
+    assert line_starts == ["start"]
+
+
+def test_outbound_u_turn_failure_never_starts_line_follow() -> None:
+    hardware = HardwareRecorder()
+    line_starts: list[str] = []
+    executor = home_ready_executor(
+        1,
+        u_turn=lambda: "ACK|WRONG",
+        line_starts=line_starts,
+    )
+    service = coordinator(executor, FakeCamera(confirmed_marker(10)), hardware)
+
+    started = service.begin_outbound_from_home()
+
+    assert started["success"] is False
+    assert started["result"] == "HOME_UTURN_FAILED"
+    assert executor.state is MissionExecutionState.FAILED
+    assert line_starts == []
 
 
 def test_navigation_auto_is_disabled_by_default(
@@ -738,6 +883,7 @@ def test_dispense_quantity_two_must_complete_two_before_return() -> None:
         dispense_medicine=hardware.dispense_medicine,
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=approved_navigation_map,
+        require_home_readiness=False,
     )
     mission = mission_for_room(1)
     mission = ClaimedMission(
@@ -1056,6 +1202,7 @@ def test_arrived_home_is_observable_then_rearms_cleanly_without_stale_motion() -
 
     assert executor.status()["state"] == "IDLE"
     assert executor.mission_id is None
+    assert executor.status()["home_ready"] is True
     assert service.status()["armed"] is True
     assert service.status()["expected_marker_id"] is None
     assert service.status()["last_marker_id"] == 10
@@ -1066,6 +1213,24 @@ def test_arrived_home_is_observable_then_rearms_cleanly_without_stale_motion() -
     assert hardware.navigation == ["U_TURN", "STRAIGHT"]
     assert service.status()["armed"] is True
     assert service.status()["last_error"] is None
+
+
+def test_next_home_ready_mission_starts_with_one_fresh_u_turn() -> None:
+    hardware = HardwareRecorder()
+    line_starts: list[str] = []
+    executor = home_ready_executor(
+        1,
+        u_turn=hardware.u_turn,
+        line_starts=line_starts,
+    )
+    executor.set_home_readiness(True)
+    service = coordinator(executor, FakeCamera(confirmed_marker(10)), hardware)
+
+    assert service.begin_outbound_from_home()["result"] == "U_TURN_STARTED"
+    service.process_serial_line(U_TURN_COMPLETE)
+
+    assert hardware.navigation == ["U_TURN"]
+    assert line_starts == ["start"]
 
 
 def test_second_mission_starts_cleanly_after_arrived_home_cleanup() -> None:

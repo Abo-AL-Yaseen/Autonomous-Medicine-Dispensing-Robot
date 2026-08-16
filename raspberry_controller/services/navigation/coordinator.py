@@ -14,7 +14,12 @@ from ..mission_executor import (
     MissionExecutor,
     MissionRouteUnavailableError,
 )
-from .route_planner import NavigationMapError, RouteDecision, UnknownMarkerError
+from .route_planner import (
+    NavigationMapError,
+    PhysicalNavigationMap,
+    RouteDecision,
+    UnknownMarkerError,
+)
 
 
 INTERSECTION_EVENT_PREFIX = "EVENT|INTERSECTION|"
@@ -94,6 +99,8 @@ class NavigationCoordinator:
         intersection_straight: Callable[[], str],
         stop_line_follow: Callable[[], str],
         show_medicine_workflow_status: Callable[[str], str] | None = None,
+        load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
+        home_line_position_is_valid: Callable[[], bool] | None = None,
     ) -> None:
         self._settings = settings
         self._executor = executor
@@ -111,6 +118,8 @@ class NavigationCoordinator:
         self._show_medicine_workflow_status = (
             show_medicine_workflow_status or (lambda state: "")
         )
+        self._load_navigation_map = load_navigation_map
+        self._home_line_position_is_valid = home_line_position_is_valid
         self._lock = threading.Lock()
         self._processing_lock = threading.Lock()
         self._post_arrival_lock = threading.Lock()
@@ -143,6 +152,10 @@ class NavigationCoordinator:
         self._intersection_event_sequence: int | None = None
         self._first_detection_sequence_used: int | None = None
         self._confirmed_detection_sequences: tuple[int, ...] = ()
+        self._home_ready = False
+        self._home_marker_id: int | None = None
+        self._home_line_position_valid = False
+        self._home_readiness_error = "HOME_NOT_CONFIRMED"
 
     @property
     def enabled(self) -> bool:
@@ -218,6 +231,19 @@ class NavigationCoordinator:
             return
 
         if line.startswith(U_TURN_COMPLETE_PREFIX):
+            if self._executor.state is MissionExecutionState.STARTING:
+                outcome = self._executor.complete_start_u_turn()
+                with self._lock:
+                    if outcome.success:
+                        self._armed = True
+                        self._state = NavigationCoordinatorState.WAITING_FOR_INTERSECTION
+                        self._last_error = None
+                    else:
+                        self._armed = False
+                        self._expected_marker_id = None
+                        self._state = NavigationCoordinatorState.ERROR
+                        self._last_error = outcome.result.value
+                return
             with self._lock:
                 if self._executor.state is MissionExecutionState.RETURNING_HOME:
                     self._armed = True
@@ -226,6 +252,14 @@ class NavigationCoordinator:
             return
 
         if line.startswith(U_TURN_FAILED_PREFIX):
+            if self._executor.state is MissionExecutionState.STARTING:
+                outcome = self._executor.fail_start_u_turn()
+                with self._lock:
+                    self._armed = False
+                    self._expected_marker_id = None
+                    self._state = NavigationCoordinatorState.ERROR
+                    self._last_error = outcome.result.value
+                return
             with self._lock:
                 self._last_intersection_event = line
             self._record_error("U_TURN_MANEUVER_FAILED")
@@ -235,6 +269,142 @@ class NavigationCoordinator:
             return
 
         self._process_intersection(line, execute_command=True, enforce_debounce=True)
+
+    def confirm_home_readiness(self) -> dict[str, object]:
+        """Confirm the stationary HOME marker and the ESP32 line-stop state."""
+
+        try:
+            if self._load_navigation_map is None:
+                raise NavigationMapError("Laravel navigation map loader is unavailable")
+            home_node = self._load_navigation_map().node_named("HOME")
+            if home_node is None or home_node.node_type != "home":
+                raise NavigationMapError("Laravel map has no dedicated HOME node")
+            detection = self._camera_service.detect(
+                expected_marker_id=home_node.marker_id,
+            )
+            marker_confirmed = (
+                detection.confirmed
+                and detection.marker_id == home_node.marker_id
+                and detection.node_name in {None, home_node.name}
+            )
+            line_position_valid = bool(
+                self._home_line_position_is_valid
+                and self._home_line_position_is_valid()
+            )
+        except Exception:
+            return self._set_home_readiness(
+                False,
+                marker_id=None,
+                line_position_valid=False,
+                error="HOME_NOT_CONFIRMED",
+            )
+
+        with self._lock:
+            self._last_marker_id = detection.marker_id
+            self._last_node = home_node.name if marker_confirmed else None
+            self._last_marker_area = detection.area
+            self._last_second_marker_id = detection.second_marker_id
+            self._last_second_marker_area = detection.second_area
+            self._last_area_ratio = detection.area_ratio
+            self._last_selection_ambiguous = detection.ambiguous
+
+        if not marker_confirmed:
+            return self._set_home_readiness(
+                False,
+                marker_id=home_node.marker_id,
+                line_position_valid=line_position_valid,
+                error="HOME_NOT_CONFIRMED",
+            )
+        if not line_position_valid:
+            return self._set_home_readiness(
+                False,
+                marker_id=home_node.marker_id,
+                line_position_valid=False,
+                error="HOME_LINE_POSITION_NOT_CONFIRMED",
+            )
+        return self._set_home_readiness(
+            True,
+            marker_id=home_node.marker_id,
+            line_position_valid=True,
+            error=None,
+        )
+
+    def begin_outbound_from_home(self) -> dict[str, object]:
+        """Validate HOME, start one U-turn, then await its completion event."""
+
+        with self._processing_lock:
+            if self._executor.state is not MissionExecutionState.READY_FOR_EXECUTION:
+                outcome = self._executor.start_ready_mission()
+                return {
+                    **outcome.as_dict(),
+                    "executor": self._executor.status(),
+                }
+
+            readiness = self.confirm_home_readiness()
+            if not readiness["success"]:
+                return {
+                    "success": False,
+                    "result": "HOME_NOT_CONFIRMED",
+                    "message": readiness["error"],
+                    "executor": self._executor.status(),
+                    "home": readiness,
+                }
+
+            if self._state is NavigationCoordinatorState.ERROR:
+                return {
+                    "success": False,
+                    "result": "NAVIGATION_NOT_READY",
+                    "message": self._last_error,
+                    "executor": self._executor.status(),
+                    "home": readiness,
+                }
+
+            try:
+                home_marker_id = int(readiness["marker_id"])
+                _, plan = self._executor.plan_route(home_marker_id)
+                if plan.decision is not RouteDecision.STRAIGHT or plan.next_node is None:
+                    raise MissionRouteUnavailableError(
+                        "Outbound HOME route does not begin with STRAIGHT."
+                    )
+                expected_marker_id = self._executor.marker_for_node(plan.next_node)
+            except (MissionRouteUnavailableError, NavigationMapError) as exc:
+                return {
+                    "success": False,
+                    "result": "OUTBOUND_ROUTE_UNAVAILABLE",
+                    "message": str(exc),
+                    "executor": self._executor.status(),
+                    "home": readiness,
+                }
+
+            with self._lock:
+                self._armed = False
+                self._expected_marker_id = expected_marker_id
+                self._expected_mission_id = self._executor.mission_id
+                self._last_command = None
+                self._last_error = None
+                self._state = NavigationCoordinatorState.COMMAND_SENT
+
+            outcome = self._executor.start_ready_mission()
+            if not outcome.success:
+                with self._lock:
+                    self._armed = False
+                    self._expected_marker_id = None
+                    self._state = NavigationCoordinatorState.ERROR
+                    self._last_error = outcome.result.value
+                return {
+                    **outcome.as_dict(),
+                    "executor": self._executor.status(),
+                    "home": readiness,
+                }
+
+            with self._lock:
+                self._last_command = "U_TURN"
+            return {
+                **outcome.as_dict(),
+                "expected_marker_id": expected_marker_id,
+                "executor": self._executor.status(),
+                "home": readiness,
+            }
 
     def begin_return_home(self) -> dict[str, object]:
         """Start one validated room U-turn and prepare return marker tracking."""
@@ -352,6 +522,38 @@ class NavigationCoordinator:
             self._confirmed_detection_sequences = ()
             self._state = NavigationCoordinatorState.DISABLED
 
+    def _set_home_readiness(
+        self,
+        ready: bool,
+        *,
+        marker_id: int | None,
+        line_position_valid: bool,
+        error: str | None,
+    ) -> dict[str, object]:
+        self._executor.set_home_readiness(ready, error=error)
+        with self._lock:
+            self._home_ready = ready
+            self._home_marker_id = marker_id
+            self._home_line_position_valid = line_position_valid
+            self._home_readiness_error = error
+            if ready and self._state is NavigationCoordinatorState.ERROR:
+                self._state = (
+                    NavigationCoordinatorState.WAITING_FOR_INTERSECTION
+                    if self.enabled
+                    else NavigationCoordinatorState.DISABLED
+                )
+                self._last_error = None
+            elif not ready:
+                self._last_error = error
+                self._state = NavigationCoordinatorState.ERROR
+            return {
+                "success": ready,
+                "ready": ready,
+                "marker_id": marker_id,
+                "line_position_valid": line_position_valid,
+                "error": error,
+            }
+
     def status(self) -> dict[str, object]:
         with self._lock:
             return {
@@ -378,6 +580,10 @@ class NavigationCoordinator:
                 "confirmed_detection_sequences": list(
                     self._confirmed_detection_sequences
                 ),
+                "home_ready": self._home_ready,
+                "home_marker_id": self._home_marker_id,
+                "home_line_position_valid": self._home_line_position_valid,
+                "home_readiness_error": self._home_readiness_error,
             }
 
     def _event_loop(self) -> None:
@@ -636,6 +842,11 @@ class NavigationCoordinator:
             return
 
         with self._lock:
+            self._executor.set_home_readiness(True)
+            self._home_ready = True
+            self._home_marker_id = self._last_marker_id
+            self._home_line_position_valid = True
+            self._home_readiness_error = None
             self._armed = True
             self._expected_marker_id = None
             self._expected_mission_id = None

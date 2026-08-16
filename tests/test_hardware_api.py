@@ -175,7 +175,7 @@ class FakeHardwareController:
     def get_line_status(self) -> str:
         return self._record_line_call(
             "get_line_status",
-            "LINE_STATUS|MODE=FOLLOWING|STATE=SEARCHING_LEFT|PATTERN=11111",
+            "LINE_STATUS|MODE=STOPPED|STATE=IDLE|PATTERN=11111",
         )
 
     def start_line_follow(self) -> str:
@@ -329,9 +329,9 @@ class FakeCameraService:
             camera_available=available,
             detected=True,
             confirmed=True,
-            marker_id=1,
-            node_name="NODE_1",
-            marker_type="intersection",
+            marker_id=10,
+            node_name="HOME",
+            marker_type="home",
             area=3600,
             consecutive_frames=3,
         )
@@ -557,9 +557,9 @@ def test_camera_detect_is_read_only_and_returns_structured_detection(
 
     assert response.status_code == 200
     assert response.json() == fake_camera.detection.as_dict()
-    assert fake_camera.detect_calls == 1
+    assert fake_camera.detect_calls == 2
     assert fake_hardware.movement_calls == []
-    assert fake_hardware.line_calls == []
+    assert fake_hardware.line_calls == ["get_line_status"]
     assert fake_hardware.navigation_calls == []
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
@@ -581,9 +581,9 @@ def test_camera_stream_uses_existing_service_and_detect_still_works(
     assert detect_response.status_code == 200
     assert fake_camera.preview_calls == 1
     assert fake_camera.stream_calls == 1
-    assert fake_camera.detect_calls == 1
+    assert fake_camera.detect_calls == 2
     assert fake_hardware.movement_calls == []
-    assert fake_hardware.line_calls == []
+    assert fake_hardware.line_calls == ["get_line_status"]
     assert fake_hardware.navigation_calls == []
 
 
@@ -621,10 +621,10 @@ def test_navigation_decision_preview_uses_loaded_mission_without_hardware(
         "decision": "STRAIGHT",
         "next_node": "NODE_1",
     }
-    assert fake_laravel.map_calls == 1
+    assert fake_laravel.map_calls == 2
     assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
     assert fake_hardware.movement_calls == []
-    assert fake_hardware.line_calls == []
+    assert fake_hardware.line_calls == ["get_line_status"]
     assert fake_hardware.navigation_calls == []
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
@@ -642,13 +642,13 @@ def test_navigation_status_reports_auto_disabled_by_default(
         "mission_id": None,
         "armed": True,
         "last_intersection_event": None,
-        "last_marker_id": None,
-        "last_node": None,
+        "last_marker_id": 10,
+        "last_node": "HOME",
         "last_decision": None,
         "last_command": None,
         "last_error": None,
         "expected_marker_id": None,
-        "last_marker_area": None,
+        "last_marker_area": 3600,
         "last_second_marker_id": None,
         "last_second_marker_area": None,
         "last_area_ratio": None,
@@ -656,6 +656,10 @@ def test_navigation_status_reports_auto_disabled_by_default(
         "intersection_event_sequence": None,
         "first_detection_sequence_used": None,
         "confirmed_detection_sequences": [],
+        "home_ready": True,
+        "home_marker_id": 10,
+        "home_line_position_valid": True,
+        "home_readiness_error": None,
     }
 
 
@@ -677,10 +681,10 @@ def test_disabled_intersection_test_endpoint_never_sends_hardware_command(
     assert response.json()["last_command"] is None
     assert response.json()["last_error"] is None
     assert executor.state is MissionExecutionState.IDLE
-    assert fake_camera.detect_calls == 0
-    assert fake_laravel.map_calls == 0
+    assert fake_camera.detect_calls == 1
+    assert fake_laravel.map_calls == 1
     assert fake_hardware.navigation_calls == []
-    assert fake_hardware.line_calls == []
+    assert fake_hardware.line_calls == ["get_line_status"]
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
 
@@ -876,8 +880,10 @@ def test_scheduler_status_is_idle_and_disabled_by_default(
         "medicine_id": None,
         "dispenser_box": None,
         "quantity": None,
-        "last_error": None,
-        "auto_execution_enabled": False,
+            "last_error": None,
+            "auto_execution_enabled": False,
+            "home_ready": True,
+            "home_readiness_error": None,
         "pending_acceptance_mission_id": None,
         "last_tick_at": None,
         "last_result": None,
@@ -923,11 +929,13 @@ def test_manual_scheduler_tick_only_prepares_claimed_mission(
         "medicine_id": 2,
         "dispenser_box": None,
         "quantity": 4,
-        "last_error": None,
-        "auto_execution_enabled": False,
+            "last_error": None,
+            "auto_execution_enabled": False,
+            "home_ready": True,
+            "home_readiness_error": None,
     }
     assert fake_hardware.movement_calls == []
-    assert fake_hardware.line_calls == []
+    assert fake_hardware.line_calls == ["get_line_status"]
     assert fake_hardware.navigation_calls == []
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
@@ -972,19 +980,28 @@ def test_executor_start_uses_high_level_line_follow_then_laravel(
     first = client.post("/executor/start")
     second = client.post("/executor/start")
 
-    assert first.status_code == 200
-    assert first.json()["result"] == "STARTED"
-    assert first.json()["executor"]["state"] == "GOING_TO_ROOM"
+    assert first.status_code == 202
+    assert first.json()["result"] == "U_TURN_STARTED"
+    assert first.json()["executor"]["state"] == "STARTING"
     assert second.status_code == 409
     assert second.json()["result"] == "EXECUTOR_BUSY"
-    assert fake_hardware.line_calls == ["start_line_follow"]
-    assert fake_laravel.start_calls == [mission]
+    assert fake_hardware.line_calls == ["get_line_status", "get_line_status"]
+    assert fake_laravel.start_calls == []
     assert fake_hardware.movement_calls == []
-    assert fake_hardware.navigation_calls == []
+    assert fake_hardware.navigation_calls == ["u-turn"]
     assert fake_hardware.camera_calls == []
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
     assert fake_hardware.return_home_calls == []
+
+    client.app.state.navigation_coordinator.process_serial_line(
+        "EVENT|U_TURN_COMPLETE|PATTERN=11011"
+    )
+    assert client.app.state.mission_executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert fake_hardware.line_calls == [
+        "get_line_status", "get_line_status", "start_line_follow"
+    ]
+    assert fake_laravel.start_calls == [mission]
 
 
 def test_executor_return_home_rejects_non_arrived_state_without_movement(
@@ -996,7 +1013,7 @@ def test_executor_return_home_rejects_non_arrived_state_without_movement(
     assert response.status_code == 409
     assert response.json()["result"] == "RETURN_NOT_ALLOWED"
     assert fake_hardware.navigation_calls == []
-    assert fake_hardware.line_calls == []
+    assert fake_hardware.line_calls == ["get_line_status"]
 
 
 def test_executor_dispense_reuses_api_hardware_and_manual_return_endpoint(
@@ -1006,7 +1023,10 @@ def test_executor_dispense_reuses_api_hardware_and_manual_return_endpoint(
     executor: MissionExecutor = client.app.state.mission_executor
     mission = executable_mission()
     assert executor.accept(mission) is True
-    assert client.post("/executor/start").status_code == 200
+    assert client.post("/executor/start").status_code == 202
+    client.app.state.navigation_coordinator.process_serial_line(
+        "EVENT|U_TURN_COMPLETE|PATTERN=11011"
+    )
     executor.mark_arrived_at_room()
     assert executor.wait_for_hand_confirmation(1.0).success is True
 
@@ -1018,7 +1038,7 @@ def test_executor_dispense_reuses_api_hardware_and_manual_return_endpoint(
     assert returned.json()["result"] == "RETURN_STARTED"
     assert returned.json()["executor"]["state"] == "RETURNING_HOME"
     assert fake_hardware.dispense_calls == [(1, 4)]
-    assert fake_hardware.navigation_calls == ["u-turn"]
+    assert fake_hardware.navigation_calls == ["u-turn", "u-turn"]
     assert fake_hardware.water_calls == []
 
 
@@ -1032,10 +1052,10 @@ def test_executor_start_does_nothing_when_hardware_is_unavailable(
 
     response = client.post("/executor/start")
 
-    assert response.status_code == 503
-    assert response.json()["result"] == "HARDWARE_UNAVAILABLE"
+    assert response.status_code == 409
+    assert response.json()["result"] == "HOME_NOT_CONFIRMED"
     assert response.json()["executor"]["state"] == "READY_FOR_EXECUTION"
-    assert fake_hardware.line_calls == []
+    assert fake_hardware.line_calls == ["get_line_status"]
     assert fake_laravel.start_calls == []
 
 
@@ -1049,12 +1069,13 @@ def test_executor_malformed_start_ack_never_updates_laravel(
 
     response = client.post("/executor/start")
 
-    assert response.status_code == 502
-    assert response.json()["result"] == "LINE_FOLLOW_START_FAILED"
-    assert response.json()["executor"]["state"] == "FAILED"
+    assert response.status_code == 202
+    client.app.state.navigation_coordinator.process_serial_line(
+        "EVENT|U_TURN_COMPLETE|PATTERN=11011"
+    )
+    assert client.app.state.mission_executor.status()["state"] == "FAILED"
     assert fake_hardware.line_calls == [
-        "start_line_follow",
-        "stop_line_follow",
+        "get_line_status", "get_line_status", "start_line_follow", "stop_line_follow",
     ]
     assert fake_laravel.start_calls == []
 
@@ -1069,12 +1090,13 @@ def test_executor_laravel_failure_immediately_stops_line_follow(
 
     response = client.post("/executor/start")
 
-    assert response.status_code == 502
-    assert response.json()["result"] == "MISSION_STATUS_UPDATE_FAILED"
-    assert response.json()["executor"]["state"] == "FAILED"
+    assert response.status_code == 202
+    client.app.state.navigation_coordinator.process_serial_line(
+        "EVENT|U_TURN_COMPLETE|PATTERN=11011"
+    )
+    assert client.app.state.mission_executor.status()["state"] == "FAILED"
     assert fake_hardware.line_calls == [
-        "start_line_follow",
-        "stop_line_follow",
+        "get_line_status", "get_line_status", "start_line_follow", "stop_line_follow",
     ]
     assert fake_laravel.start_calls == [executable_mission()]
 
@@ -1349,7 +1371,7 @@ def test_movement_hardware_error_returns_service_unavailable(
             {
                 "success": True,
                 "status": (
-                    "LINE_STATUS|MODE=FOLLOWING|STATE=SEARCHING_LEFT|PATTERN=11111"
+                    "LINE_STATUS|MODE=STOPPED|STATE=IDLE|PATTERN=11111"
                 ),
             },
         ),
@@ -1379,7 +1401,7 @@ def test_line_endpoint_invokes_exactly_one_controller_method(
 
     assert response.status_code == 200
     assert response.json() == response_body
-    assert fake_hardware.line_calls == [controller_method]
+    assert fake_hardware.line_calls == ["get_line_status", controller_method]
 
 
 def test_line_hardware_error_returns_service_unavailable(
@@ -1396,7 +1418,7 @@ def test_line_hardware_error_returns_service_unavailable(
     assert response.json() == {
         "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
     }
-    assert fake_hardware.line_calls == []
+    assert fake_hardware.line_calls == ["get_line_status"]
     assert "/dev/serial/example" not in response.text
 
 

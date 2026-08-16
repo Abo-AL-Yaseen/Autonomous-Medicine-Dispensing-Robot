@@ -95,6 +95,7 @@ def ready_executor(
         start_line_follow=dependencies.start_line_follow,
         stop_line_follow=dependencies.stop_line_follow,
         mark_mission_in_progress=dependencies.mark_in_progress,
+        require_home_readiness=False,
     )
     assert executor.accept(valid_mission()) is True
     return executor
@@ -185,6 +186,7 @@ def test_invalid_claimed_mission_never_touches_hardware_or_laravel() -> None:
         start_line_follow=dependencies.start_line_follow,
         stop_line_follow=dependencies.stop_line_follow,
         mark_mission_in_progress=dependencies.mark_in_progress,
+        require_home_readiness=False,
     )
     executor.accept(ClaimedMission(8, 1, 2, 4))
 
@@ -206,6 +208,40 @@ def test_success_starts_line_follow_and_updates_laravel_once() -> None:
     assert dependencies.line_calls == ["start"]
     assert dependencies.updated_missions == [valid_mission()]
     assert executor.state is MissionExecutionState.GOING_TO_ROOM
+
+
+def test_home_readiness_blocks_start_then_u_turn_precedes_line_follow() -> None:
+    dependencies = FakeExecutionDependencies()
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=lambda: u_turn_calls.append("u-turn") or "ACK|U_TURN_STARTED",
+        mark_mission_in_progress=dependencies.mark_in_progress,
+    )
+    assert executor.accept(valid_mission()) is True
+
+    blocked = executor.start_ready_mission()
+
+    assert blocked.result is MissionStartResult.HOME_NOT_CONFIRMED
+    assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
+    assert u_turn_calls == []
+    assert dependencies.line_calls == []
+
+    executor.set_home_readiness(True)
+    started = executor.start_ready_mission()
+
+    assert started.result is MissionStartResult.U_TURN_STARTED
+    assert executor.state is MissionExecutionState.STARTING
+    assert u_turn_calls == ["u-turn"]
+    assert dependencies.line_calls == []
+
+    completed = executor.complete_start_u_turn()
+
+    assert completed.result is MissionStartResult.STARTED
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert dependencies.line_calls == ["start"]
 
 
 def test_line_follow_failure_leaves_laravel_pending() -> None:
@@ -316,6 +352,7 @@ def test_partial_sensor_confirmed_dispense_fails_and_cannot_start_return_home() 
         },
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
     )
     assert executor.accept(valid_mission()) is True
     assert executor.start_ready_mission().success is True
@@ -351,6 +388,7 @@ def test_arrival_waits_for_hand_and_blocks_dispense_until_confirmation() -> None
         ),
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
     )
     assert executor.accept(valid_mission()) is True
     assert executor.start_ready_mission().success is True
@@ -381,6 +419,7 @@ def test_hand_timeout_fails_without_uno_dispense_or_return_home() -> None:
         dispense_medicine=lambda box, quantity: dispense_calls.append((box, quantity)) or {},
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
     )
     assert executor.accept(valid_mission()) is True
     assert executor.start_ready_mission().success is True
@@ -415,6 +454,7 @@ def test_duplicate_hand_confirmation_cannot_start_a_second_dispense() -> None:
         ),
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
     )
     assert executor.accept(valid_mission()) is True
     assert executor.start_ready_mission().success is True
@@ -437,6 +477,7 @@ def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:
         u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
     )
     mission = valid_mission()
     assert executor.accept(mission) is True
@@ -468,6 +509,7 @@ def test_return_home_invalid_state_and_hardware_failure_do_not_turn() -> None:
         u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
     )
 
     invalid_state = executor.start_return_home()
@@ -495,6 +537,7 @@ def test_arrived_home_finalization_completes_and_clears_mission_context() -> Non
         mark_mission_in_progress=dependencies.mark_in_progress,
         mark_mission_completed=completed_missions.append,
         load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
     )
     mission = valid_mission()
     assert executor.accept(mission) is True
@@ -515,6 +558,8 @@ def test_arrived_home_finalization_completes_and_clears_mission_context() -> Non
         "medicine_id": None,
         "dispenser_box": None,
         "quantity": None,
-        "last_error": None,
-        "auto_execution_enabled": False,
-    }
+            "last_error": None,
+            "auto_execution_enabled": False,
+            "home_ready": True,
+            "home_readiness_error": None,
+        }

@@ -255,6 +255,23 @@ def create_app(
             with hardware_lock:
                 return controller.stop_line_follow()
 
+        def home_line_position_is_valid() -> bool:
+            """Require the existing ESP32 to report a stationary line state."""
+
+            if not application.state.hardware_connected:
+                return False
+            with hardware_lock:
+                status = controller.get_line_status()
+            fields = dict(
+                field.split("=", 1)
+                for field in status.split("|")[1:]
+                if "=" in field
+            )
+            return (
+                fields.get("MODE") == "STOPPED"
+                and fields.get("STATE") == "IDLE"
+            )
+
         def run_navigation_hardware(operation: Callable[[], str]) -> str:
             if not application.state.hardware_connected:
                 raise HardwareControllerError("robot hardware is disconnected")
@@ -292,6 +309,7 @@ def create_app(
             mark_mission_completed=laravel_client.complete_claimed_mission,
             load_navigation_map=laravel_client.get_navigation_map,
             auto_execution_enabled=scheduler_settings.auto_execution_enabled,
+            require_home_readiness=True,
         )
 
         scheduler = MissionScheduler(
@@ -324,6 +342,8 @@ def create_app(
                 controller.stop_line_follow
             ),
             show_medicine_workflow_status=show_executor_medicine_status,
+            load_navigation_map=laravel_client.get_navigation_map,
+            home_line_position_is_valid=home_line_position_is_valid,
         )
         application.state.mission_executor = executor
         application.state.mission_scheduler = scheduler
@@ -343,6 +363,11 @@ def create_app(
         except Exception:
             # Camera availability is independent from robot serial startup.
             pass
+
+        # The system remains stationary if this cannot be confirmed.  The
+        # start endpoint retries the same check so a camera warming up cannot
+        # require a FastAPI restart.
+        navigation_coordinator.confirm_home_readiness()
 
         navigation_coordinator.start()
         scheduler_loop.start()
@@ -523,23 +548,27 @@ def create_app(
 
     @application.post("/executor/start")
     def executor_start(request: Request) -> JSONResponse:
-        executor: MissionExecutor = request.app.state.mission_executor
-        result = executor.start_ready_mission()
+        coordinator: NavigationCoordinator = (
+            request.app.state.navigation_coordinator
+        )
+        result = coordinator.begin_outbound_from_home()
         status_code = {
-            MissionStartResult.STARTED: 200,
-            MissionStartResult.NO_READY_MISSION: 409,
-            MissionStartResult.HARDWARE_UNAVAILABLE: 503,
-            MissionStartResult.EXECUTOR_BUSY: 409,
-            MissionStartResult.INVALID_MISSION: 422,
-            MissionStartResult.LINE_FOLLOW_START_FAILED: 502,
-            MissionStartResult.MISSION_STATUS_UPDATE_FAILED: 502,
-        }[result.result]
+            MissionStartResult.U_TURN_STARTED.value: 202,
+            MissionStartResult.STARTED.value: 200,
+            MissionStartResult.NO_READY_MISSION.value: 409,
+            MissionStartResult.HOME_NOT_CONFIRMED.value: 409,
+            MissionStartResult.HARDWARE_UNAVAILABLE.value: 503,
+            MissionStartResult.EXECUTOR_BUSY.value: 409,
+            MissionStartResult.INVALID_MISSION.value: 422,
+            MissionStartResult.HOME_UTURN_FAILED.value: 502,
+            MissionStartResult.LINE_FOLLOW_START_FAILED.value: 502,
+            MissionStartResult.MISSION_STATUS_UPDATE_FAILED.value: 502,
+            "NAVIGATION_NOT_READY": 409,
+            "OUTBOUND_ROUTE_UNAVAILABLE": 422,
+        }.get(str(result["result"]), 500)
         return JSONResponse(
             status_code=status_code,
-            content={
-                **result.as_dict(),
-                "executor": executor.status(),
-            },
+            content=result,
         )
 
     @application.post("/executor/return-home")

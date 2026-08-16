@@ -39,7 +39,10 @@ class MissionExecutionState(str, Enum):
 
 class MissionStartResult(str, Enum):
     STARTED = "STARTED"
+    U_TURN_STARTED = "U_TURN_STARTED"
     NO_READY_MISSION = "NO_READY_MISSION"
+    HOME_NOT_CONFIRMED = "HOME_NOT_CONFIRMED"
+    HOME_UTURN_FAILED = "HOME_UTURN_FAILED"
     HARDWARE_UNAVAILABLE = "HARDWARE_UNAVAILABLE"
     EXECUTOR_BUSY = "EXECUTOR_BUSY"
     INVALID_MISSION = "INVALID_MISSION"
@@ -144,6 +147,7 @@ class MissionExecutor:
         mark_mission_completed: Callable[[ClaimedMission], None] | None = None,
         load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
         auto_execution_enabled: bool = False,
+        require_home_readiness: bool = True,
     ) -> None:
         self._lock = threading.Lock()
         self._state = MissionExecutionState.IDLE
@@ -162,6 +166,11 @@ class MissionExecutor:
         self._destination_node: PhysicalNode | None = None
         self._hand_confirmed = False
         self._auto_execution_enabled = auto_execution_enabled
+        self._require_home_readiness = require_home_readiness
+        self._home_ready = not require_home_readiness
+        self._home_readiness_error: str | None = (
+            None if self._home_ready else MissionStartResult.HOME_NOT_CONFIRMED.value
+        )
 
     @property
     def state(self) -> MissionExecutionState:
@@ -179,6 +188,17 @@ class MissionExecutor:
 
         with self._lock:
             return self._mission.room_id if self._mission else None
+
+    def set_home_readiness(self, ready: bool, *, error: str | None = None) -> None:
+        """Record the coordinator's confirmed stationary HOME precondition."""
+
+        with self._lock:
+            self._home_ready = ready
+            self._home_readiness_error = (
+                None
+                if ready
+                else error or MissionStartResult.HOME_NOT_CONFIRMED.value
+            )
 
     def accept(self, mission: ClaimedMission) -> bool:
         """Transition IDLE to READY exactly once for the accepted mission."""
@@ -520,7 +540,7 @@ class MissionExecutor:
         return True
 
     def start_ready_mission(self) -> MissionStartOutcome:
-        """Perform only READY -> line follow -> in_progress -> GOING_TO_ROOM."""
+        """Perform READY -> outbound U-turn; completion starts line following."""
 
         with self._lock:
             if self._state is MissionExecutionState.IDLE:
@@ -534,6 +554,17 @@ class MissionExecutor:
                     MissionStartResult.EXECUTOR_BUSY,
                     False,
                     f"MissionExecutor is {self._state.value}.",
+                )
+
+            if self._require_home_readiness and not self._home_ready:
+                message = self._home_readiness_error or (
+                    MissionStartResult.HOME_NOT_CONFIRMED.value
+                )
+                self._last_error = message
+                return MissionStartOutcome(
+                    MissionStartResult.HOME_NOT_CONFIRMED,
+                    False,
+                    message,
                 )
 
             mission = self._mission
@@ -564,6 +595,47 @@ class MissionExecutor:
 
         assert mission is not None
 
+        # The production API always enables HOME readiness and waits for the
+        # ESP32 U-turn completion event.  Keep the dependency-light executor
+        # mode used by offline route tests as the historical line-follow
+        # boundary; it has no coordinator to consume that event.
+        if not self._require_home_readiness:
+            return self.complete_start_u_turn()
+
+        try:
+            if self._u_turn is None:
+                raise RuntimeError("U-turn operation is not configured")
+            acknowledgement = self._u_turn()
+            if acknowledgement != U_TURN_STARTED_ACK:
+                raise RuntimeError(
+                    f"Unexpected U-turn acknowledgement: {acknowledgement!r}"
+                )
+        except Exception as exc:
+            message = self._stop_after_failure(
+                f"HOME_UTURN_FAILED: {exc}",
+            )
+            return self._fail(MissionStartResult.HOME_UTURN_FAILED, message)
+
+        return MissionStartOutcome(MissionStartResult.U_TURN_STARTED, True)
+
+    def complete_start_u_turn(self) -> MissionStartOutcome:
+        """Start outbound line following after the ESP32 confirms the U-turn."""
+
+        with self._lock:
+            if self._state is not MissionExecutionState.STARTING:
+                return MissionStartOutcome(
+                    MissionStartResult.EXECUTOR_BUSY,
+                    False,
+                    f"MissionExecutor is {self._state.value}.",
+                )
+            mission = self._mission
+
+        if mission is None:
+            return self._fail(
+                MissionStartResult.INVALID_MISSION,
+                "Claimed mission data is missing.",
+            )
+
         try:
             if self._start_line_follow is None:
                 raise RuntimeError("Line-follow start operation is not configured")
@@ -573,9 +645,7 @@ class MissionExecutor:
                     f"Unexpected line-follow acknowledgement: {acknowledgement!r}"
                 )
         except Exception as exc:
-            message = self._stop_after_failure(
-                f"Line-follow start failed: {exc}",
-            )
+            message = self._stop_after_failure(f"Line-follow start failed: {exc}")
             return self._fail(MissionStartResult.LINE_FOLLOW_START_FAILED, message)
 
         try:
@@ -597,6 +667,19 @@ class MissionExecutor:
 
         return MissionStartOutcome(MissionStartResult.STARTED, True)
 
+    def fail_start_u_turn(self) -> MissionStartOutcome:
+        """Fail a pending outbound start when ESP32 reports U-turn failure."""
+
+        with self._lock:
+            if self._state is not MissionExecutionState.STARTING:
+                return MissionStartOutcome(
+                    MissionStartResult.EXECUTOR_BUSY,
+                    False,
+                    f"MissionExecutor is {self._state.value}.",
+                )
+        message = self._stop_after_failure(MissionStartResult.HOME_UTURN_FAILED.value)
+        return self._fail(MissionStartResult.HOME_UTURN_FAILED, message)
+
     def status(self) -> dict[str, object]:
         with self._lock:
             mission = self._mission
@@ -611,6 +694,8 @@ class MissionExecutor:
                 "quantity": mission.quantity if mission else None,
                 "last_error": self._last_error,
                 "auto_execution_enabled": self._auto_execution_enabled,
+                "home_ready": self._home_ready,
+                "home_readiness_error": self._home_readiness_error,
             }
 
     @staticmethod

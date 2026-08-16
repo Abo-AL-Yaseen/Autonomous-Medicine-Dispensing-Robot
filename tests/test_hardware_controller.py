@@ -715,10 +715,11 @@ def test_mission_executor_start_preserves_immediate_intersection_event() -> None
         hardware_available=lambda: True,
         start_line_follow=controller.start_line_follow,
         stop_line_follow=controller.stop_line_follow,
-        mark_mission_in_progress=lambda mission: started_missions.append(
-            mission.id
-        ),
-    )
+            mark_mission_in_progress=lambda mission: started_missions.append(
+                mission.id
+            ),
+            require_home_readiness=False,
+        )
     mission = ClaimedMission(
         id=42,
         room_id=1,
