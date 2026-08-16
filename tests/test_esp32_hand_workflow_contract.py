@@ -43,3 +43,45 @@ def test_hand_and_lcd_commands_are_machine_readable_and_do_not_touch_navigation(
         firmware.index('normalizedCommand == "GET_HAND"'):
         firmware.index('normalizedCommand == "GET_HAND"') + 1200
     ]
+
+
+def test_serial_parser_dispatches_only_complete_single_character_legacy_lines() -> None:
+    firmware = source()
+    parser = firmware[
+        firmware.index("static SerialInputResult readSerialInput"):
+        firmware.index("static bool interruptionRequested()")
+    ]
+    dispatcher = firmware[
+        firmware.index("static void processSerialInput()"):
+        firmware.index("void setup()")
+    ]
+
+    assert "Every command is newline-terminated" in firmware
+    assert "if (incoming == '\\n')" in parser
+    assert "if (isLegacyCommand(incoming))" not in parser
+    assert "serialPending" not in parser
+    assert (
+        "receivedLine.length() == 1 && isLegacyCommand(receivedLine.charAt(0))"
+        in dispatcher
+    )
+
+
+def test_lcd_lines_and_unknown_long_l_or_r_lines_cannot_dispatch_legacy_turns() -> None:
+    firmware = source()
+    dispatcher = firmware[
+        firmware.index("static void processSerialInput()"):
+        firmware.index("void setup()")
+    ]
+    text_handler = firmware[
+        firmware.index("void handleTextCommand"):
+        firmware.index("static void processSerialInput()")
+    ]
+
+    assert dispatcher.count("handleLegacyCommand(") == 1
+    assert "else {\n      handleTextCommand(receivedLine);\n    }" in dispatcher
+    assert 'Serial.println("ERROR|UNKNOWN_COMMAND");' in text_handler
+
+    assert 'case \'L\':' in firmware
+    assert 'Serial.println("ACK|LEFT");' in firmware
+    assert 'case \'R\':' in firmware
+    assert 'Serial.println("ACK|RIGHT");' in firmware

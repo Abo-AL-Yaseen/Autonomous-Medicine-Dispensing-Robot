@@ -364,23 +364,12 @@ static bool irDetectionLatched = false;
 static unsigned long irDebounceStartedMs = 0;
 
 const size_t SERIAL_COMMAND_BUFFER_SIZE = 64;
-const unsigned long SERIAL_PENDING_P_TIMEOUT_MS = 125;
-const unsigned long SERIAL_PENDING_S_TIMEOUT_MS = 20;
-const unsigned long SERIAL_PENDING_U_TIMEOUT_MS = 20;
 static char serialCommandBuffer[SERIAL_COMMAND_BUFFER_SIZE];
 static size_t serialCommandLength = 0;
 static bool serialCommandOverflow = false;
-static bool serialTextMode = false;
-static bool serialPendingP = false;
-static unsigned long serialPendingPStartedMs = 0;
-static bool serialPendingS = false;
-static unsigned long serialPendingSStartedMs = 0;
-static bool serialPendingU = false;
-static unsigned long serialPendingUStartedMs = 0;
 
 enum SerialInputResult {
   SERIAL_INPUT_INCOMPLETE,
-  SERIAL_INPUT_LEGACY_READY,
   SERIAL_INPUT_LINE_READY,
   SERIAL_INPUT_OVERFLOW
 };
@@ -418,10 +407,10 @@ static void disableLineFollowing(LineFollowState nextState);
 static void cancelIntersectionNavigation();
 static void startUturnNavigation();
 
-// Hardware keys execute immediately. Text commands remain newline-terminated,
-// while P/S/U are held briefly so PING, ST..., and U_TURN text lines are not
-// mistaken for the pump, emergency-stop, or ultrasonic legacy keys.
-static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
+// Every command is newline-terminated. Dispatch happens only after the full
+// line is available, so a structured command beginning with a legacy letter
+// (for example LCD|STATE=...) can never trigger motor movement.
+static SerialInputResult readSerialInput(String& line) {
   while (Serial.available() > 0) {
     char incoming = (char)Serial.read();
 
@@ -430,149 +419,30 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
         serialCommandLength = 0;
         serialCommandBuffer[0] = '\0';
         serialCommandOverflow = false;
-        serialTextMode = false;
         return SERIAL_INPUT_OVERFLOW;
       }
       continue;
     }
 
-    if (serialTextMode) {
-      if (incoming == '\r') {
-        continue;
-      }
-
-      if (incoming == '\n') {
-        serialCommandBuffer[serialCommandLength] = '\0';
-        line = serialCommandBuffer;
-        serialCommandLength = 0;
-        serialCommandBuffer[0] = '\0';
-        serialTextMode = false;
-        return SERIAL_INPUT_LINE_READY;
-      }
-
-      if (serialCommandLength < SERIAL_COMMAND_BUFFER_SIZE - 1) {
-        serialCommandBuffer[serialCommandLength++] = incoming;
-      } else {
-        serialCommandLength = 0;
-        serialCommandBuffer[0] = '\0';
-        serialCommandOverflow = true;
-      }
+    if (incoming == '\r') {
       continue;
     }
 
-    if (serialPendingP) {
-      if (incoming == '\r' || incoming == '\n') {
-        serialPendingP = false;
-        legacyCommand = 'P';
-        return SERIAL_INPUT_LEGACY_READY;
-      }
-
-      if (isLegacyCommand(incoming)) {
-        serialPendingP = false;
-        legacyCommand = incoming;
-        return SERIAL_INPUT_LEGACY_READY;
-      }
-
-      serialPendingP = false;
-      serialTextMode = true;
+    if (incoming == '\n') {
+      serialCommandBuffer[serialCommandLength] = '\0';
+      line = serialCommandBuffer;
       serialCommandLength = 0;
-      serialCommandBuffer[serialCommandLength++] = 'P';
+      serialCommandBuffer[0] = '\0';
+      return SERIAL_INPUT_LINE_READY;
+    }
+
+    if (serialCommandLength < SERIAL_COMMAND_BUFFER_SIZE - 1) {
       serialCommandBuffer[serialCommandLength++] = incoming;
-      continue;
+    } else {
+      serialCommandLength = 0;
+      serialCommandBuffer[0] = '\0';
+      serialCommandOverflow = true;
     }
-
-    if (serialPendingS) {
-      if (incoming == '\r' || incoming == '\n') {
-        serialPendingS = false;
-        legacyCommand = 'S';
-        return SERIAL_INPUT_LEGACY_READY;
-      }
-
-      if ((char)toupper((unsigned char)incoming) == 'T') {
-        serialPendingS = false;
-        serialTextMode = true;
-        serialCommandLength = 0;
-        serialCommandBuffer[serialCommandLength++] = 'S';
-        serialCommandBuffer[serialCommandLength++] = incoming;
-        continue;
-      }
-
-      // A non-text character following S still prioritizes emergency stop.
-      serialPendingS = false;
-      legacyCommand = 'S';
-      return SERIAL_INPUT_LEGACY_READY;
-    }
-
-    if (serialPendingU) {
-      if (incoming == '\r' || incoming == '\n') {
-        serialPendingU = false;
-        legacyCommand = 'U';
-        return SERIAL_INPUT_LEGACY_READY;
-      }
-
-      if (incoming == '_') {
-        serialPendingU = false;
-        serialTextMode = true;
-        serialCommandLength = 0;
-        serialCommandBuffer[serialCommandLength++] = 'U';
-        serialCommandBuffer[serialCommandLength++] = incoming;
-        continue;
-      }
-
-      // A non-text character following U preserves the ultrasonic shortcut.
-      serialPendingU = false;
-      legacyCommand = 'U';
-      return SERIAL_INPUT_LEGACY_READY;
-    }
-
-    if (incoming == '\r' || incoming == '\n' || incoming == ' ' || incoming == '\t') {
-      continue;
-    }
-
-    if ((char)toupper((unsigned char)incoming) == 'P') {
-      serialPendingP = true;
-      serialPendingPStartedMs = millis();
-      continue;
-    }
-
-    if ((char)toupper((unsigned char)incoming) == 'S') {
-      serialPendingS = true;
-      serialPendingSStartedMs = millis();
-      continue;
-    }
-
-    if ((char)toupper((unsigned char)incoming) == 'U') {
-      serialPendingU = true;
-      serialPendingUStartedMs = millis();
-      continue;
-    }
-
-    if (isLegacyCommand(incoming)) {
-      legacyCommand = incoming;
-      return SERIAL_INPUT_LEGACY_READY;
-    }
-
-    serialTextMode = true;
-    serialCommandLength = 0;
-    serialCommandBuffer[serialCommandLength++] = incoming;
-  }
-
-  if (serialPendingP && millis() - serialPendingPStartedMs >= SERIAL_PENDING_P_TIMEOUT_MS) {
-    serialPendingP = false;
-    legacyCommand = 'P';
-    return SERIAL_INPUT_LEGACY_READY;
-  }
-
-  if (serialPendingS && millis() - serialPendingSStartedMs >= SERIAL_PENDING_S_TIMEOUT_MS) {
-    serialPendingS = false;
-    legacyCommand = 'S';
-    return SERIAL_INPUT_LEGACY_READY;
-  }
-
-  if (serialPendingU && millis() - serialPendingUStartedMs >= SERIAL_PENDING_U_TIMEOUT_MS) {
-    serialPendingU = false;
-    legacyCommand = 'U';
-    return SERIAL_INPUT_LEGACY_READY;
   }
 
   return SERIAL_INPUT_INCOMPLETE;
@@ -582,9 +452,8 @@ static SerialInputResult readSerialInput(char& legacyCommand, String& line) {
 // الأمر S يعمل كتوقف طارئ، وباقي الأوامر تُعاد بعد عودة البرنامج للحلقة الرئيسية.
 static bool interruptionRequested() {
   while (true) {
-    char legacyCommand = '\0';
     String receivedLine;
-    SerialInputResult result = readSerialInput(legacyCommand, receivedLine);
+    SerialInputResult result = readSerialInput(receivedLine);
 
     if (result == SERIAL_INPUT_INCOMPLETE) {
       return false;
@@ -598,13 +467,9 @@ static bool interruptionRequested() {
       return true;
     }
 
-    if (result == SERIAL_INPUT_LEGACY_READY) {
-      receivedLine = String(legacyCommand);
-    } else {
-      receivedLine.trim();
-      if (receivedLine.length() == 0) {
-        continue;
-      }
+    receivedLine.trim();
+    if (receivedLine.length() == 0) {
+      continue;
     }
 
     receivedLine.trim();
@@ -3750,9 +3615,8 @@ void handleTextCommand(const String& command) {
 
 static void processSerialInput() {
   while (true) {
-    char legacyCommand = '\0';
     String receivedLine;
-    SerialInputResult result = readSerialInput(legacyCommand, receivedLine);
+    SerialInputResult result = readSerialInput(receivedLine);
 
     if (result == SERIAL_INPUT_INCOMPLETE) {
       return;
@@ -3760,11 +3624,6 @@ static void processSerialInput() {
 
     if (result == SERIAL_INPUT_OVERFLOW) {
       Serial.println("ERROR|COMMAND_TOO_LONG");
-      continue;
-    }
-
-    if (result == SERIAL_INPUT_LEGACY_READY) {
-      handleLegacyCommand(legacyCommand);
       continue;
     }
 
