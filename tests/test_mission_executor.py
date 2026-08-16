@@ -106,14 +106,20 @@ def navigation_map_for_room_one() -> PhysicalNavigationMap:
         nodes=(
             PhysicalNode(1, "NODE_0", "intersection", 0),
             PhysicalNode(2, "ROOM_1", "room", 11),
+            PhysicalNode(3, "HOME", "home", 10),
         ),
         connections=(
+            DirectedConnection("HOME", "NODE_0", RouteDecision.STRAIGHT),
+            DirectedConnection("NODE_0", "HOME", RouteDecision.STRAIGHT),
             DirectedConnection("NODE_0", "ROOM_1", RouteDecision.LEFT),
         ),
         return_routes=(
             ReturnRoute(
                 1,
-                (RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),),
+                (
+                    RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),
+                    RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+                ),
             ),
         ),
     )

@@ -53,6 +53,7 @@ class PhysicalNavigationMapTest extends TestCase
             'NODE_0' => 0,
             'NODE_1' => 1,
             'NODE_2' => 2,
+            'HOME' => 10,
             'ROOM_1' => 11,
             'ROOM_2' => 12,
             'ROOM_3' => 13,
@@ -61,6 +62,8 @@ class PhysicalNavigationMapTest extends TestCase
         ], Node::query()->orderBy('marker_id')->pluck('marker_id', 'node_code')->all());
 
         $this->assertSame([
+            'HOME|NODE_0|STRAIGHT',
+            'NODE_0|HOME|STRAIGHT',
             'NODE_0|NODE_1|STRAIGHT',
             'NODE_0|ROOM_1|LEFT',
             'NODE_1|NODE_2|LEFT',
@@ -71,7 +74,8 @@ class PhysicalNavigationMapTest extends TestCase
         ], $this->connectionKeys());
 
         $this->assertFalse(Room::query()->where('room_number', '6')->exists());
-        $this->assertFalse(Node::query()->whereIn('node_code', ['HOME', 'J1', 'J2', 'J3', 'J4'])->exists());
+        $this->assertSame('home', Node::query()->where('node_code', 'HOME')->value('node_type'));
+        $this->assertFalse(Node::query()->whereIn('node_code', ['J1', 'J2', 'J3', 'J4'])->exists());
     }
 
     #[DataProvider('approvedRoutes')]
@@ -129,24 +133,29 @@ class PhysicalNavigationMapTest extends TestCase
         return [
             '1' => [
                 ['ROOM_1', 'U_TURN', 'NODE_0'],
+                ['NODE_0', 'STRAIGHT', 'HOME'],
             ],
             '2' => [
                 ['ROOM_2', 'U_TURN', 'NODE_2'],
                 ['NODE_2', 'LEFT', 'NODE_1'],
                 ['NODE_1', 'RIGHT', 'NODE_0'],
+                ['NODE_0', 'STRAIGHT', 'HOME'],
             ],
             '3' => [
                 ['ROOM_3', 'U_TURN', 'NODE_2'],
                 ['NODE_2', 'RIGHT', 'NODE_1'],
                 ['NODE_1', 'RIGHT', 'NODE_0'],
+                ['NODE_0', 'STRAIGHT', 'HOME'],
             ],
             '4' => [
                 ['ROOM_4', 'U_TURN', 'NODE_1'],
                 ['NODE_1', 'LEFT', 'NODE_0'],
+                ['NODE_0', 'STRAIGHT', 'HOME'],
             ],
             '5' => [
                 ['ROOM_5', 'U_TURN', 'NODE_1'],
                 ['NODE_1', 'STRAIGHT', 'NODE_0'],
+                ['NODE_0', 'STRAIGHT', 'HOME'],
             ],
         ];
     }
@@ -205,14 +214,16 @@ class PhysicalNavigationMapTest extends TestCase
             ->assertOk()
             ->assertJsonPath('success', true)
             ->assertJsonCount(5, 'rooms')
-            ->assertJsonCount(8, 'nodes')
-            ->assertJsonCount(7, 'connections')
+            ->assertJsonCount(9, 'nodes')
+            ->assertJsonCount(9, 'connections')
             ->assertJsonCount(5, 'return_routes')
             ->assertJsonPath('rooms.3.room_number', '4')
             ->assertJsonPath('rooms.3.destination_node.node_name', 'ROOM_4')
             ->assertJsonPath('rooms.3.destination_node.marker_id', 14);
 
         $this->assertSame([
+            ['from_node' => 'HOME', 'to_node' => 'NODE_0', 'direction' => 'STRAIGHT'],
+            ['from_node' => 'NODE_0', 'to_node' => 'HOME', 'direction' => 'STRAIGHT'],
             ['from_node' => 'NODE_0', 'to_node' => 'ROOM_1', 'direction' => 'LEFT'],
             ['from_node' => 'NODE_0', 'to_node' => 'NODE_1', 'direction' => 'STRAIGHT'],
             ['from_node' => 'NODE_1', 'to_node' => 'NODE_2', 'direction' => 'LEFT'],
@@ -229,6 +240,7 @@ class PhysicalNavigationMapTest extends TestCase
                 ['from_node' => 'ROOM_2', 'to_node' => 'NODE_2', 'direction' => 'U_TURN'],
                 ['from_node' => 'NODE_2', 'to_node' => 'NODE_1', 'direction' => 'LEFT'],
                 ['from_node' => 'NODE_1', 'to_node' => 'NODE_0', 'direction' => 'RIGHT'],
+                ['from_node' => 'NODE_0', 'to_node' => 'HOME', 'direction' => 'STRAIGHT'],
             ],
         ], $response->json('return_routes.1'));
 
@@ -261,7 +273,7 @@ class PhysicalNavigationMapTest extends TestCase
         $this->assertSame($roomIds, Room::query()->orderBy('id')->pluck('id')->all());
         $this->assertSame($nodeIds, Node::query()->orderBy('id')->pluck('id')->all());
         $this->assertSame($connectionIds, Connection::query()->orderBy('id')->pluck('id')->all());
-        $this->assertCount(7, $this->connectionKeys());
+        $this->assertCount(9, $this->connectionKeys());
     }
 
     public function test_seeding_preserves_existing_medicines_and_missions(): void

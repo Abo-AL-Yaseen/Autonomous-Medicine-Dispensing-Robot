@@ -181,9 +181,9 @@ class LaravelRoutePlanner:
                 f"Marker {current_marker_id} is not present in Laravel's map"
             )
 
-        home_node = self.navigation_map.node_for_marker(0)
-        if home_node is None or home_node.name != "NODE_0":
-            raise NavigationMapError("Laravel's map has no NODE_0 marker 0")
+        home_node = self.navigation_map.node_named("HOME")
+        if home_node is None or home_node.node_type != "home":
+            raise NavigationMapError("Laravel's map has no dedicated HOME node")
 
         if current_node.name == home_node.name:
             return RoutePlan(

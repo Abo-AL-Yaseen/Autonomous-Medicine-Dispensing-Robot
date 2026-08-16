@@ -29,6 +29,7 @@ APPROVED_MARKERS: dict[int, tuple[str, str]] = {
     0: ("NODE_0", "intersection"),
     1: ("NODE_1", "intersection"),
     2: ("NODE_2", "intersection"),
+    10: ("HOME", "home"),
     11: ("ROOM_1", "room"),
     12: ("ROOM_2", "room"),
     13: ("ROOM_3", "room"),

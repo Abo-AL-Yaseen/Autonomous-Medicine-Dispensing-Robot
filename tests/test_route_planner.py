@@ -19,14 +19,15 @@ from raspberry_controller.services.navigation import (
 
 def approved_navigation_map() -> PhysicalNavigationMap:
     nodes = (
-        PhysicalNode(1, "NODE_0", "intersection", 0),
-        PhysicalNode(2, "NODE_1", "intersection", 1),
-        PhysicalNode(3, "NODE_2", "intersection", 2),
-        PhysicalNode(4, "ROOM_1", "room", 11),
-        PhysicalNode(5, "ROOM_2", "room", 12),
-        PhysicalNode(6, "ROOM_3", "room", 13),
-        PhysicalNode(7, "ROOM_4", "room", 14),
-        PhysicalNode(8, "ROOM_5", "room", 15),
+        PhysicalNode(1, "HOME", "home", 10),
+        PhysicalNode(2, "NODE_0", "intersection", 0),
+        PhysicalNode(3, "NODE_1", "intersection", 1),
+        PhysicalNode(4, "NODE_2", "intersection", 2),
+        PhysicalNode(5, "ROOM_1", "room", 11),
+        PhysicalNode(6, "ROOM_2", "room", 12),
+        PhysicalNode(7, "ROOM_3", "room", 13),
+        PhysicalNode(8, "ROOM_4", "room", 14),
+        PhysicalNode(9, "ROOM_5", "room", 15),
     )
     rooms = tuple(
         PhysicalRoom(
@@ -39,6 +40,8 @@ def approved_navigation_map() -> PhysicalNavigationMap:
         for room_number in range(1, 6)
     )
     connections = (
+        DirectedConnection("HOME", "NODE_0", RouteDecision.STRAIGHT),
+        DirectedConnection("NODE_0", "HOME", RouteDecision.STRAIGHT),
         DirectedConnection("NODE_0", "ROOM_1", RouteDecision.LEFT),
         DirectedConnection("NODE_0", "NODE_1", RouteDecision.STRAIGHT),
         DirectedConnection("NODE_1", "NODE_2", RouteDecision.LEFT),
@@ -48,24 +51,31 @@ def approved_navigation_map() -> PhysicalNavigationMap:
         DirectedConnection("NODE_2", "ROOM_2", RouteDecision.RIGHT),
     )
     return_routes = (
-        ReturnRoute(1, (RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),)),
+        ReturnRoute(1, (
+            RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+        )),
         ReturnRoute(2, (
             RouteStep("ROOM_2", RouteDecision.U_TURN, "NODE_2"),
             RouteStep("NODE_2", RouteDecision.LEFT, "NODE_1"),
             RouteStep("NODE_1", RouteDecision.RIGHT, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
         )),
         ReturnRoute(3, (
             RouteStep("ROOM_3", RouteDecision.U_TURN, "NODE_2"),
             RouteStep("NODE_2", RouteDecision.RIGHT, "NODE_1"),
             RouteStep("NODE_1", RouteDecision.RIGHT, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
         )),
         ReturnRoute(4, (
             RouteStep("ROOM_4", RouteDecision.U_TURN, "NODE_1"),
             RouteStep("NODE_1", RouteDecision.LEFT, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
         )),
         ReturnRoute(5, (
             RouteStep("ROOM_5", RouteDecision.U_TURN, "NODE_1"),
             RouteStep("NODE_1", RouteDecision.STRAIGHT, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
         )),
     )
     return PhysicalNavigationMap(rooms, nodes, connections, return_routes)
@@ -121,9 +131,18 @@ def test_exact_approved_routes(
     assert plan.next_node == expected_steps[0][2]
 
 
+@pytest.mark.parametrize("room_id", range(1, 6))
+def test_outbound_route_starts_at_home_then_node_zero(room_id: int) -> None:
+    plan = LaravelRoutePlanner(approved_navigation_map()).plan(10, room_id)
+
+    assert (plan.steps[0].from_node, plan.steps[0].direction.value, plan.steps[0].to_node) == (
+        "HOME", "STRAIGHT", "NODE_0"
+    )
+
+
 @pytest.mark.parametrize(
     ("marker_id", "node_name"),
-    [(0, "NODE_0"), (1, "NODE_1"), (2, "NODE_2")],
+    [(0, "NODE_0"), (1, "NODE_1"), (2, "NODE_2"), (10, "HOME")],
 )
 def test_intersection_markers_resolve_through_laravel_map(
     marker_id: int,
@@ -172,24 +191,28 @@ def test_missing_directed_path_returns_no_route() -> None:
 @pytest.mark.parametrize(
     ("room_id", "marker_id", "expected_steps"),
     [
-        (1, 11, [("ROOM_1", "U_TURN", "NODE_0")]),
+        (1, 11, [("ROOM_1", "U_TURN", "NODE_0"), ("NODE_0", "STRAIGHT", "HOME")]),
         (2, 12, [
             ("ROOM_2", "U_TURN", "NODE_2"),
             ("NODE_2", "LEFT", "NODE_1"),
             ("NODE_1", "RIGHT", "NODE_0"),
+            ("NODE_0", "STRAIGHT", "HOME"),
         ]),
         (3, 13, [
             ("ROOM_3", "U_TURN", "NODE_2"),
             ("NODE_2", "RIGHT", "NODE_1"),
             ("NODE_1", "RIGHT", "NODE_0"),
+            ("NODE_0", "STRAIGHT", "HOME"),
         ]),
         (4, 14, [
             ("ROOM_4", "U_TURN", "NODE_1"),
             ("NODE_1", "LEFT", "NODE_0"),
+            ("NODE_0", "STRAIGHT", "HOME"),
         ]),
         (5, 15, [
             ("ROOM_5", "U_TURN", "NODE_1"),
             ("NODE_1", "STRAIGHT", "NODE_0"),
+            ("NODE_0", "STRAIGHT", "HOME"),
         ]),
     ],
 )
@@ -205,4 +228,7 @@ def test_exact_approved_return_routes(
         (step.from_node, step.direction.value, step.to_node)
         for step in plan.steps
     ] == expected_steps
-    assert planner.plan_return(0, room_id).decision is RouteDecision.ARRIVED
+    at_node_zero = planner.plan_return(0, room_id)
+    assert at_node_zero.decision is RouteDecision.STRAIGHT
+    assert at_node_zero.next_node == "HOME"
+    assert planner.plan_return(10, room_id).decision is RouteDecision.ARRIVED

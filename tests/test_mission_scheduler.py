@@ -515,6 +515,12 @@ def test_laravel_client_loads_the_read_only_navigation_map_contract() -> None:
                 ],
                 "nodes": [
                     {
+                        "id": 3,
+                        "node_name": "HOME",
+                        "node_type": "home",
+                        "marker_id": 10,
+                    },
+                    {
                         "id": 1,
                         "node_name": "NODE_0",
                         "node_type": "intersection",
@@ -528,6 +534,11 @@ def test_laravel_client_loads_the_read_only_navigation_map_contract() -> None:
                     },
                 ],
                 "connections": [
+                    {
+                        "from_node": "HOME",
+                        "to_node": "NODE_0",
+                        "direction": "STRAIGHT",
+                    },
                     {
                         "from_node": "NODE_0",
                         "to_node": "ROOM_1",
@@ -543,6 +554,11 @@ def test_laravel_client_loads_the_read_only_navigation_map_contract() -> None:
                                 "from_node": "ROOM_1",
                                 "to_node": "NODE_0",
                                 "direction": "U_TURN",
+                            },
+                            {
+                                "from_node": "NODE_0",
+                                "to_node": "HOME",
+                                "direction": "STRAIGHT",
                             }
                         ],
                     }
@@ -562,9 +578,10 @@ def test_laravel_client_loads_the_read_only_navigation_map_contract() -> None:
         client.close()
 
     assert navigation_map.node_for_marker(0).name == "NODE_0"  # type: ignore[union-attr]
+    assert navigation_map.node_for_marker(10).name == "HOME"  # type: ignore[union-attr]
     assert navigation_map.room_by_id(1).destination_node == "ROOM_1"  # type: ignore[union-attr]
-    assert navigation_map.connections[0].direction.value == "LEFT"
-    assert navigation_map.return_routes[0].steps[0].direction.value == "U_TURN"
+    assert navigation_map.connections[0].direction.value == "STRAIGHT"
+    assert navigation_map.return_routes[0].steps[-1].to_node == "HOME"
 
 
 def test_laravel_client_maps_timeout_to_clear_error() -> None:

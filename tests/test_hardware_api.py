@@ -273,14 +273,15 @@ class FakeLaravelClient:
 
 def _navigation_map_fixture() -> PhysicalNavigationMap:
     nodes = (
-        PhysicalNode(1, "NODE_0", "intersection", 0),
-        PhysicalNode(2, "NODE_1", "intersection", 1),
-        PhysicalNode(3, "NODE_2", "intersection", 2),
-        PhysicalNode(4, "ROOM_1", "room", 11),
-        PhysicalNode(5, "ROOM_2", "room", 12),
-        PhysicalNode(6, "ROOM_3", "room", 13),
-        PhysicalNode(7, "ROOM_4", "room", 14),
-        PhysicalNode(8, "ROOM_5", "room", 15),
+        PhysicalNode(1, "HOME", "home", 10),
+        PhysicalNode(2, "NODE_0", "intersection", 0),
+        PhysicalNode(3, "NODE_1", "intersection", 1),
+        PhysicalNode(4, "NODE_2", "intersection", 2),
+        PhysicalNode(5, "ROOM_1", "room", 11),
+        PhysicalNode(6, "ROOM_2", "room", 12),
+        PhysicalNode(7, "ROOM_3", "room", 13),
+        PhysicalNode(8, "ROOM_4", "room", 14),
+        PhysicalNode(9, "ROOM_5", "room", 15),
     )
     rooms = tuple(
         PhysicalRoom(
@@ -293,6 +294,8 @@ def _navigation_map_fixture() -> PhysicalNavigationMap:
         for room_number in range(1, 6)
     )
     connections = (
+        DirectedConnection("HOME", "NODE_0", RouteDecision.STRAIGHT),
+        DirectedConnection("NODE_0", "HOME", RouteDecision.STRAIGHT),
         DirectedConnection("NODE_0", "ROOM_1", RouteDecision.LEFT),
         DirectedConnection("NODE_0", "NODE_1", RouteDecision.STRAIGHT),
         DirectedConnection("NODE_1", "NODE_2", RouteDecision.LEFT),
@@ -304,7 +307,10 @@ def _navigation_map_fixture() -> PhysicalNavigationMap:
     return_routes = tuple(
         ReturnRoute(
             room_id,
-            (RouteStep(f"ROOM_{room_id}", RouteDecision.U_TURN, "NODE_0"),),
+            (
+                RouteStep(f"ROOM_{room_id}", RouteDecision.U_TURN, "NODE_0"),
+                RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+            ),
         )
         for room_id in range(1, 6)
     )

@@ -17,6 +17,7 @@ class PhysicalNavigationMapSeeder extends Seeder
     {
         DB::transaction(function (): void {
             $markerIds = [
+                'HOME' => 10,
                 'NODE_0' => 0,
                 'NODE_1' => 1,
                 'NODE_2' => 2,
@@ -37,7 +38,11 @@ class PhysicalNavigationMapSeeder extends Seeder
                 $nodes[$nodeCode] = Node::query()->updateOrCreate(
                     ['node_code' => $nodeCode],
                     [
-                        'node_type' => str_starts_with($nodeCode, 'ROOM_') ? 'room' : 'intersection',
+                        'node_type' => match (true) {
+                            $nodeCode === 'HOME' => 'home',
+                            str_starts_with($nodeCode, 'ROOM_') => 'room',
+                            default => 'intersection',
+                        },
                         'marker_id' => $markerId,
                     ],
                 );
@@ -54,6 +59,8 @@ class PhysicalNavigationMapSeeder extends Seeder
             }
 
             $connections = [
+                ['HOME', 'NODE_0', 'STRAIGHT'],
+                ['NODE_0', 'HOME', 'STRAIGHT'],
                 ['NODE_0', 'ROOM_1', 'LEFT'],
                 ['NODE_0', 'NODE_1', 'STRAIGHT'],
                 ['NODE_1', 'NODE_2', 'LEFT'],

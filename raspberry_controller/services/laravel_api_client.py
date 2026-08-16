@@ -299,6 +299,9 @@ def _parse_navigation_map(payload: object) -> PhysicalNavigationMap:
         nodes.append(parsed)
 
     nodes_by_name = {node.name: node for node in nodes}
+    home_node = nodes_by_name.get("HOME")
+    if home_node is None or home_node.node_type != "home":
+        raise LaravelApiError("Laravel navigation map has no dedicated HOME node")
     rooms: list[PhysicalRoom] = []
     room_ids: set[int] = set()
     for index, raw_room in enumerate(raw_rooms):
@@ -456,8 +459,8 @@ def _parse_navigation_map(payload: object) -> PhysicalNavigationMap:
                 )
             steps.append(RouteStep(from_node, direction, to_node))
             previous_to_node = to_node
-        if not steps or steps[-1].to_node != "NODE_0":
-            raise LaravelApiError("Laravel return route must end at NODE_0")
+        if not steps or steps[-1].to_node != "HOME":
+            raise LaravelApiError("Laravel return route must end at HOME")
         return_routes.append(ReturnRoute(room_id, tuple(steps)))
 
     return PhysicalNavigationMap(

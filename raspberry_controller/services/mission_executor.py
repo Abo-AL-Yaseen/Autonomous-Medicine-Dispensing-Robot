@@ -234,7 +234,7 @@ class MissionExecutor:
         return mission, route_planner.plan(marker_id, mission.room_id)
 
     def plan_return_route(self, marker_id: int) -> tuple[ClaimedMission, RoutePlan]:
-        """Plan the retained mission's Laravel-defined route to NODE_0."""
+        """Plan the retained mission's Laravel-defined route to HOME."""
 
         with self._lock:
             mission = self._mission

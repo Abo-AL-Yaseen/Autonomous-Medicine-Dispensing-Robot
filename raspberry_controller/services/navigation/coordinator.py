@@ -641,7 +641,7 @@ class NavigationCoordinator:
             self._expected_mission_id = None
             self._last_command = None
             self._last_error = None
-            # Keep last_marker_id/NODE_0/ARRIVED as the proof of physical
+            # Keep last_marker_id/HOME/ARRIVED as the proof of physical
             # arrival while making the coordinator ready for the next route.
             self._state = (
                 NavigationCoordinatorState.WAITING_FOR_INTERSECTION

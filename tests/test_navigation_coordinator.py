@@ -41,14 +41,15 @@ U_TURN_COMPLETE = "EVENT|U_TURN_COMPLETE|PATTERN=11011"
 
 def approved_navigation_map() -> PhysicalNavigationMap:
     nodes = (
-        PhysicalNode(1, "NODE_0", "intersection", 0),
-        PhysicalNode(2, "NODE_1", "intersection", 1),
-        PhysicalNode(3, "NODE_2", "intersection", 2),
-        PhysicalNode(4, "ROOM_1", "room", 11),
-        PhysicalNode(5, "ROOM_2", "room", 12),
-        PhysicalNode(6, "ROOM_3", "room", 13),
-        PhysicalNode(7, "ROOM_4", "room", 14),
-        PhysicalNode(8, "ROOM_5", "room", 15),
+        PhysicalNode(1, "HOME", "home", 10),
+        PhysicalNode(2, "NODE_0", "intersection", 0),
+        PhysicalNode(3, "NODE_1", "intersection", 1),
+        PhysicalNode(4, "NODE_2", "intersection", 2),
+        PhysicalNode(5, "ROOM_1", "room", 11),
+        PhysicalNode(6, "ROOM_2", "room", 12),
+        PhysicalNode(7, "ROOM_3", "room", 13),
+        PhysicalNode(8, "ROOM_4", "room", 14),
+        PhysicalNode(9, "ROOM_5", "room", 15),
     )
     rooms = tuple(
         PhysicalRoom(
@@ -61,6 +62,8 @@ def approved_navigation_map() -> PhysicalNavigationMap:
         for room_number in range(1, 6)
     )
     connections = (
+        DirectedConnection("HOME", "NODE_0", RouteDecision.STRAIGHT),
+        DirectedConnection("NODE_0", "HOME", RouteDecision.STRAIGHT),
         DirectedConnection("NODE_0", "ROOM_1", RouteDecision.LEFT),
         DirectedConnection("NODE_0", "NODE_1", RouteDecision.STRAIGHT),
         DirectedConnection("NODE_1", "NODE_2", RouteDecision.LEFT),
@@ -70,24 +73,31 @@ def approved_navigation_map() -> PhysicalNavigationMap:
         DirectedConnection("NODE_2", "ROOM_2", RouteDecision.RIGHT),
     )
     return_routes = (
-        ReturnRoute(1, (RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),)),
+        ReturnRoute(1, (
+            RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+        )),
         ReturnRoute(2, (
             RouteStep("ROOM_2", RouteDecision.U_TURN, "NODE_2"),
             RouteStep("NODE_2", RouteDecision.LEFT, "NODE_1"),
             RouteStep("NODE_1", RouteDecision.RIGHT, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
         )),
         ReturnRoute(3, (
             RouteStep("ROOM_3", RouteDecision.U_TURN, "NODE_2"),
             RouteStep("NODE_2", RouteDecision.RIGHT, "NODE_1"),
             RouteStep("NODE_1", RouteDecision.RIGHT, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
         )),
         ReturnRoute(4, (
             RouteStep("ROOM_4", RouteDecision.U_TURN, "NODE_1"),
             RouteStep("NODE_1", RouteDecision.LEFT, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
         )),
         ReturnRoute(5, (
             RouteStep("ROOM_5", RouteDecision.U_TURN, "NODE_1"),
             RouteStep("NODE_1", RouteDecision.STRAIGHT, "NODE_0"),
+            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
         )),
     )
     return PhysicalNavigationMap(rooms, nodes, connections, return_routes)
@@ -794,7 +804,9 @@ def test_room_one_full_automatic_arrival_dispense_return_home_chain() -> None:
         dispense_medicine=hardware.dispense_medicine,
     )
     mission_id = executor.mission_id
-    camera = FakeCamera(confirmed_marker(11), confirmed_marker(0))
+    camera = FakeCamera(
+        confirmed_marker(11), confirmed_marker(0), confirmed_marker(10)
+    )
     service = coordinator(executor, camera, hardware)
 
     service.process_serial_line(INTERSECTION_EVENT)
@@ -803,11 +815,16 @@ def test_room_one_full_automatic_arrival_dispense_return_home_chain() -> None:
 
     service.process_serial_line(U_TURN_COMPLETE)
     service.process_serial_line(INTERSECTION_EVENT)
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
+    assert service.status()["expected_marker_id"] == 10
+    service.process_serial_line(INTERSECTION_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
 
     assert executor.state is MissionExecutionState.ARRIVED_HOME
     assert executor.mission_id == mission_id
     assert hardware.dispense == [(1, 1)]
-    assert hardware.navigation == ["U_TURN"]
+    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
     assert hardware.line == ["stop", "stop"]
     assert hardware.water == []
     assert service.status()["state"] == "ARRIVED_HOME"
@@ -842,7 +859,7 @@ def test_return_u_turn_runs_once_and_stale_arrival_event_cannot_move() -> None:
     assert service.status()["expected_marker_id"] == 0
 
 
-def test_room_two_return_home_keeps_existing_detection_timing() -> None:
+def test_room_two_return_home_keeps_existing_detection_timing_until_home() -> None:
     hardware = HardwareRecorder()
     camera = FakeCamera(confirmed_marker(0))
     executor = arrived_executor(2, hardware)
@@ -852,9 +869,10 @@ def test_room_two_return_home_keeps_existing_detection_timing() -> None:
     service.process_serial_line(U_TURN_COMPLETE)
     service.process_serial_line(INTERSECTION_EVENT)
 
-    assert hardware.navigation == ["U_TURN"]
+    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
     assert camera.after_sequences == [None]
-    assert executor.state is MissionExecutionState.ARRIVED_HOME
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+    assert service.status()["expected_marker_id"] == 10
 
 
 @pytest.mark.parametrize(
@@ -911,27 +929,41 @@ def test_unexpected_marker_while_returning_fails_without_direction_command() -> 
     assert service.status()["last_error"] == "UNEXPECTED_MARKER"
 
 
-def test_marker_zero_stops_and_marks_arrived_home_without_completing_mission() -> None:
+def test_marker_zero_continues_to_home_and_only_home_marks_arrived() -> None:
     hardware = HardwareRecorder()
     executor = arrived_executor(1, hardware)
     mission_id = executor.mission_id
-    service = coordinator(executor, FakeCamera(confirmed_marker(0)), hardware)
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(0), confirmed_marker(10)),
+        hardware,
+    )
 
     service.begin_return_home()
     service.process_serial_line(U_TURN_COMPLETE)
     service.process_serial_line(INTERSECTION_EVENT)
 
-    assert hardware.navigation == ["U_TURN"]
-    assert hardware.line == ["stop"]
+    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
+    assert hardware.line == []
     assert hardware.dispense == []
     assert hardware.water == []
-    assert executor.state is MissionExecutionState.ARRIVED_HOME
+    assert executor.state is MissionExecutionState.RETURNING_HOME
     assert executor.mission_id == mission_id
-    assert service.status()["state"] == "ARRIVED_HOME"
+    assert service.status()["state"] == "COMMAND_SENT"
     assert service.status()["last_marker_id"] == 0
     assert service.status()["last_node"] == "NODE_0"
-    assert service.status()["last_decision"] == "ARRIVED"
+    assert service.status()["last_decision"] == "STRAIGHT"
     assert service.status()["last_error"] is None
+
+    service.process_serial_line(INTERSECTION_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.line == ["stop"]
+    assert executor.state is MissionExecutionState.ARRIVED_HOME
+    assert service.status()["state"] == "ARRIVED_HOME"
+    assert service.status()["last_marker_id"] == 10
+    assert service.status()["last_node"] == "HOME"
+    assert service.status()["last_decision"] == "ARRIVED"
 
 
 def test_arrival_waits_for_hand_before_exactly_one_dispense_and_return() -> None:
@@ -1002,7 +1034,7 @@ def test_arrived_home_is_observable_then_rearms_cleanly_without_stale_motion() -
     executor = arrived_executor(1, hardware)
     service = coordinator(
         executor,
-        FakeCamera(confirmed_marker(0)),
+        FakeCamera(confirmed_marker(0), confirmed_marker(10)),
         hardware,
         arrived_home_observation_seconds=0.01,
     )
@@ -1010,11 +1042,13 @@ def test_arrived_home_is_observable_then_rearms_cleanly_without_stale_motion() -
     service.begin_return_home()
     service.process_serial_line(U_TURN_COMPLETE)
     service.process_serial_line(INTERSECTION_EVENT)
+    service.process_serial_line(INTERSECTION_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
 
-    # The confirmed NODE_0 arrival is available before the asynchronous reset.
+    # The confirmed HOME arrival is available before the asynchronous reset.
     assert executor.state is MissionExecutionState.ARRIVED_HOME
     assert service.status()["state"] == "ARRIVED_HOME"
-    assert service.status()["last_node"] == "NODE_0"
+    assert service.status()["last_node"] == "HOME"
 
     finalization_thread = service._home_finalization_thread
     assert finalization_thread is not None
@@ -1024,12 +1058,12 @@ def test_arrived_home_is_observable_then_rearms_cleanly_without_stale_motion() -
     assert executor.mission_id is None
     assert service.status()["armed"] is True
     assert service.status()["expected_marker_id"] is None
-    assert service.status()["last_marker_id"] == 0
-    assert service.status()["last_node"] == "NODE_0"
+    assert service.status()["last_marker_id"] == 10
+    assert service.status()["last_node"] == "HOME"
     assert service.status()["last_decision"] == "ARRIVED"
 
     service.process_serial_line(INTERSECTION_EVENT)
-    assert hardware.navigation == ["U_TURN"]
+    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
     assert service.status()["armed"] is True
     assert service.status()["last_error"] is None
 
@@ -1039,13 +1073,17 @@ def test_second_mission_starts_cleanly_after_arrived_home_cleanup() -> None:
     executor = arrived_executor(1, hardware)
     service = coordinator(
         executor,
-        FakeCamera(confirmed_marker(0), confirmed_marker(0)),
+        FakeCamera(
+            confirmed_marker(0), confirmed_marker(10), confirmed_marker(0)
+        ),
         hardware,
         arrived_home_observation_seconds=0.01,
     )
 
     service.begin_return_home()
     service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+    service.process_serial_line(INTERSECTION_COMPLETE)
     service.process_serial_line(INTERSECTION_EVENT)
     finalization_thread = service._home_finalization_thread
     assert finalization_thread is not None
@@ -1067,7 +1105,7 @@ def test_second_mission_starts_cleanly_after_arrived_home_cleanup() -> None:
     service.process_serial_line(INTERSECTION_EVENT)
 
     assert executor.state is MissionExecutionState.GOING_TO_ROOM
-    assert hardware.navigation == ["U_TURN", "LEFT"]
+    assert hardware.navigation == ["U_TURN", "STRAIGHT", "LEFT"]
     assert hardware.line == ["stop"]
     assert hardware.dispense == []
     assert hardware.water == []
