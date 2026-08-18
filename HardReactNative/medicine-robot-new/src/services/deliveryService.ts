@@ -21,7 +21,7 @@ import {
 
 export interface ImmediateDeliveryPayload {
   room_id: number;
-  items: Array<{ medicine_id: number; quantity: number }>;
+  items: { medicine_id: number; quantity: number }[];
 }
 
 export interface ImmediateDeliveryResult {

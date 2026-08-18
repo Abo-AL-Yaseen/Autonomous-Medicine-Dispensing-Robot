@@ -27,7 +27,11 @@ export default function TabLayout() {
         },
         tabBarIcon: ({ color, size }) => {
           const iconName =
-            route.name === "index" ? "medical" : "game-controller";
+            route.name === "index"
+              ? "medical"
+              : route.name === "dispenser-setup"
+                ? "construct"
+                : "game-controller";
           return <Ionicons name={iconName} size={size} color={color} />;
         },
       })}
@@ -42,6 +46,12 @@ export default function TabLayout() {
         name="explore"
         options={{
           title: "Manual Control",
+        }}
+      />
+      <Tabs.Screen
+        name="dispenser-setup"
+        options={{
+          title: "Dispenser Setup",
         }}
       />
     </Tabs>

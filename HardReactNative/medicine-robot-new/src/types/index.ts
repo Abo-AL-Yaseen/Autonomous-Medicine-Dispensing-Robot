@@ -78,9 +78,23 @@ export interface RobotHardwareStatus {
   error?: string;
 }
 
+export interface DispenserDiskStatus {
+  calibrated: boolean;
+  slot: number;
+}
+
+export interface DispenserStatus {
+  disk1: DispenserDiskStatus;
+  disk2: DispenserDiskStatus;
+}
+
+export interface DispenserSetZeroResponse extends DispenserDiskStatus {
+  box: 1 | 2;
+}
+
 export interface CreateMissionRequest {
   room_id: number;
-  items?: Array<{ medicine_id: number; quantity: number }>;
+  items?: { medicine_id: number; quantity: number }[];
   // Temporary legacy compatibility for existing callers during rollout.
   medicine_id?: number;
   quantity?: number;

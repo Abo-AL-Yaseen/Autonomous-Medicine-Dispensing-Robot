@@ -143,6 +143,7 @@ class MissionExecutor:
         u_turn: Callable[[], str] | None = None,
         wait_for_hand: Callable[[float], bool] | None = None,
         dispense_medicine: Callable[[int, int], dict[str, int]] | None = None,
+        get_disk_status: Callable[[], dict[str, dict[str, bool | int]]] | None = None,
         mark_mission_in_progress: Callable[[ClaimedMission], None] | None = None,
         mark_mission_completed: Callable[[ClaimedMission], None] | None = None,
         load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
@@ -159,6 +160,7 @@ class MissionExecutor:
         self._u_turn = u_turn
         self._wait_for_hand = wait_for_hand
         self._dispense_medicine = dispense_medicine
+        self._get_disk_status = get_disk_status
         self._mark_mission_in_progress = mark_mission_in_progress
         self._mark_mission_completed = mark_mission_completed
         self._load_navigation_map = load_navigation_map
@@ -458,6 +460,12 @@ class MissionExecutor:
             self._last_error = None
 
         try:
+            if self._get_disk_status is not None:
+                disk_status = self._get_disk_status()
+                for box_number in sorted({item.dispenser_box for item in items}):
+                    disk = disk_status.get(f"disk{box_number}")
+                    if not isinstance(disk, dict) or disk.get("calibrated") is not True:
+                        raise RuntimeError(f"DISK_NOT_CALIBRATED|BOX={box_number}")
             if self._dispense_medicine is None:
                 raise RuntimeError("Medicine dispense operation is not configured")
             for item in items:

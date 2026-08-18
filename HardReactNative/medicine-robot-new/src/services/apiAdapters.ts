@@ -1,6 +1,8 @@
 import type {
   ApiSuccessResponse,
   HealthResponse,
+  DispenserSetZeroResponse,
+  DispenserStatus,
   Medicine,
   MedicineDispensePayload,
   MedicineDispenseResponse,
@@ -435,6 +437,49 @@ export const normalizeFastApiHealth = (payload: unknown): HealthResponse => {
     connection: hardwareConnected ? "Connected" : "Disconnected",
     status: requireString(value.status, "FastAPI health", "status"),
   };
+};
+
+const normalizeDispenserDisk = (
+  payload: unknown,
+  context: string,
+) => {
+  const disk = requireRecord(payload, context);
+  return {
+    calibrated: requireBoolean(disk.calibrated, context, "calibrated"),
+    slot: requireInteger(disk.slot, context, "slot", 0),
+  };
+};
+
+export const normalizeDispenserStatus = (payload: unknown): DispenserStatus => {
+  const value = requireRecord(payload, "FastAPI dispenser status");
+  if (!requireBoolean(value.success, "FastAPI dispenser status", "success")) {
+    return invalidResponse("FastAPI dispenser status", "'success' was false.");
+  }
+  const disk1 = normalizeDispenserDisk(value.disk1, "FastAPI dispenser disk1");
+  const disk2 = normalizeDispenserDisk(value.disk2, "FastAPI dispenser disk2");
+  if (disk1.slot > 7 || disk2.slot > 7) {
+    return invalidResponse("FastAPI dispenser status", "slot must be between 0 and 7.");
+  }
+  return { disk1, disk2 };
+};
+
+export const normalizeDispenserSetZero = (
+  payload: unknown,
+  requestedBox: 1 | 2,
+): DispenserSetZeroResponse => {
+  const value = requireRecord(payload, "FastAPI dispenser set-zero");
+  if (!requireBoolean(value.success, "FastAPI dispenser set-zero", "success")) {
+    return invalidResponse("FastAPI dispenser set-zero", "'success' was false.");
+  }
+  const box = requireInteger(value.box, "FastAPI dispenser set-zero", "box");
+  if (box !== requestedBox || (box !== 1 && box !== 2)) {
+    return invalidResponse("FastAPI dispenser set-zero", "returned the wrong box.");
+  }
+  const disk = normalizeDispenserDisk(value, "FastAPI dispenser set-zero");
+  if (disk.slot > 7) {
+    return invalidResponse("FastAPI dispenser set-zero", "slot must be between 0 and 7.");
+  }
+  return { box, ...disk };
 };
 
 const normalizeStringRecord = (

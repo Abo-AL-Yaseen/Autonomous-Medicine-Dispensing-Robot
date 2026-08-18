@@ -242,6 +242,54 @@ def test_dispense_sensor_stuck_is_immediate_without_completed_pill() -> None:
         controller.dispense(2, 1)
 
 
+def test_disk_status_and_manual_zero_use_the_existing_uno_connection() -> None:
+    uno = RecordingSerialController(
+        {
+            "GET_DISK_STATUS": (
+                "DISK_STATUS|DISK1_CALIBRATED=1|DISK1_SLOT=0|"
+                "DISK2_CALIBRATED=1|DISK2_SLOT=7"
+            ),
+            "SET_SLOT_ZERO_1": "ACK|SET_SLOT_ZERO_1",
+        }
+    )
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=uno,  # type: ignore[arg-type]
+    )
+
+    assert controller.get_disk_status() == {
+        "disk1": {"calibrated": True, "slot": 0},
+        "disk2": {"calibrated": True, "slot": 7},
+    }
+    assert controller.set_slot_zero(1) == {"calibrated": True, "slot": 0}
+    assert uno.commands == [
+        "GET_DISK_STATUS",
+        "SET_SLOT_ZERO_1",
+        "GET_DISK_STATUS",
+    ]
+
+
+@pytest.mark.parametrize("box_number", [1, 2])
+def test_slot_zero_uses_the_matching_uno_command(box_number: int) -> None:
+    command = f"SET_SLOT_ZERO_{box_number}"
+    uno = RecordingSerialController(
+        {
+            command: f"ACK|{command}",
+            "GET_DISK_STATUS": (
+                "DISK_STATUS|DISK1_CALIBRATED=1|DISK1_SLOT=0|"
+                "DISK2_CALIBRATED=1|DISK2_SLOT=0"
+            ),
+        }
+    )
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=uno,  # type: ignore[arg-type]
+    )
+
+    assert controller.set_slot_zero(box_number)["calibrated"] is True
+    assert uno.commands[0] == command
+
+
 @pytest.mark.parametrize(
     ("method_name", "command", "acknowledgement"),
     [

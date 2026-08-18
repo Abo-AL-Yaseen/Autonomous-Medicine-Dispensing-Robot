@@ -543,6 +543,80 @@ def test_multi_medicine_failure_stops_before_later_item_and_return() -> None:
     assert u_turn_calls == []
 
 
+def test_uncalibrated_required_disk_fails_before_any_multi_item_dispense() -> None:
+    dependencies = FakeExecutionDependencies()
+    calls: list[tuple[int, int]] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        wait_for_hand=lambda _: True,
+        get_disk_status=lambda: {
+            "disk1": {"calibrated": True, "slot": 0},
+            "disk2": {"calibrated": False, "slot": 0},
+        },
+        dispense_medicine=lambda box, quantity: calls.append((box, quantity)) or {
+            "box_number": box,
+            "requested_pills": quantity,
+            "dispensed_pills": quantity,
+        },
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
+    )
+    mission = ClaimedMission(
+        90, 1, 99, 2, room_number="204", dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+        mission_items=(ClaimedMissionItem(99, 2, 1), ClaimedMissionItem(42, 1, 2)),
+    )
+    executor.accept(mission)
+    assert executor.start_ready_mission().success
+    executor.mark_arrived_at_room()
+    assert executor.wait_for_hand_confirmation(1).success
+
+    result = executor.dispense_at_room()
+
+    assert result.success is False
+    assert calls == []
+    assert result.message == "DISPENSE_FAILED: DISK_NOT_CALIBRATED|BOX=2"
+    assert executor.start_return_home().success is False
+
+
+def test_calibrated_disks_allow_normal_multi_item_dispense() -> None:
+    dependencies = FakeExecutionDependencies()
+    calls: list[tuple[int, int]] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        wait_for_hand=lambda _: True,
+        get_disk_status=lambda: {
+            "disk1": {"calibrated": True, "slot": 0},
+            "disk2": {"calibrated": True, "slot": 0},
+        },
+        dispense_medicine=lambda box, quantity: calls.append((box, quantity)) or {
+            "box_number": box,
+            "requested_pills": quantity,
+            "dispensed_pills": quantity,
+        },
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
+    )
+    mission = ClaimedMission(
+        91, 1, 99, 2, room_number="204", dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+        mission_items=(ClaimedMissionItem(99, 2, 1), ClaimedMissionItem(42, 1, 2)),
+    )
+    executor.accept(mission)
+    assert executor.start_ready_mission().success
+    executor.mark_arrived_at_room()
+    assert executor.wait_for_hand_confirmation(1).success
+
+    assert executor.dispense_at_room().success
+    assert calls == [(1, 2), (2, 1)]
+
+
 def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:
     dependencies = FakeExecutionDependencies()
     u_turn_calls: list[str] = []

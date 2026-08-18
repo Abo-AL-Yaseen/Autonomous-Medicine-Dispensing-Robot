@@ -287,6 +287,12 @@ def create_app(
             with hardware_lock:
                 return controller.dispense(box_number, quantity)
 
+        def get_executor_disk_status() -> dict[str, dict[str, bool | int]]:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.get_disk_status()
+
         def wait_for_executor_hand(timeout_seconds: float) -> bool:
             if not application.state.hardware_connected:
                 raise HardwareControllerError("robot hardware is disconnected")
@@ -305,6 +311,7 @@ def create_app(
             u_turn=lambda: run_navigation_hardware(controller.u_turn),
             wait_for_hand=wait_for_executor_hand,
             dispense_medicine=dispense_executor_medicine,
+            get_disk_status=get_executor_disk_status,
             mark_mission_in_progress=laravel_client.start_claimed_mission,
             mark_mission_completed=laravel_client.complete_claimed_mission,
             load_navigation_map=laravel_client.get_navigation_map,
@@ -604,6 +611,27 @@ def create_app(
             "requested": {"box1": payload.box1, "box2": payload.box2},
             "results": results,
         }
+
+    @application.get("/dispenser/status")
+    def dispenser_status(request: Request) -> dict[str, object]:
+        status = _run_hardware_operation(
+            request,
+            lambda controller: controller.get_disk_status(),
+        )
+        return {"success": True, **status}
+
+    @application.post("/dispenser/box/{box_number}/set-zero")
+    def dispenser_set_zero(box_number: int, request: Request) -> dict[str, object]:
+        if box_number not in (1, 2):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "INVALID_DISPENSER_BOX"},
+            )
+        disk = _run_hardware_operation(
+            request,
+            lambda controller: controller.set_slot_zero(box_number),
+        )
+        return {"success": True, "box": box_number, **disk}
 
     @application.post("/water/dispense")
     def dispense_water(

@@ -52,6 +52,11 @@ class FakeHardwareController:
         self.navigation_calls: list[str] = []
         self.rtc_calls = 0
         self.water_calls: list[int] = []
+        self.disk_status = {
+            "disk1": {"calibrated": False, "slot": 0},
+            "disk2": {"calibrated": False, "slot": 0},
+        }
+        self.set_zero_calls: list[int] = []
         self.hardware_error: Exception | None = None
         self.line_start_response = "ACK|LINE_FOLLOW_STARTED"
         self.line_stop_response = "ACK|LINE_FOLLOW_STOPPED"
@@ -86,6 +91,21 @@ class FakeHardwareController:
             "requested_pills": pill_count,
             "dispensed_pills": pill_count,
         }
+
+    def get_disk_status(self) -> dict[str, dict[str, bool | int]]:
+        self._raise_hardware_error()
+        return {
+            name: dict(disk)
+            for name, disk in self.disk_status.items()
+        }
+
+    def set_slot_zero(self, box_number: int) -> dict[str, bool | int]:
+        self._raise_hardware_error()
+        self.set_zero_calls.append(box_number)
+        disk = self.disk_status[f"disk{box_number}"]
+        disk["calibrated"] = True
+        disk["slot"] = 0
+        return dict(disk)
 
     def wait_for_hand(self, timeout_seconds: float) -> bool:
         self._raise_hardware_error()
@@ -1029,6 +1049,7 @@ def test_executor_dispense_reuses_api_hardware_and_manual_return_endpoint(
     )
     executor.mark_arrived_at_room()
     assert executor.wait_for_hand_confirmation(1.0).success is True
+    fake_hardware.disk_status["disk1"] = {"calibrated": True, "slot": 0}
 
     dispense = executor.dispense_at_room()
     returned = client.post("/executor/return-home")
@@ -1185,6 +1206,37 @@ def test_dispense_hardware_unavailable_sends_no_command(
     assert response.status_code == 503
     assert response.json() == {"detail": {"code": "HARDWARE_UNAVAILABLE"}}
     assert fake_hardware.dispense_calls == []
+
+
+def test_dispenser_status_and_manual_zero_endpoints_use_owned_hardware(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.disk_status["disk1"] = {"calibrated": True, "slot": 4}
+
+    status = client.get("/dispenser/status")
+    zero = client.post("/dispenser/box/2/set-zero")
+
+    assert status.json() == {
+        "success": True,
+        "disk1": {"calibrated": True, "slot": 4},
+        "disk2": {"calibrated": False, "slot": 0},
+    }
+    assert zero.json() == {
+        "success": True,
+        "box": 2,
+        "calibrated": True,
+        "slot": 0,
+    }
+    assert fake_hardware.set_zero_calls == [2]
+    assert fake_hardware.dispense_calls == []
+
+
+def test_dispenser_zero_rejects_unknown_box(client: TestClient) -> None:
+    response = client.post("/dispenser/box/3/set-zero")
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "INVALID_DISPENSER_BOX"
 
 
 @pytest.mark.parametrize("amount_ml", [0, -1, 1001])

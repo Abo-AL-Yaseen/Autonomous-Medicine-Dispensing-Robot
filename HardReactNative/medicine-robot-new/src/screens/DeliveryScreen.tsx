@@ -1,6 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Ionicons } from "@expo/vector-icons";
 import { DateTimePickerAndroid } from "@react-native-community/datetimepicker";
+import { useFocusEffect } from "@react-navigation/native";
+import { useRouter } from "expo-router";
 import {
   Alert,
   Pressable,
@@ -13,16 +15,17 @@ import { Text } from "react-native-paper";
 
 import { MissionStatusCard } from "@/src/components/MissionStatusCard";
 import { PrimaryButton } from "@/src/components/PrimaryButton";
-import { QuantitySelector } from "@/src/components/QuantitySelector";
 import { RobotStatusCard } from "@/src/components/RobotStatusCard";
 import { RoomSelector } from "@/src/components/RoomSelector";
 import { useRobotStatus } from "@/src/hooks/useRobotStatus";
 import { robotTimezone } from "@/src/config/api";
 import { buildRobotScheduleDateTime } from "@/src/services/apiAdapters";
 import { startDelivery } from "@/src/services/api";
+import { requiredDispenserBoxes } from "@/src/services/dispenserReadiness";
 import { getMedicines } from "@/src/services/laravel/medicineService";
 import { createMission } from "@/src/services/laravel/missionService";
 import { getRooms } from "@/src/services/laravel/roomService";
+import { getDispenserStatus } from "@/src/services/robot/dispenserCalibrationService";
 import {
   createPickerWallClockSelection,
   formatApiScheduleSummary,
@@ -34,7 +37,7 @@ import {
   PickerWallClockSelection,
 } from "@/src/services/scheduleDateTime";
 import { theme } from "@/src/theme/theme";
-import { Medicine, MissionState, Room } from "@/src/types";
+import { DispenserStatus, Medicine, MissionState, Room } from "@/src/types";
 
 export default function DeliveryScreen() {
   const [rooms, setRooms] = useState<Room[]>([]);
@@ -52,7 +55,11 @@ export default function DeliveryScreen() {
   const [loadingMedicines, setLoadingMedicines] = useState(true);
   const [creatingMission, setCreatingMission] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dispenserStatus, setDispenserStatus] = useState<DispenserStatus | null>(null);
+  const [loadingDispenserStatus, setLoadingDispenserStatus] = useState(true);
+  const [dispenserStatusError, setDispenserStatusError] = useState<string | null>(null);
   const submissionInProgress = useRef(false);
+  const router = useRouter();
 
   const robotStatus = useRobotStatus();
 
@@ -105,6 +112,29 @@ export default function DeliveryScreen() {
     loadOptions();
   }, []);
 
+  const refreshDispenserStatus = useCallback(async () => {
+    setLoadingDispenserStatus(true);
+    setDispenserStatusError(null);
+    try {
+      setDispenserStatus(await getDispenserStatus());
+    } catch (statusError) {
+      setDispenserStatus(null);
+      setDispenserStatusError(
+        statusError instanceof Error
+          ? statusError.message
+          : "Robot dispenser service unavailable.",
+      );
+    } finally {
+      setLoadingDispenserStatus(false);
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      void refreshDispenserStatus();
+    }, [refreshDispenserStatus]),
+  );
+
   const selectedRoomName = useMemo(
     () =>
       rooms.find((room) => String(room.id) === selectedRoom)?.name ??
@@ -126,6 +156,31 @@ export default function DeliveryScreen() {
       [medicineId]: Math.max(0, Math.min(9, quantity)),
     }));
   };
+
+  const requiredBoxes = useMemo(
+    () => requiredDispenserBoxes(medicines, selectedItems),
+    [medicines, selectedItems],
+  );
+
+  const calibrationReadinessError = useMemo(() => {
+    if (selectedItems.length === 0) return null;
+    if (loadingDispenserStatus) return "Checking dispenser calibration…";
+    if (dispenserStatusError || dispenserStatus === null) {
+      return "Robot dispenser service unavailable. Open Dispenser Setup and retry.";
+    }
+    const uncalibratedBox = requiredBoxes.find(
+      (box) => !(box === 1 ? dispenserStatus.disk1 : dispenserStatus.disk2).calibrated,
+    );
+    return uncalibratedBox
+      ? `Box ${uncalibratedBox} must be calibrated before starting this mission.`
+      : null;
+  }, [
+    dispenserStatus,
+    dispenserStatusError,
+    loadingDispenserStatus,
+    requiredBoxes,
+    selectedItems.length,
+  ]);
 
   const selectedFriendlyDate = scheduledDate
     ? formatFriendlyScheduleDate(scheduledDate)
@@ -212,6 +267,11 @@ export default function DeliveryScreen() {
       setError(
         "Please select a room and at least one medicine before starting the delivery.",
       );
+      return;
+    }
+
+    if (calibrationReadinessError) {
+      setError(calibrationReadinessError);
       return;
     }
 
@@ -324,33 +384,104 @@ export default function DeliveryScreen() {
             {medicines.map((medicine) => {
               const quantity = selectedQuantities[medicine.id] ?? 0;
               return (
-                <View key={medicine.id} style={styles.medicineRow}>
+                <View
+                  key={medicine.id}
+                  style={[
+                    styles.medicineCard,
+                    quantity > 0 && styles.medicineCardSelected,
+                  ]}
+                >
                   <View style={styles.medicineDetails}>
                     <Text style={styles.medicineName}>{medicine.name}</Text>
                     <Text style={styles.medicineHint}>
-                      {quantity > 0 ? "Selected" : "Not selected"}
+                      {medicine.dispenser_box
+                        ? `Dispenser Box ${medicine.dispenser_box}`
+                        : "Dispenser Box unavailable"}
                     </Text>
                   </View>
-                  {quantity === 0 ? (
+                  <View style={styles.quantityControl}>
                     <Pressable
                       accessibilityRole="button"
-                      accessibilityLabel={`Add ${medicine.name}`}
-                      onPress={() => setMedicineQuantity(medicine.id, 1)}
-                      style={styles.addMedicineButton}
+                      accessibilityLabel={`Decrease ${medicine.name} quantity`}
+                      onPress={() => setMedicineQuantity(medicine.id, quantity - 1)}
+                      style={styles.quantityButton}
                     >
-                      <Text style={styles.addMedicineText}>Add</Text>
+                      <Text style={styles.quantityButtonText}>−</Text>
                     </Pressable>
-                  ) : (
-                    <QuantitySelector
-                      value={quantity}
-                      onDecrease={() => setMedicineQuantity(medicine.id, quantity - 1)}
-                      onIncrease={() => setMedicineQuantity(medicine.id, quantity + 1)}
-                    />
-                  )}
+                    <View style={styles.quantityValueWrap}>
+                      <Text style={styles.quantityValue}>{quantity}</Text>
+                      <Text style={styles.quantityState}>
+                        {quantity > 0 ? "Selected" : "Not selected"}
+                      </Text>
+                    </View>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`Increase ${medicine.name} quantity`}
+                      onPress={() => setMedicineQuantity(medicine.id, quantity + 1)}
+                      style={styles.quantityButton}
+                    >
+                      <Text style={styles.quantityButtonText}>+</Text>
+                    </Pressable>
+                  </View>
                 </View>
               );
             })}
           </View>
+
+          <View style={styles.selectedSummary}>
+            <Text style={styles.selectedSummaryTitle}>Selected medicines</Text>
+            {selectedItems.length === 0 ? (
+              <Text style={styles.selectedSummaryEmpty}>None selected</Text>
+            ) : (
+              selectedItems.map((item) => {
+                const medicine = medicines.find(
+                  (candidate) => candidate.id === item.medicine_id,
+                );
+                return (
+                  <Text key={item.medicine_id} style={styles.selectedSummaryItem}>
+                    {medicine?.name ?? "Medicine"} × {item.quantity}
+                  </Text>
+                );
+              })
+            )}
+          </View>
+
+          {selectedItems.length > 0 ? (
+            <View style={styles.readinessCard}>
+              <Text style={styles.readinessTitle}>Dispenser Readiness</Text>
+              <Text style={styles.readinessWarning}>
+                Calibration is required after Arduino reset or power cycle.
+              </Text>
+              {requiredBoxes.map((box) => {
+                const calibrated =
+                  box === 1
+                    ? dispenserStatus?.disk1.calibrated
+                    : dispenserStatus?.disk2.calibrated;
+                return (
+                  <Text
+                    key={box}
+                    style={[
+                      styles.readinessBox,
+                      calibrated ? styles.readinessGood : styles.readinessBad,
+                    ]}
+                  >
+                    Box {box}: {calibrated ? "✓ Calibrated" : "✕ Not Calibrated"}
+                  </Text>
+                );
+              })}
+              {calibrationReadinessError ? (
+                <Text style={styles.readinessError}>{calibrationReadinessError}</Text>
+              ) : null}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Open Dispenser Setup"
+                onPress={() => router.push("/dispenser-setup")}
+                style={styles.setupLink}
+              >
+                <Text style={styles.setupLinkText}>Open Dispenser Setup</Text>
+              </Pressable>
+            </View>
+          ) : null}
 
           <View style={styles.scheduleRow}>
             <View style={styles.scheduleText}>
@@ -479,6 +610,7 @@ export default function DeliveryScreen() {
               rooms.length === 0 ||
               medicines.length === 0
               || selectedItems.length === 0
+              || calibrationReadinessError !== null
             }
             loading={creatingMission}
           />
@@ -530,24 +662,66 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     marginBottom: 10,
   },
-  medicineRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: theme.colors.border,
+  medicineCard: {
+    padding: 16,
+    marginBottom: 12,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.card,
+  },
+  medicineCardSelected: {
+    borderColor: theme.colors.primary,
+    backgroundColor: "#F0FBF3",
   },
   medicineDetails: { flex: 1, marginRight: 12 },
   medicineName: { color: theme.colors.textPrimary, fontSize: 16, fontWeight: "600" },
   medicineHint: { color: theme.colors.textSecondary, fontSize: 13, marginTop: 2 },
-  addMedicineButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 9,
-    borderRadius: 14,
+  quantityControl: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginTop: 16,
+  },
+  quantityButton: {
+    width: 56,
+    height: 56,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: theme.colors.background,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  quantityButtonText: { color: theme.colors.textPrimary, fontSize: 30 },
+  quantityValueWrap: { alignItems: "center", minWidth: 96 },
+  quantityValue: { color: theme.colors.textPrimary, fontSize: 34, fontWeight: "800" },
+  quantityState: { color: theme.colors.textSecondary, fontSize: 12, fontWeight: "600" },
+  selectedSummary: {
+    marginBottom: 20,
+    padding: 16,
+    borderRadius: 18,
     backgroundColor: "#EAF8EE",
   },
-  addMedicineText: { color: theme.colors.primary, fontWeight: "700" },
+  selectedSummaryTitle: { color: theme.colors.textPrimary, fontSize: 16, fontWeight: "700", marginBottom: 6 },
+  selectedSummaryItem: { color: theme.colors.textPrimary, fontSize: 15, fontWeight: "600", marginTop: 4 },
+  selectedSummaryEmpty: { color: theme.colors.textSecondary, fontSize: 14 },
+  readinessCard: {
+    marginBottom: 20,
+    padding: 16,
+    borderRadius: 18,
+    backgroundColor: theme.colors.card,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  readinessTitle: { color: theme.colors.textPrimary, fontSize: 16, fontWeight: "700" },
+  readinessWarning: { color: theme.colors.textSecondary, fontSize: 13, marginTop: 5, marginBottom: 10 },
+  readinessBox: { fontSize: 15, fontWeight: "700", marginTop: 4 },
+  readinessGood: { color: theme.colors.success },
+  readinessBad: { color: theme.colors.emergency },
+  readinessError: { color: theme.colors.emergency, fontSize: 13, fontWeight: "600", marginTop: 10 },
+  setupLink: { alignSelf: "flex-start", marginTop: 12, paddingVertical: 8 },
+  setupLinkText: { color: theme.colors.primary, fontWeight: "700" },
   scheduleRow: {
     flexDirection: "row",
     alignItems: "center",

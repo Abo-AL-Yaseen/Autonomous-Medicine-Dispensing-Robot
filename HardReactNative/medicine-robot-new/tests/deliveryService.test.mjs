@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { runImmediateDeliveryFlow } from "../src/services/deliveryService.ts";
@@ -111,6 +112,19 @@ test("immediate delivery preserves independently selected medicine items", async
     items,
     scheduled_at: "2026-08-12 12:30:00",
   }]);
+});
+
+test("delivery UI keeps dynamic medicines, visible quantities, and selected summary", () => {
+  const screen = readFileSync(
+    new URL("../src/screens/DeliveryScreen.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(screen, /medicines\.map\(\(medicine\)/);
+  assert.match(screen, /selectedQuantities\[medicine\.id\] \?\? 0/);
+  assert.match(screen, /fontSize: 34/);
+  assert.match(screen, /Selected medicines/);
+  assert.match(screen, /quantity > 0 \? "Selected" : "Not selected"/);
 });
 
 test("a busy executor prevents duplicate mission creation", async () => {

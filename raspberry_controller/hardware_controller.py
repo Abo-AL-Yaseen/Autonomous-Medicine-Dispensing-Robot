@@ -469,6 +469,7 @@ class RobotHardwareController:
     }
     WATER_MIN_DURATION_MS = 100
     WATER_MAX_DURATION_MS = 60000
+    DISK_SLOT_COUNT = 8
 
     def __init__(
         self,
@@ -860,6 +861,29 @@ class RobotHardwareController:
             "dispensed_pills": completed_pills,
         }
 
+    def get_disk_status(self) -> dict[str, dict[str, bool | int]]:
+        """Read both volatile UNO disk-calibration states on its owned link."""
+
+        response = self._request(
+            self.arduino_uno,
+            "GET_DISK_STATUS",
+            "VALID_DISK_STATUS",
+            validator=self._is_valid_disk_status,
+            response_prefix="DISK_STATUS|",
+        )
+        return self.parse_disk_status(response)
+
+    def set_slot_zero(self, box_number: int) -> dict[str, bool | int]:
+        """Record a manually aligned slot zero without moving either motor."""
+
+        if isinstance(box_number, bool) or box_number not in (1, 2):
+            raise ValueError("box_number must be 1 or 2")
+
+        command = f"SET_SLOT_ZERO_{box_number}"
+        acknowledgement = f"ACK|{command}"
+        self._request(self.arduino_uno, command, acknowledgement)
+        return self.get_disk_status()[f"disk{box_number}"]
+
     def _request(
         self,
         controller: SerialController,
@@ -975,7 +999,68 @@ class RobotHardwareController:
         if start < 0:
             return None
         code = message[start + len(response_prefix) :].split("|", 1)[0]
-        return code if code in {"PILL_TIMEOUT", "SENSOR_STUCK"} else None
+        return (
+            code
+            if code in {"PILL_TIMEOUT", "SENSOR_STUCK", "DISK_NOT_CALIBRATED"}
+            else None
+        )
+
+    @classmethod
+    def _is_valid_disk_status(cls, response: str) -> bool:
+        try:
+            cls.parse_disk_status(response)
+        except ValueError:
+            return False
+        return True
+
+    @classmethod
+    def parse_disk_status(cls, response: str) -> dict[str, dict[str, bool | int]]:
+        """Strictly parse the UNO's machine-readable disk status response."""
+
+        fields = response.split("|")
+        if len(fields) != 5 or fields[0] != "DISK_STATUS":
+            raise ValueError("invalid disk status response")
+        expected = {
+            "DISK1_CALIBRATED",
+            "DISK1_SLOT",
+            "DISK2_CALIBRATED",
+            "DISK2_SLOT",
+        }
+        values: dict[str, str] = {}
+        for field in fields[1:]:
+            if "=" not in field:
+                raise ValueError("invalid disk status field")
+            key, value = field.split("=", 1)
+            if key not in expected or key in values:
+                raise ValueError("invalid disk status field")
+            values[key] = value
+        if set(values) != expected:
+            raise ValueError("incomplete disk status response")
+
+        def calibrated(key: str) -> bool:
+            if values[key] not in {"0", "1"}:
+                raise ValueError("invalid calibration flag")
+            return values[key] == "1"
+
+        def slot(key: str) -> int:
+            try:
+                value = int(values[key])
+            except ValueError as exc:
+                raise ValueError("invalid disk slot") from exc
+            if value < 0 or value >= cls.DISK_SLOT_COUNT:
+                raise ValueError("invalid disk slot")
+            return value
+
+        return {
+            "disk1": {
+                "calibrated": calibrated("DISK1_CALIBRATED"),
+                "slot": slot("DISK1_SLOT"),
+            },
+            "disk2": {
+                "calibrated": calibrated("DISK2_CALIBRATED"),
+                "slot": slot("DISK2_SLOT"),
+            },
+        }
 
     @staticmethod
     def _raise_dispense_error(
