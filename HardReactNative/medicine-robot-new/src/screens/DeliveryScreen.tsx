@@ -11,7 +11,6 @@ import {
 } from "react-native";
 import { Text } from "react-native-paper";
 
-import { MedicineSelector } from "@/src/components/MedicineSelector";
 import { MissionStatusCard } from "@/src/components/MissionStatusCard";
 import { PrimaryButton } from "@/src/components/PrimaryButton";
 import { QuantitySelector } from "@/src/components/QuantitySelector";
@@ -41,8 +40,7 @@ export default function DeliveryScreen() {
   const [rooms, setRooms] = useState<Room[]>([]);
   const [medicines, setMedicines] = useState<Medicine[]>([]);
   const [selectedRoom, setSelectedRoom] = useState("0");
-  const [selectedMedicine, setSelectedMedicine] = useState("0");
-  const [quantity, setQuantity] = useState(1);
+  const [selectedQuantities, setSelectedQuantities] = useState<Record<number, number>>({});
   const [missionState, setMissionState] = useState<MissionState>("Waiting");
   const [scheduleForLater, setScheduleForLater] = useState(false);
   const [scheduledDate, setScheduledDate] =
@@ -77,10 +75,6 @@ export default function DeliveryScreen() {
           setSelectedRoom(String(loadedRooms[0].id));
         }
 
-        if (loadedMedicines.length > 0) {
-          setSelectedMedicine(String(loadedMedicines[0].id));
-        }
-
         if (loadedRooms.length === 0 && loadedMedicines.length === 0) {
           setError("No rooms or medicines exist.");
         } else if (loadedRooms.length === 0) {
@@ -96,7 +90,7 @@ export default function DeliveryScreen() {
         setRooms([]);
         setMedicines([]);
         setSelectedRoom("0");
-        setSelectedMedicine("0");
+        setSelectedQuantities({});
         setError(
           message.startsWith("Invalid ")
             ? `Invalid response received: ${message}`
@@ -118,17 +112,20 @@ export default function DeliveryScreen() {
     [rooms, selectedRoom],
   );
 
-  const selectedMedicineName = useMemo(
-    () =>
-      medicines.find((medicine) => String(medicine.id) === selectedMedicine)
-        ?.name ?? "Medicine not selected",
-    [medicines, selectedMedicine],
+  const selectedItems = useMemo(
+    () => medicines.flatMap((medicine) => {
+      const quantity = selectedQuantities[medicine.id] ?? 0;
+      return quantity > 0 ? [{ medicine_id: medicine.id, quantity }] : [];
+    }),
+    [medicines, selectedQuantities],
   );
 
-  const handleDecrease = () =>
-    setQuantity((current) => Math.max(1, current - 1));
-  const handleIncrease = () =>
-    setQuantity((current) => Math.min(9, current + 1));
+  const setMedicineQuantity = (medicineId: number, quantity: number) => {
+    setSelectedQuantities((current) => ({
+      ...current,
+      [medicineId]: Math.max(0, Math.min(9, quantity)),
+    }));
+  };
 
   const selectedFriendlyDate = scheduledDate
     ? formatFriendlyScheduleDate(scheduledDate)
@@ -211,11 +208,9 @@ export default function DeliveryScreen() {
     if (submissionInProgress.current) return;
 
     const roomId = Number(selectedRoom);
-    const medicineId = Number(selectedMedicine);
-
-    if (!roomId || !medicineId) {
+    if (!roomId || selectedItems.length === 0) {
       setError(
-        "Please select a room and medicine before starting the delivery.",
+        "Please select a room and at least one medicine before starting the delivery.",
       );
       return;
     }
@@ -245,8 +240,7 @@ export default function DeliveryScreen() {
       setScheduleError(null);
       const payload = {
         room_id: roomId,
-        medicine_id: medicineId,
-        quantity,
+        items: selectedItems,
       };
 
       if (scheduleForLater) {
@@ -285,7 +279,7 @@ export default function DeliveryScreen() {
       setMissionState("Moving");
       Alert.alert(
         "Mission Started",
-        `Delivery to ${selectedRoomName} with ${selectedMedicineName} has started.`,
+        `Delivery to ${selectedRoomName} has started.`,
       );
     } catch (e) {
       const message =
@@ -325,17 +319,38 @@ export default function DeliveryScreen() {
             rooms={rooms}
             loading={loadingRooms}
           />
-          <MedicineSelector
-            value={selectedMedicine}
-            onValueChange={setSelectedMedicine}
-            medicines={medicines}
-            loading={loadingMedicines}
-          />
-          <QuantitySelector
-            value={quantity}
-            onDecrease={handleDecrease}
-            onIncrease={handleIncrease}
-          />
+          <View style={styles.medicineList}>
+            <Text style={styles.medicineLabel}>Medicines</Text>
+            {medicines.map((medicine) => {
+              const quantity = selectedQuantities[medicine.id] ?? 0;
+              return (
+                <View key={medicine.id} style={styles.medicineRow}>
+                  <View style={styles.medicineDetails}>
+                    <Text style={styles.medicineName}>{medicine.name}</Text>
+                    <Text style={styles.medicineHint}>
+                      {quantity > 0 ? "Selected" : "Not selected"}
+                    </Text>
+                  </View>
+                  {quantity === 0 ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`Add ${medicine.name}`}
+                      onPress={() => setMedicineQuantity(medicine.id, 1)}
+                      style={styles.addMedicineButton}
+                    >
+                      <Text style={styles.addMedicineText}>Add</Text>
+                    </Pressable>
+                  ) : (
+                    <QuantitySelector
+                      value={quantity}
+                      onDecrease={() => setMedicineQuantity(medicine.id, quantity - 1)}
+                      onIncrease={() => setMedicineQuantity(medicine.id, quantity + 1)}
+                    />
+                  )}
+                </View>
+              );
+            })}
+          </View>
 
           <View style={styles.scheduleRow}>
             <View style={styles.scheduleText}>
@@ -463,6 +478,7 @@ export default function DeliveryScreen() {
               loadingMedicines ||
               rooms.length === 0 ||
               medicines.length === 0
+              || selectedItems.length === 0
             }
             loading={creatingMission}
           />
@@ -505,6 +521,33 @@ const styles = StyleSheet.create({
     color: "#C62828",
     fontWeight: "600",
   },
+  medicineList: {
+    marginBottom: 20,
+  },
+  medicineLabel: {
+    color: theme.colors.textPrimary,
+    fontSize: 16,
+    fontWeight: "600",
+    marginBottom: 10,
+  },
+  medicineRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+  },
+  medicineDetails: { flex: 1, marginRight: 12 },
+  medicineName: { color: theme.colors.textPrimary, fontSize: 16, fontWeight: "600" },
+  medicineHint: { color: theme.colors.textSecondary, fontSize: 13, marginTop: 2 },
+  addMedicineButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    borderRadius: 14,
+    backgroundColor: "#EAF8EE",
+  },
+  addMedicineText: { color: theme.colors.primary, fontWeight: "700" },
   scheduleRow: {
     flexDirection: "row",
     alignItems: "center",

@@ -3,7 +3,13 @@
 #include <string.h>
 
 #define STEPS_PER_REV 2048
-#define PILL_STEPS 256
+#define SLOT_COUNT 8
+#if (STEPS_PER_REV % SLOT_COUNT) != 0
+#error "STEPS_PER_REV must divide evenly into SLOT_COUNT"
+#endif
+#define STEPS_PER_SLOT (STEPS_PER_REV / SLOT_COUNT)
+// The verified one-pill movement is exactly one of the eight disk slots.
+#define PILL_STEPS STEPS_PER_SLOT
 
 // Pill-drop IR sensors. Most LM393-style obstacle modules assert LOW when a
 // pill blocks the beam. Change this one value to HIGH after workshop testing
@@ -38,11 +44,20 @@ enum ControllerState {
 
 ControllerState controllerState = IDLE;
 
+// The disks have no limit switches or homing sensors.  They begin uncalibrated
+// on every boot and become slot 0 only after the operator manually aligns the
+// physical disk over its chute and sends the matching SET_SLOT_ZERO command.
+bool disk1Calibrated = false;
+bool disk2Calibrated = false;
+byte disk1CurrentSlot = 0;
+byte disk2CurrentSlot = 0;
+
 // These types must appear before the first function definition. Arduino's
 // preprocessor inserts function prototypes there, and those prototypes use
 // both types below.
 enum DispenseResult {
   DISPENSE_CONFIRMED,
+  DISPENSE_DISK_NOT_CALIBRATED,
   DISPENSE_SENSOR_STUCK,
   DISPENSE_PILL_TIMEOUT
 };
@@ -85,6 +100,21 @@ void printStatus() {
       Serial.println(F("STATUS|IDLE"));
       break;
   }
+}
+
+void printDiskStatus() {
+  Serial.print(F("DISK_STATUS|DISK1_CALIBRATED="));
+  Serial.print(disk1Calibrated ? 1 : 0);
+  Serial.print(F("|DISK1_SLOT="));
+  Serial.print(disk1CurrentSlot);
+  Serial.print(F("|DISK2_CALIBRATED="));
+  Serial.print(disk2Calibrated ? 1 : 0);
+  Serial.print(F("|DISK2_SLOT="));
+  Serial.println(disk2CurrentSlot);
+}
+
+void advanceDiskSlot(byte *currentSlot) {
+  *currentSlot = (*currentSlot + 1) % SLOT_COUNT;
 }
 
 void runMotor1(int steps) {
@@ -336,8 +366,13 @@ bool pillPulseLatched(byte pin) {
 DispenseResult runConfirmedPill(
   Stepper *motor,
   byte sensorPin,
-  ControllerState dispensingState
+  ControllerState dispensingState,
+  bool calibrated,
+  byte *currentSlot
 ) {
+  if (!calibrated) {
+    return DISPENSE_DISK_NOT_CALIBRATED;
+  }
   // A blocked sensor before movement is unsafe: do not rotate the disk.
   if (pillSensorDetected(sensorPin)) {
     return DISPENSE_SENSOR_STUCK;
@@ -360,6 +395,9 @@ DispenseResult runConfirmedPill(
   for (int step = 0; step < PILL_STEPS; step++) {
     motor->step(1);
   }
+  // The disk physically advanced even if the sensor later reports a timeout.
+  // Keep the software position honest; only DONE still represents a pill.
+  advanceDiskSlot(currentSlot);
 
   // A pill can leave the disk just after the final step. Wait only for the
   // ISR's one-pulse latch until the existing bounded per-pill deadline.
@@ -395,7 +433,9 @@ void printDispenseError(const char *command, DispenseResult result) {
   Serial.print(F("ERROR|"));
   Serial.print(command);
   Serial.print(F("|CODE="));
-  if (result == DISPENSE_SENSOR_STUCK) {
+  if (result == DISPENSE_DISK_NOT_CALIBRATED) {
+    Serial.println(F("DISK_NOT_CALIBRATED"));
+  } else if (result == DISPENSE_SENSOR_STUCK) {
     Serial.println(F("SENSOR_STUCK"));
   } else {
     Serial.println(F("PILL_TIMEOUT"));
@@ -406,7 +446,9 @@ void printDispenseBothError(byte box, DispenseResult result) {
   Serial.print(F("ERROR|DISPENSE_BOTH|BOX="));
   Serial.print(box);
   Serial.print(F("|CODE="));
-  if (result == DISPENSE_SENSOR_STUCK) {
+  if (result == DISPENSE_DISK_NOT_CALIBRATED) {
+    Serial.println(F("DISK_NOT_CALIBRATED"));
+  } else if (result == DISPENSE_SENSOR_STUCK) {
     Serial.println(F("SENSOR_STUCK"));
   } else {
     Serial.println(F("PILL_TIMEOUT"));
@@ -418,9 +460,9 @@ void printDispenseBothError(byte box, DispenseResult result) {
 // debounce so workshop testing can determine the electrical polarity/pulse.
 void printPillSensors() {
   Serial.print(F("PILL_SENSORS|D12="));
-  Serial.print(digitalRead(PILL_SENSOR_1_PIN));
+  Serial.print(digitalRead(PILL_SENSOR_2_PIN));
   Serial.print(F("|D3="));
-  Serial.println(digitalRead(PILL_SENSOR_2_PIN));
+  Serial.println(digitalRead(PILL_SENSOR_1_PIN));
 }
 
 void printPillSensorChange(byte pin, int state) {
@@ -455,6 +497,16 @@ void executeCommand(const char *command) {
     Serial.println(F("ACK|PING"));
   } else if (strcmp(command, "GET_STATUS") == 0) {
     printStatus();
+  } else if (strcmp(command, "GET_DISK_STATUS") == 0) {
+    printDiskStatus();
+  } else if (strcmp(command, "SET_SLOT_ZERO_1") == 0) {
+    disk1CurrentSlot = 0;
+    disk1Calibrated = true;
+    Serial.println(F("ACK|SET_SLOT_ZERO_1"));
+  } else if (strcmp(command, "SET_SLOT_ZERO_2") == 0) {
+    disk2CurrentSlot = 0;
+    disk2Calibrated = true;
+    Serial.println(F("ACK|SET_SLOT_ZERO_2"));
   } else if (strcmp(command, "GET_PILL_SENSORS") == 0) {
     printPillSensors();
   } else if (strcmp(command, "GET_PILL_IRQ_DEBUG") == 0) {
@@ -467,7 +519,9 @@ void executeCommand(const char *command) {
     DispenseResult result = runConfirmedPill(
       &motor1,
       PILL_SENSOR_1_PIN,
-      DISPENSING_1
+      DISPENSING_1,
+      disk1Calibrated,
+      &disk1CurrentSlot
     );
     if (result == DISPENSE_CONFIRMED) {
       Serial.println(F("DONE|DISPENSE_1"));
@@ -480,7 +534,9 @@ void executeCommand(const char *command) {
     DispenseResult result = runConfirmedPill(
       &motor2,
       PILL_SENSOR_2_PIN,
-      DISPENSING_2
+      DISPENSING_2,
+      disk2Calibrated,
+      &disk2CurrentSlot
     );
     if (result == DISPENSE_CONFIRMED) {
       Serial.println(F("DONE|DISPENSE_2"));
@@ -493,7 +549,9 @@ void executeCommand(const char *command) {
     DispenseResult firstResult = runConfirmedPill(
       &motor1,
       PILL_SENSOR_1_PIN,
-      DISPENSING_BOTH
+      DISPENSING_BOTH,
+      disk1Calibrated,
+      &disk1CurrentSlot
     );
     if (firstResult != DISPENSE_CONFIRMED) {
       printDispenseBothError(1, firstResult);
@@ -503,7 +561,9 @@ void executeCommand(const char *command) {
     DispenseResult secondResult = runConfirmedPill(
       &motor2,
       PILL_SENSOR_2_PIN,
-      DISPENSING_BOTH
+      DISPENSING_BOTH,
+      disk2Calibrated,
+      &disk2CurrentSlot
     );
     if (secondResult != DISPENSE_CONFIRMED) {
       printDispenseBothError(2, secondResult);

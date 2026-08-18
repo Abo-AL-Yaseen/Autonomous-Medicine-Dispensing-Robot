@@ -19,10 +19,10 @@ import {
   SchedulerTickResponse,
 } from "@/src/types";
 
-export type ImmediateDeliveryPayload = Pick<
-  CreateMissionRequest,
-  "room_id" | "medicine_id" | "quantity"
->;
+export interface ImmediateDeliveryPayload {
+  room_id: number;
+  items: Array<{ medicine_id: number; quantity: number }>;
+}
 
 export interface ImmediateDeliveryResult {
   mission: Mission;

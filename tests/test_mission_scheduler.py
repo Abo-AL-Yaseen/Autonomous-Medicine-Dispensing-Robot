@@ -10,6 +10,7 @@ import pytest
 
 from raspberry_controller.services.laravel_api_client import (
     ClaimedMission,
+    ClaimedMissionItem,
     LaravelApiClient,
     LaravelApiError,
     LaravelApiUnavailable,
@@ -436,6 +437,40 @@ def test_laravel_claimed_ibuprofen_box_two_reaches_raspberry_unchanged() -> None
     assert mission is not None
     assert mission.medicine_id == 7
     assert mission.dispenser_box == 2
+
+
+def test_laravel_claimed_multi_medicine_items_preserve_database_box_mapping() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "claimed": True,
+                "mission": {
+                    "id": 20,
+                    "room": {"id": 1, "room_number": "204"},
+                    "medicine": {"id": 7, "dispenser_box": 2},
+                    "quantity": 1,
+                    "items": [
+                        {"medicine": {"id": 91, "name": "Dynamic A", "dispenser_box": 2}, "quantity": 2},
+                        {"medicine": {"id": 44, "name": "Dynamic B", "dispenser_box": 1}, "quantity": 1},
+                    ],
+                    "schedule_claimed_at": "2026-08-09T18:40:00+00:00",
+                },
+            },
+        )
+
+    client = LaravelApiClient("http://laravel.test/api", 0.2, transport=httpx.MockTransport(handler))
+    try:
+        mission = client.claim_due_mission(datetime(2026, 8, 9, 21, 40), "Asia/Hebron")
+    finally:
+        client.close()
+
+    assert mission is not None
+    assert mission.items == (
+        ClaimedMissionItem(91, 2, 2, "Dynamic A"),
+        ClaimedMissionItem(44, 1, 1, "Dynamic B"),
+    )
 
 
 def test_laravel_client_starts_only_the_exact_claimed_mission() -> None:

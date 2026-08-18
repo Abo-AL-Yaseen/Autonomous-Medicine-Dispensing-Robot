@@ -27,8 +27,22 @@ class LaravelApiUnavailable(LaravelApiError):
 
 
 @dataclass(frozen=True)
+class ClaimedMissionItem:
+    """One Laravel-selected medicine and its authoritative dispenser box."""
+
+    medicine_id: int
+    quantity: int
+    dispenser_box: int
+    medicine_name: str | None = None
+
+
+@dataclass(frozen=True)
 class ClaimedMission:
-    """Minimum Laravel mission data needed by the runtime executor."""
+    """Minimum Laravel mission data needed by the runtime executor.
+
+    The legacy fields remain for wire compatibility during the mission-items
+    rollout.  ``mission_items`` is authoritative whenever Laravel supplies it.
+    """
 
     id: int
     room_id: int
@@ -37,6 +51,21 @@ class ClaimedMission:
     room_number: str | None = None
     dispenser_box: int | None = None
     schedule_claimed_at: str | None = None
+    mission_items: tuple[ClaimedMissionItem, ...] = ()
+
+    @property
+    def items(self) -> tuple[ClaimedMissionItem, ...]:
+        if self.mission_items:
+            return self.mission_items
+        if self.dispenser_box not in (1, 2):
+            return ()
+        return (
+            ClaimedMissionItem(
+                medicine_id=self.medicine_id,
+                quantity=self.quantity,
+                dispenser_box=self.dispenser_box,
+            ),
+        )
 
 
 class LaravelApiClient:
@@ -99,6 +128,7 @@ class LaravelApiClient:
 
         room = _object(mission.get("room"), "mission.room")
         medicine = _object(mission.get("medicine"), "mission.medicine")
+        items = _parse_claimed_mission_items(mission.get("items"))
 
         return ClaimedMission(
             id=_positive_int(mission.get("id"), "mission.id"),
@@ -119,6 +149,7 @@ class LaravelApiClient:
                 mission.get("schedule_claimed_at"),
                 "mission.schedule_claimed_at",
             ),
+            mission_items=items,
         )
 
     def start_claimed_mission(self, mission: ClaimedMission) -> None:
@@ -252,6 +283,46 @@ def _optional_dispenser_box(value: object) -> int | None:
             "Laravel claim response has an invalid mission.medicine.dispenser_box"
         )
     return value
+
+
+def _parse_claimed_mission_items(value: object) -> tuple[ClaimedMissionItem, ...]:
+    """Parse Laravel's normalized items without accepting duplicate medicines."""
+
+    if value is None:
+        return ()
+    raw_items = _list(value, "mission.items")
+    if not raw_items:
+        raise LaravelApiError("Laravel claim response has no mission items")
+
+    parsed: list[ClaimedMissionItem] = []
+    medicine_ids: set[int] = set()
+    for index, raw_item in enumerate(raw_items):
+        item = _object(raw_item, f"mission.items.{index}")
+        medicine = _object(item.get("medicine"), f"mission.items.{index}.medicine")
+        medicine_id = _positive_int(
+            medicine.get("id"), f"mission.items.{index}.medicine.id"
+        )
+        if medicine_id in medicine_ids:
+            raise LaravelApiError("Laravel claim response has duplicate medicine items")
+        medicine_ids.add(medicine_id)
+        box = _optional_dispenser_box(medicine.get("dispenser_box"))
+        if box is None:
+            raise LaravelApiError(
+                "Laravel claim response has an item without a dispenser box"
+            )
+        parsed.append(
+            ClaimedMissionItem(
+                medicine_id=medicine_id,
+                quantity=_positive_int(
+                    item.get("quantity"), f"mission.items.{index}.quantity"
+                ),
+                dispenser_box=box,
+                medicine_name=_optional_nonempty_string(
+                    medicine.get("name"), f"mission.items.{index}.medicine.name"
+                ),
+            )
+        )
+    return tuple(parsed)
 
 
 def _parse_navigation_map(payload: object) -> PhysicalNavigationMap:

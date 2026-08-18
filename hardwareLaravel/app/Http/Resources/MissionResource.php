@@ -18,6 +18,13 @@ class MissionResource extends JsonResource
                 'id' => $this->medicine_id,
             ],
             'quantity' => $this->quantity,
+            'items' => $this->whenLoaded('items', fn () => $this->items->map(
+                fn ($item) => [
+                    'id' => $item->id,
+                    'medicine' => new MedicineResource($item->medicine),
+                    'quantity' => $item->quantity,
+                ],
+            )->values()),
             'status' => $this->status,
             'scheduled_at' => $this->scheduled_at?->utc()->toIso8601String(),
             'schedule_claimed_at' => $this->schedule_claimed_at?->utc()->toIso8601String(),

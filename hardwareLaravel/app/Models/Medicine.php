@@ -26,4 +26,9 @@ class Medicine extends Model
     {
         return $this->hasMany(Mission::class);
     }
+
+    public function missionItems(): HasMany
+    {
+        return $this->hasMany(MissionItem::class);
+    }
 }

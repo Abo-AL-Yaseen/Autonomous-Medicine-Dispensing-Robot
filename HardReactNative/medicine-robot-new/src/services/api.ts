@@ -29,8 +29,7 @@ import { dispenseWater } from "@/src/services/robot/waterService";
 
 export const startDelivery = async (payload: {
   room_id: number;
-  medicine_id: number;
-  quantity: number;
+  items: Array<{ medicine_id: number; quantity: number }>;
 }) => startImmediateDelivery(payload);
 
 export const loadRooms = () => getRooms();

@@ -420,7 +420,7 @@ class MissionExecutor:
         return MissionReturnOutcome(MissionReturnResult.RETURN_STARTED, True)
 
     def dispense_at_room(self) -> MissionDispenseOutcome:
-        """Dispense the retained mission once, validating the UNO summary."""
+        """Dispense every retained mission item once, validating each UNO summary."""
 
         with self._lock:
             if (
@@ -441,9 +441,11 @@ class MissionExecutor:
                     False,
                     self._last_error,
                 )
-            box_number = mission.dispenser_box
-            quantity = mission.quantity
-            if box_number not in (1, 2) or quantity <= 0:
+            items = mission.items
+            if not items or any(
+                item.dispenser_box not in (1, 2) or item.quantity <= 0
+                for item in items
+            ):
                 self._state = MissionExecutionState.FAILED
                 self._last_error = "Mission dispenser data is invalid."
                 return MissionDispenseOutcome(
@@ -458,15 +460,21 @@ class MissionExecutor:
         try:
             if self._dispense_medicine is None:
                 raise RuntimeError("Medicine dispense operation is not configured")
-            result = self._dispense_medicine(box_number, quantity)
-            if (
-                result.get("box_number") != box_number
-                or result.get("requested_pills") != quantity
-                or result.get("dispensed_pills") != quantity
-            ):
-                raise RuntimeError(
-                    "Dispenser completed quantity does not match the mission"
-                )
+            for item in items:
+                result = self._dispense_medicine(item.dispenser_box, item.quantity)
+                confirmed = result.get("dispensed_pills")
+                if (
+                    result.get("box_number") != item.dispenser_box
+                    or result.get("requested_pills") != item.quantity
+                    or confirmed != item.quantity
+                ):
+                    raise RuntimeError(
+                        "Medicine item failed: "
+                        f"medicine_id={item.medicine_id} "
+                        f"box={item.dispenser_box} "
+                        f"requested={item.quantity} "
+                        f"confirmed={confirmed!r}"
+                    )
         except Exception as exc:
             message = f"DISPENSE_FAILED: {exc}"
             with self._lock:
@@ -704,8 +712,13 @@ class MissionExecutor:
             return "Claimed mission data is missing."
         if not mission.room_number or not mission.room_number.strip():
             return "Claimed mission room_number is missing."
-        if mission.dispenser_box not in (1, 2):
-            return "Claimed mission dispenser_box is invalid."
+        if not mission.items:
+            return "Claimed mission has no medicine items."
+        if any(
+            item.dispenser_box not in (1, 2) or item.quantity <= 0
+            for item in mission.items
+        ):
+            return "Claimed mission medicine item is invalid."
         if not mission.schedule_claimed_at:
             return "Claimed mission schedule_claimed_at is missing."
         return None

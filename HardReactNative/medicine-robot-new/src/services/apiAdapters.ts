@@ -5,6 +5,7 @@ import type {
   MedicineDispensePayload,
   MedicineDispenseResponse,
   Mission,
+  MissionItem,
   MissionExecutorState,
   MissionExecutorStatus,
   MovementResponse,
@@ -299,6 +300,33 @@ export const normalizeMission = (payload: unknown): Mission => {
       : requireInteger(value.medicine_id, "mission", "medicine_id");
   const roomRecord = isRecord(value.room) ? value.room : null;
   const medicineRecord = isRecord(value.medicine) ? value.medicine : null;
+  const rawItems = value.items;
+  const items: MissionItem[] = Array.isArray(rawItems)
+    ? rawItems.map((rawItem, index) => {
+        const item = requireRecord(rawItem, "mission item");
+        const itemMedicine = requireRecord(item.medicine, "mission item medicine");
+        return {
+          medicine_id: requireInteger(
+            itemMedicine.id,
+            "mission item",
+            `items.${index}.medicine.id`,
+          ),
+          medicine:
+            itemMedicine.name !== undefined ? normalizeMedicine(itemMedicine) : undefined,
+          quantity: requireInteger(item.quantity, "mission item", `items.${index}.quantity`),
+        };
+      })
+    : [{
+        medicine_id: medicineId,
+        medicine:
+          medicineRecord?.name !== undefined
+            ? normalizeMedicine(medicineRecord)
+            : undefined,
+        quantity: requireInteger(value.quantity, "mission", "quantity"),
+      }];
+  if (items.length === 0) {
+    return invalidResponse("mission", "expected at least one item.");
+  }
 
   return {
     id: requireMissionId(value.id),
@@ -311,6 +339,7 @@ export const normalizeMission = (payload: unknown): Mission => {
         ? normalizeMedicine(medicineRecord)
         : undefined,
     quantity: requireInteger(value.quantity, "mission", "quantity"),
+    items,
     status: requireString(value.status, "mission", "status"),
     scheduled_at:
       optionalNullableString(value.scheduled_at, "mission", "scheduled_at") ??

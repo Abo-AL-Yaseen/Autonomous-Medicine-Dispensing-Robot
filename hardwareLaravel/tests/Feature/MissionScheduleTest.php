@@ -371,6 +371,49 @@ class MissionScheduleTest extends TestCase
         ]);
     }
 
+    public function test_mission_api_creates_normalized_multiple_medicine_items(): void
+    {
+        [$room, $firstMedicine] = $this->createRoomAndMedicine();
+        $secondMedicine = Medicine::create([
+            'name' => 'Second medicine',
+            'description' => null,
+            'stock_quantity' => 10,
+            'dispenser_box' => 2,
+        ]);
+
+        $response = $this->postJson('/api/missions', [
+            'room_id' => $room->id,
+            'items' => [
+                ['medicine_id' => $firstMedicine->id, 'quantity' => 2],
+                ['medicine_id' => $secondMedicine->id, 'quantity' => 1],
+            ],
+        ]);
+
+        $response->assertCreated()
+            ->assertJsonPath('data.items.0.medicine.id', $firstMedicine->id)
+            ->assertJsonPath('data.items.0.quantity', 2)
+            ->assertJsonPath('data.items.1.medicine.id', $secondMedicine->id)
+            ->assertJsonPath('data.items.1.quantity', 1);
+        $this->assertDatabaseHas('mission_items', [
+            'mission_id' => $response->json('data.id'),
+            'medicine_id' => $secondMedicine->id,
+            'quantity' => 1,
+        ]);
+    }
+
+    public function test_mission_api_rejects_duplicate_medicine_items(): void
+    {
+        [$room, $medicine] = $this->createRoomAndMedicine();
+
+        $this->postJson('/api/missions', [
+            'room_id' => $room->id,
+            'items' => [
+                ['medicine_id' => $medicine->id, 'quantity' => 1],
+                ['medicine_id' => $medicine->id, 'quantity' => 1],
+            ],
+        ])->assertUnprocessable()->assertJsonValidationErrors('items.1.medicine_id');
+    }
+
     public function test_summer_palestine_wall_clock_converts_to_utc(): void
     {
         $utc = $this->scheduleTime()->localWallClockToUtc('2026-08-09 20:52:00');
@@ -468,6 +511,7 @@ class MissionScheduleTest extends TestCase
             'name' => 'Schedule Medicine '.$suffix,
             'description' => null,
             'stock_quantity' => 10,
+            'dispenser_box' => 1,
         ]);
 
         return [$room, $medicine];

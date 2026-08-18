@@ -36,6 +36,11 @@ class Mission extends Model
         return $this->belongsTo(Medicine::class);
     }
 
+    public function items(): HasMany
+    {
+        return $this->hasMany(MissionItem::class);
+    }
+
     public function robotStatuses(): HasMany
     {
         return $this->hasMany(RobotStatus::class, 'current_mission_id');

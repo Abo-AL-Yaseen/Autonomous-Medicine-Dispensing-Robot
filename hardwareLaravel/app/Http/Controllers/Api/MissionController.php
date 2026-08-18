@@ -11,6 +11,7 @@ use App\Services\Mission\MissionScheduleTime;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\DB;
 
 class MissionController extends Controller
 {
@@ -20,12 +21,12 @@ class MissionController extends Controller
 
     public function index(): AnonymousResourceCollection
     {
-        return MissionResource::collection(Mission::query()->with(['room.navigationNode', 'medicine'])->latest()->get());
+        return MissionResource::collection(Mission::query()->with(['room.navigationNode', 'medicine', 'items.medicine'])->latest()->get());
     }
 
     public function show(Mission $mission): MissionResource
     {
-        return new MissionResource($mission->load(['room.navigationNode', 'medicine']));
+        return new MissionResource($mission->load(['room.navigationNode', 'medicine', 'items.medicine']));
     }
 
     public function store(StoreMissionRequest $request): MissionResource
@@ -34,9 +35,19 @@ class MissionController extends Controller
         $payload['status'] = $this->normalizeStatus($payload['status'] ?? 'pending');
         $this->normalizeScheduledAt($payload);
 
-        $mission = Mission::create($payload);
+        $items = $this->missionItems($payload);
+        unset($payload['items']);
+        // Keep the original non-null columns as a compatibility projection for
+        // deployed databases and older readers; mission_items is authoritative.
+        $payload['medicine_id'] = $items[0]['medicine_id'];
+        $payload['quantity'] = $items[0]['quantity'];
+        $mission = DB::transaction(function () use ($payload, $items): Mission {
+            $mission = Mission::create($payload);
+            $mission->items()->createMany($items);
+            return $mission;
+        });
 
-        return new MissionResource($mission->load(['room.navigationNode', 'medicine']));
+        return new MissionResource($mission->load(['room.navigationNode', 'medicine', 'items.medicine']));
     }
 
     public function update(UpdateMissionRequest $request, Mission $mission): MissionResource
@@ -48,9 +59,23 @@ class MissionController extends Controller
         }
         $this->normalizeScheduledAt($payload);
 
-        $mission->update($payload);
+        $items = array_key_exists('items', $payload)
+            ? $this->missionItems($payload)
+            : null;
+        unset($payload['items']);
+        if ($items !== null) {
+            $payload['medicine_id'] = $items[0]['medicine_id'];
+            $payload['quantity'] = $items[0]['quantity'];
+        }
+        DB::transaction(function () use ($mission, $payload, $items): void {
+            $mission->update($payload);
+            if ($items !== null) {
+                $mission->items()->delete();
+                $mission->items()->createMany($items);
+            }
+        });
 
-        return new MissionResource($mission->fresh()->load(['room.navigationNode', 'medicine']));
+        return new MissionResource($mission->fresh()->load(['room.navigationNode', 'medicine', 'items.medicine']));
     }
 
     public function destroy(Mission $mission): JsonResponse
@@ -86,6 +111,25 @@ class MissionController extends Controller
 
         $payload['scheduled_at'] = $this->scheduleTime->localWallClockToUtc(
             $payload['scheduled_at'],
+        );
+    }
+
+    /** @return array<int, array{medicine_id: int, quantity: int}> */
+    private function missionItems(array $payload): array
+    {
+        if (! isset($payload['items'])) {
+            return [[
+                'medicine_id' => $payload['medicine_id'],
+                'quantity' => $payload['quantity'],
+            ]];
+        }
+
+        return array_map(
+            fn (array $item): array => [
+                'medicine_id' => $item['medicine_id'],
+                'quantity' => $item['quantity'],
+            ],
+            $payload['items'],
         );
     }
 }

@@ -96,6 +96,28 @@ test("accepts a valid mission ID from a wrapped mission response", () => {
   assert.equal(mission.medicine_id, 12);
 });
 
+test("normalizes multiple dynamically supplied mission medicine items", () => {
+  const mission = normalizeMission({
+    id: 43,
+    room: laravelRoom,
+    medicine: laravelMedicine,
+    quantity: 2,
+    status: "pending",
+    items: [
+      { medicine: laravelMedicine, quantity: 2 },
+      {
+        medicine: { ...laravelMedicine, id: 13, name: "Ibuprofen", dispenser_box: 2 },
+        quantity: 1,
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    mission.items.map((item) => [item.medicine_id, item.quantity]),
+    [[12, 2], [13, 1]],
+  );
+});
+
 test("rejects a missing mission ID before navigation can start", () => {
   assert.throws(
     () =>

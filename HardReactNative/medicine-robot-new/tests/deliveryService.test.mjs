@@ -97,6 +97,22 @@ test("immediate delivery creates, claims, and starts the same mission", async ()
   ]);
 });
 
+test("immediate delivery preserves independently selected medicine items", async () => {
+  const { calls, dependencies } = buildDependencies();
+  const items = [
+    { medicine_id: 2, quantity: 2 },
+    { medicine_id: 7, quantity: 1 },
+  ];
+
+  await runImmediateDeliveryFlow({ room_id: 1, items }, dependencies);
+
+  assert.deepEqual(calls[2], ["create", {
+    room_id: 1,
+    items,
+    scheduled_at: "2026-08-12 12:30:00",
+  }]);
+});
+
 test("a busy executor prevents duplicate mission creation", async () => {
   let createCalls = 0;
   const { dependencies } = buildDependencies({

@@ -42,10 +42,17 @@ export interface Mission {
   room?: Room;
   medicine?: Medicine;
   quantity: number;
+  items: MissionItem[];
   status: string;
   scheduled_at: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+}
+
+export interface MissionItem {
+  medicine_id: number;
+  medicine?: Medicine;
+  quantity: number;
 }
 
 export interface RobotStatus {
@@ -73,8 +80,10 @@ export interface RobotHardwareStatus {
 
 export interface CreateMissionRequest {
   room_id: number;
-  medicine_id: number;
-  quantity: number;
+  items?: Array<{ medicine_id: number; quantity: number }>;
+  // Temporary legacy compatibility for existing callers during rollout.
+  medicine_id?: number;
+  quantity?: number;
   scheduled_at?: string | null;
 }
 

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from raspberry_controller.services.laravel_api_client import ClaimedMission
+from raspberry_controller.services.laravel_api_client import (
+    ClaimedMission,
+    ClaimedMissionItem,
+)
 from raspberry_controller.services.mission_executor import (
     MissionExecutionState,
     MissionExecutor,
@@ -465,6 +468,79 @@ def test_duplicate_hand_confirmation_cannot_start_a_second_dispense() -> None:
     assert executor.dispense_at_room().success is True
     assert executor.dispense_at_room().result.value == "DISPENSE_NOT_ALLOWED"
     assert dispense_calls == [(1, 4)]
+
+
+def test_multi_medicine_mission_dispenses_each_laravel_item_in_order() -> None:
+    dependencies = FakeExecutionDependencies()
+    calls: list[tuple[int, int]] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=lambda: "ACK|U_TURN_STARTED",
+        wait_for_hand=lambda _: True,
+        dispense_medicine=lambda box, quantity: calls.append((box, quantity)) or {
+            "box_number": box,
+            "requested_pills": quantity,
+            "dispensed_pills": quantity,
+        },
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
+    )
+    mission = ClaimedMission(
+        88, 1, 99, 2, room_number="204", dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+        mission_items=(
+            ClaimedMissionItem(99, 2, 1),
+            ClaimedMissionItem(42, 1, 2),
+        ),
+    )
+    executor.accept(mission)
+    assert executor.start_ready_mission().success
+    executor.mark_arrived_at_room()
+    assert executor.wait_for_hand_confirmation(1).success
+
+    assert executor.dispense_at_room().success
+    assert calls == [(1, 2), (2, 1)]
+    assert executor.start_return_home().success
+
+
+def test_multi_medicine_failure_stops_before_later_item_and_return() -> None:
+    dependencies = FakeExecutionDependencies()
+    calls: list[tuple[int, int]] = []
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+        wait_for_hand=lambda _: True,
+        dispense_medicine=lambda box, quantity: calls.append((box, quantity)) or {
+            "box_number": box,
+            "requested_pills": quantity,
+            "dispensed_pills": 0,
+        },
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
+    )
+    mission = ClaimedMission(
+        89, 1, 99, 2, room_number="204", dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+        mission_items=(ClaimedMissionItem(99, 2, 1), ClaimedMissionItem(42, 1, 2)),
+    )
+    executor.accept(mission)
+    assert executor.start_ready_mission().success
+    executor.mark_arrived_at_room()
+    assert executor.wait_for_hand_confirmation(1).success
+
+    failed = executor.dispense_at_room()
+    assert failed.success is False
+    assert calls == [(1, 2)]
+    assert "medicine_id=99 box=1 requested=2 confirmed=0" in (failed.message or "")
+    assert executor.start_return_home().success is False
+    assert u_turn_calls == []
 
 
 def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:

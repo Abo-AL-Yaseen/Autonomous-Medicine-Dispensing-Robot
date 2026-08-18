@@ -34,7 +34,9 @@ def test_pill_sensors_match_the_verified_physical_box_to_chute_mapping() -> None
 def test_confirmed_dispense_keeps_256_incremental_steps_and_sensor_errors() -> None:
     source = sketch_source()
 
-    assert "#define PILL_STEPS 256" in source
+    assert "#define SLOT_COUNT 8" in source
+    assert "#define STEPS_PER_SLOT (STEPS_PER_REV / SLOT_COUNT)" in source
+    assert "#define PILL_STEPS STEPS_PER_SLOT" in source
     assert "for (int step = 0; step < PILL_STEPS; step++)" in source
     assert "motor->step(1);" in source
     assert "PILL_MIN_PULSE_US = 200" in source
@@ -193,3 +195,28 @@ def test_temporary_raw_pill_sensor_diagnostics_do_not_use_dispense_helpers() -> 
     assert 'F("|D3=")' in source
     assert 'F("PILL_SENSOR|PIN=")' in source
     assert "PILL_SENSOR_MONITOR_MS = 5000" in source
+
+
+def test_manual_slot_calibration_is_required_and_never_moves_a_motor() -> None:
+    source = sketch_source()
+
+    assert "bool disk1Calibrated = false;" in source
+    assert "bool disk2Calibrated = false;" in source
+    assert 'strcmp(command, "SET_SLOT_ZERO_1")' in source
+    assert 'strcmp(command, "SET_SLOT_ZERO_2")' in source
+    assert 'Serial.println(F("ACK|SET_SLOT_ZERO_1"));' in source
+    assert 'Serial.println(F("ACK|SET_SLOT_ZERO_2"));' in source
+    assert "DISK_NOT_CALIBRATED" in source
+    calibration = source[source.index('strcmp(command, "SET_SLOT_ZERO_1")'):source.index('strcmp(command, "DISPENSE_1")')]
+    assert "step(" not in calibration
+
+
+def test_slot_position_advances_after_the_physical_motor_move_even_on_timeout() -> None:
+    source = sketch_source()
+
+    movement = source[source.index("for (int step = 0; step < PILL_STEPS; step++)"):source.index("if (!pillPulseLatched(sensorPin))")]
+    assert "advanceDiskSlot(currentSlot);" in movement
+    assert "*currentSlot = (*currentSlot + 1) % SLOT_COUNT;" in source
+    assert 'strcmp(command, "GET_DISK_STATUS")' in source
+    assert "DISK1_CALIBRATED" in source
+    assert "DISK2_CALIBRATED" in source
