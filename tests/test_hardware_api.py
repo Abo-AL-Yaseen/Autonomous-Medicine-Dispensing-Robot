@@ -724,12 +724,14 @@ def test_home_readiness_fails_closed_without_exact_home_marker_and_line_signatur
     assert client.app.state.mission_executor.status()["home_ready"] is False
 
 
-def test_home_readiness_accepts_verified_stopped_intersection_at_marker_ten(
+@pytest.mark.parametrize("state", ["IDLE", "INTERSECTION"])
+def test_home_readiness_accepts_verified_stopped_home_states_at_marker_ten(
     client: TestClient,
     fake_hardware: FakeHardwareController,
+    state: str,
 ) -> None:
     fake_hardware.line_status = (
-        "LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=00000"
+        f"LINE_STATUS|MODE=STOPPED|STATE={state}|PATTERN=00000"
     )
 
     readiness = client.app.state.navigation_coordinator.confirm_home_readiness()

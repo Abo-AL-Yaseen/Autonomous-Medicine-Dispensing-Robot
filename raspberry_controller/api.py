@@ -256,7 +256,7 @@ def create_app(
                 return controller.stop_line_follow()
 
         def home_line_position_is_valid() -> bool:
-            """Require the verified stopped HOME line-position signature."""
+            """Require one of the verified stopped HOME line signatures."""
 
             if not application.state.hardware_connected:
                 return False
@@ -269,7 +269,7 @@ def create_app(
             )
             return (
                 fields.get("MODE") == "STOPPED"
-                and fields.get("STATE") == "INTERSECTION"
+                and fields.get("STATE") in {"IDLE", "INTERSECTION"}
                 and fields.get("PATTERN") == "00000"
             )
 
