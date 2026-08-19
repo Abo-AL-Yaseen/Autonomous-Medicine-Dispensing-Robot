@@ -256,7 +256,7 @@ def create_app(
                 return controller.stop_line_follow()
 
         def home_line_position_is_valid() -> bool:
-            """Require the existing ESP32 to report a stationary line state."""
+            """Require the verified stopped HOME line-position signature."""
 
             if not application.state.hardware_connected:
                 return False
@@ -269,7 +269,8 @@ def create_app(
             )
             return (
                 fields.get("MODE") == "STOPPED"
-                and fields.get("STATE") == "IDLE"
+                and fields.get("STATE") == "INTERSECTION"
+                and fields.get("PATTERN") == "00000"
             )
 
         def run_navigation_hardware(operation: Callable[[], str]) -> str:

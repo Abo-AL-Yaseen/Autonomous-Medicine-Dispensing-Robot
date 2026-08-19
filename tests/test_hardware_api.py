@@ -60,6 +60,9 @@ class FakeHardwareController:
         self.hardware_error: Exception | None = None
         self.line_start_response = "ACK|LINE_FOLLOW_STARTED"
         self.line_stop_response = "ACK|LINE_FOLLOW_STOPPED"
+        self.line_status = (
+            "LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=00000"
+        )
         self.line_start_error: Exception | None = None
         self.camera_calls: list[str] = []
         self.return_home_calls: list[str] = []
@@ -195,7 +198,7 @@ class FakeHardwareController:
     def get_line_status(self) -> str:
         return self._record_line_call(
             "get_line_status",
-            "LINE_STATUS|MODE=STOPPED|STATE=IDLE|PATTERN=11111",
+            self.line_status,
         )
 
     def start_line_follow(self) -> str:
@@ -681,6 +684,64 @@ def test_navigation_status_reports_auto_disabled_by_default(
         "home_line_position_valid": True,
         "home_readiness_error": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("line_status", "marker_id", "expected_error"),
+    [
+        (
+            "LINE_STATUS|MODE=FOLLOWING|STATE=INTERSECTION|PATTERN=00000",
+            10,
+            "HOME_LINE_POSITION_NOT_CONFIRMED",
+        ),
+        (
+            "LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=11111",
+            10,
+            "HOME_LINE_POSITION_NOT_CONFIRMED",
+        ),
+        (
+            "LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=00000",
+            0,
+            "HOME_NOT_CONFIRMED",
+        ),
+    ],
+)
+def test_home_readiness_fails_closed_without_exact_home_marker_and_line_signature(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_camera: FakeCameraService,
+    line_status: str,
+    marker_id: int,
+    expected_error: str,
+) -> None:
+    fake_hardware.line_status = line_status
+    fake_camera.detection = replace(fake_camera.detection, marker_id=marker_id)
+
+    readiness = client.app.state.navigation_coordinator.confirm_home_readiness()
+
+    assert readiness["ready"] is False
+    assert readiness["error"] == expected_error
+    assert client.app.state.mission_executor.status()["home_ready"] is False
+
+
+def test_home_readiness_accepts_verified_stopped_intersection_at_marker_ten(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.line_status = (
+        "LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=00000"
+    )
+
+    readiness = client.app.state.navigation_coordinator.confirm_home_readiness()
+
+    assert readiness == {
+        "success": True,
+        "ready": True,
+        "marker_id": 10,
+        "line_position_valid": True,
+        "error": None,
+    }
+    assert client.app.state.mission_executor.status()["home_ready"] is True
 
 
 def test_disabled_intersection_test_endpoint_never_sends_hardware_command(
@@ -1436,7 +1497,7 @@ def test_movement_hardware_error_returns_service_unavailable(
             {
                 "success": True,
                 "status": (
-                    "LINE_STATUS|MODE=STOPPED|STATE=IDLE|PATTERN=11111"
+                    "LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=00000"
                 ),
             },
         ),
