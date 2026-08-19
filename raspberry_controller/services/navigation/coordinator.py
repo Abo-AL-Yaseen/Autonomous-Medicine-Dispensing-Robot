@@ -285,7 +285,7 @@ class NavigationCoordinator:
             marker_confirmed = (
                 detection.confirmed
                 and detection.marker_id == home_node.marker_id
-                and detection.node_name in {None, home_node.name}
+                and detection.node_name == home_node.name
             )
             line_position_valid = bool(
                 self._home_line_position_is_valid

@@ -35,6 +35,7 @@ from .services.camera import ArucoCameraService, CameraSettings
 from .services.mission_service import MissionService
 from .services.laravel_api_client import ClaimedMission, LaravelApiClient
 from .services.mission_executor import (
+    MissionExecutionState,
     MissionExecutor,
     MissionReturnResult,
     MissionRouteUnavailableError,
@@ -552,6 +553,14 @@ def create_app(
     @application.get("/executor/status")
     def executor_status(request: Request) -> dict[str, object]:
         executor: MissionExecutor = request.app.state.mission_executor
+        if executor.state in {
+            MissionExecutionState.IDLE,
+            MissionExecutionState.READY_FOR_EXECUTION,
+        }:
+            coordinator: NavigationCoordinator = (
+                request.app.state.navigation_coordinator
+            )
+            coordinator.confirm_home_readiness()
         return executor.status()
 
     @application.post("/executor/start")

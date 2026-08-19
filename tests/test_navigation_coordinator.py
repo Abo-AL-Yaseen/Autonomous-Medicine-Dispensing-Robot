@@ -204,8 +204,8 @@ def confirmed_marker(marker_id: int) -> MarkerDetectionResult:
         detected=True,
         confirmed=True,
         marker_id=marker_id,
-        node_name=None,
-        marker_type=None,
+        node_name="HOME" if marker_id == 10 else None,
+        marker_type="home" if marker_id == 10 else None,
         area=3600,
         consecutive_frames=3,
     )

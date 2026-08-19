@@ -717,11 +717,11 @@ def test_home_readiness_fails_closed_without_exact_home_marker_and_line_signatur
     fake_hardware.line_status = line_status
     fake_camera.detection = replace(fake_camera.detection, marker_id=marker_id)
 
-    readiness = client.app.state.navigation_coordinator.confirm_home_readiness()
+    response = client.get("/executor/status")
 
-    assert readiness["ready"] is False
-    assert readiness["error"] == expected_error
-    assert client.app.state.mission_executor.status()["home_ready"] is False
+    assert response.status_code == 200
+    assert response.json()["home_ready"] is False
+    assert response.json()["home_readiness_error"] == expected_error
 
 
 @pytest.mark.parametrize("state", ["IDLE", "INTERSECTION"])
@@ -734,16 +734,66 @@ def test_home_readiness_accepts_verified_stopped_home_states_at_marker_ten(
         f"LINE_STATUS|MODE=STOPPED|STATE={state}|PATTERN=00000"
     )
 
-    readiness = client.app.state.navigation_coordinator.confirm_home_readiness()
+    response = client.get("/executor/status")
 
-    assert readiness == {
-        "success": True,
-        "ready": True,
-        "marker_id": 10,
-        "line_position_valid": True,
-        "error": None,
-    }
-    assert client.app.state.mission_executor.status()["home_ready"] is True
+    assert response.status_code == 200
+    assert response.json()["home_ready"] is True
+    assert response.json()["home_readiness_error"] is None
+
+
+@pytest.mark.parametrize(
+    "detection",
+    [
+        MarkerDetectionResult(
+            camera_available=True,
+            detected=False,
+            confirmed=False,
+        ),
+        MarkerDetectionResult(
+            camera_available=True,
+            detected=True,
+            confirmed=False,
+            marker_id=10,
+            node_name="HOME",
+            marker_type="home",
+            area=3600,
+            ambiguous=True,
+        ),
+        MarkerDetectionResult(
+            camera_available=False,
+            detected=False,
+            confirmed=False,
+        ),
+    ],
+    ids=["no-marker", "ambiguous-marker", "camera-unavailable"],
+)
+def test_executor_status_fails_home_readiness_for_unconfirmed_camera_results(
+    client: TestClient,
+    fake_camera: FakeCameraService,
+    detection: MarkerDetectionResult,
+) -> None:
+    fake_camera.detection = detection
+
+    response = client.get("/executor/status")
+
+    assert response.status_code == 200
+    assert response.json()["home_ready"] is False
+    assert response.json()["home_readiness_error"] == "HOME_NOT_CONFIRMED"
+
+
+def test_executor_start_performs_a_fresh_home_confirmation(
+    client: TestClient,
+    fake_camera: FakeCameraService,
+) -> None:
+    assert client.app.state.mission_executor.accept(executable_mission()) is True
+    fake_camera.detection = replace(fake_camera.detection, marker_id=0, node_name="NODE_0")
+    detect_calls_before_start = fake_camera.detect_calls
+
+    response = client.post("/executor/start")
+
+    assert response.status_code == 409
+    assert response.json()["result"] == "HOME_NOT_CONFIRMED"
+    assert fake_camera.detect_calls == detect_calls_before_start + 1
 
 
 def test_disabled_intersection_test_endpoint_never_sends_hardware_command(
