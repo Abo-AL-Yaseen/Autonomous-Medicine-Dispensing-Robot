@@ -122,6 +122,19 @@ def test_hand_response_is_not_misrouted_as_an_async_navigation_event() -> None:
     assert SerialController._is_async_line("IR|HAND_DETECTED") is True
 
 
+def test_real_uno_disk_status_line_is_not_misrouted_as_async_telemetry() -> None:
+    response = (
+        "DISK_STATUS|DISK1_CALIBRATED=0|DISK1_SLOT=0|"
+        "DISK2_CALIBRATED=0|DISK2_SLOT=0"
+    )
+
+    assert SerialController._is_async_line(response) is False
+    assert RobotHardwareController.parse_disk_status(response) == {
+        "disk1": {"calibrated": False, "slot": 0},
+        "disk2": {"calibrated": False, "slot": 0},
+    }
+
+
 @pytest.mark.parametrize(
     "response",
     [

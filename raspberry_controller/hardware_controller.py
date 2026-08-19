@@ -371,6 +371,7 @@ class SerialController:
             "DONE|",
             "ERROR|",
             "STATUS|",
+            "DISK_STATUS|",
             "RTC|",
             "HAND|",
             "LINE|",

@@ -1232,6 +1232,19 @@ def test_dispenser_status_and_manual_zero_endpoints_use_owned_hardware(
     assert fake_hardware.dispense_calls == []
 
 
+def test_dispenser_status_returns_the_real_uno_uncalibrated_shape(
+    client: TestClient,
+) -> None:
+    response = client.get("/dispenser/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "disk1": {"calibrated": False, "slot": 0},
+        "disk2": {"calibrated": False, "slot": 0},
+    }
+
+
 def test_dispenser_zero_rejects_unknown_box(client: TestClient) -> None:
     response = client.post("/dispenser/box/3/set-zero")
 
