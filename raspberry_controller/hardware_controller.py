@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import math
 import os
 import queue
 import sys
@@ -376,6 +377,7 @@ class SerialController:
             "HAND|",
             "LINE|",
             "LINE_STATUS|",
+            "WATER_LEVEL|",
         )
         return not line.startswith(response_prefixes)
 
@@ -470,6 +472,7 @@ class RobotHardwareController:
     }
     WATER_MIN_DURATION_MS = 100
     WATER_MAX_DURATION_MS = 60000
+    WATER_LEVEL_STATUSES = {"OK", "LOW", "EMPTY", "SENSOR_ERROR"}
     DISK_SLOT_COUNT = 8
 
     def __init__(
@@ -655,6 +658,18 @@ class RobotHardwareController:
             validator=self._is_valid_line_status,
             response_prefix="LINE_STATUS|",
         )
+
+    def get_water_level(self) -> dict[str, float | int | str | None]:
+        """Read the ESP32 HC-SR04 water level on its existing serial link."""
+
+        response = self._request(
+            self.esp32,
+            "GET_WATER_LEVEL",
+            "VALID_WATER_LEVEL",
+            validator=self._is_valid_water_level,
+            response_prefix="WATER_LEVEL|",
+        )
+        return self.parse_water_level(response)
 
     def start_line_follow(self) -> str:
         """Start non-blocking line following on the ESP32."""
@@ -986,6 +1001,64 @@ class RobotHardwareController:
             and len(pattern) == 5
             and all(value in "01" for value in pattern)
         )
+
+    @classmethod
+    def _is_valid_water_level(cls, response: str) -> bool:
+        try:
+            cls.parse_water_level(response)
+        except ValueError:
+            return False
+        return True
+
+    @classmethod
+    def parse_water_level(
+        cls,
+        response: str,
+    ) -> dict[str, float | int | str | None]:
+        """Parse the ESP32's machine-readable water-level response."""
+
+        fields = response.split("|")
+        if len(fields) != 4 or fields[0] != "WATER_LEVEL":
+            raise ValueError("invalid water level response")
+
+        expected = {"DISTANCE_CM", "PERCENT", "STATUS"}
+        values: dict[str, str] = {}
+        for field in fields[1:]:
+            if "=" not in field:
+                raise ValueError("invalid water level field")
+            key, value = field.split("=", 1)
+            if key not in expected or key in values:
+                raise ValueError("invalid water level field")
+            values[key] = value
+        if set(values) != expected or values["STATUS"] not in cls.WATER_LEVEL_STATUSES:
+            raise ValueError("invalid water level status")
+
+        if values["STATUS"] == "SENSOR_ERROR":
+            if values["DISTANCE_CM"] != "NA" or values["PERCENT"] != "NA":
+                raise ValueError("invalid water level sensor error")
+            return {
+                "distance_cm": None,
+                "percent": None,
+                "status": "SENSOR_ERROR",
+            }
+
+        try:
+            distance_cm = float(values["DISTANCE_CM"])
+            percent = int(values["PERCENT"])
+        except ValueError as exc:
+            raise ValueError("invalid water level value") from exc
+        if (
+            not math.isfinite(distance_cm)
+            or distance_cm < 0
+            or not 0 <= percent <= 100
+            or values["PERCENT"] != str(percent)
+        ):
+            raise ValueError("invalid water level value")
+        return {
+            "distance_cm": distance_cm,
+            "percent": percent,
+            "status": values["STATUS"],
+        }
 
     @staticmethod
     def _dispense_sensor_error_code(

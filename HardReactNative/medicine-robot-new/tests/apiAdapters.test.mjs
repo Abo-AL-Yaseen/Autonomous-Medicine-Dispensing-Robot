@@ -11,6 +11,7 @@ import {
   normalizeFastApiHealth,
   normalizeFastApiStatus,
   normalizeFastApiWaterDispense,
+  normalizeFastApiWaterLevel,
   normalizeHardwareActionErrorMessage,
   normalizeMedicine,
   normalizeMission,
@@ -312,6 +313,27 @@ test("normalizes a calibrated water dispense response", () => {
 
   assert.equal(result.duration_ms, 2000);
   assert.equal(result.delivery_basis, "calibrated_time");
+});
+
+test("normalizes valid and sensor-error water-level responses", () => {
+  assert.deepEqual(
+    normalizeFastApiWaterLevel({
+      success: true,
+      distance_cm: 7.3,
+      percent: 68,
+      status: "OK",
+    }),
+    { success: true, distance_cm: 7.3, percent: 68, status: "OK" },
+  );
+  assert.deepEqual(
+    normalizeFastApiWaterLevel({
+      success: false,
+      distance_cm: null,
+      percent: null,
+      status: "SENSOR_ERROR",
+    }),
+    { success: false, distance_cm: null, percent: null, status: "SENSOR_ERROR" },
+  );
 });
 
 test("maps disconnected hardware actions to a clear message", () => {

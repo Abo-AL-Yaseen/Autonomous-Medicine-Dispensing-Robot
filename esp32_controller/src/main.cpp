@@ -180,6 +180,13 @@ const uint8_t MANUAL_PIVOT_PWM = TURN_SPEED;
 #define PUMP_RUN_MS          2000   // مدة اختبار المضخة بالأمر P
 const unsigned long WATER_MIN_DURATION_MS = 100;
 const unsigned long WATER_MAX_DURATION_MS = 60000;
+// TEMPORARY tank calibration defaults. Measure the installed tank and replace
+// these values before relying on the reported percentage.
+const float WATER_FULL_DISTANCE_CM = 5.0f;
+const float WATER_EMPTY_DISTANCE_CM = 25.0f;
+const uint8_t WATER_LEVEL_SAMPLE_COUNT = 2;
+const uint8_t WATER_LOW_PERCENT = 20;
+const uint8_t WATER_EMPTY_PERCENT = 5;
 
 // ─── مدة كل حركة بالتيست (ms) ─────────────────────
 #define TEST_MOVE_MS        1000   // مدة المشي قدام/خلف
@@ -380,6 +387,10 @@ void pumpOff();
 void stopAllOutputs();
 void setupUltrasonic();
 float readUltrasonicCm();
+float readWaterLevelDistanceCm();
+int waterLevelPercentForDistance(float distanceCm);
+const char* waterLevelStatusForPercent(int percent);
+void printWaterLevel();
 void testUltrasonicOnce();
 void updateIrSensor();
 void sampleLineSensors();
@@ -617,6 +628,57 @@ float readUltrasonicCm() {
   if (distanceCm < 2.0f || distanceCm > 400.0f) return -1.0f;
 
   return distanceCm;
+}
+
+float readWaterLevelDistanceCm() {
+  float readings[WATER_LEVEL_SAMPLE_COUNT];
+  uint8_t validReadings = 0;
+
+  for (uint8_t sample = 0; sample < WATER_LEVEL_SAMPLE_COUNT; sample++) {
+    float distance = readUltrasonicCm();
+    if (distance >= 0.0f) {
+      readings[validReadings++] = distance;
+    }
+  }
+
+  if (validReadings != WATER_LEVEL_SAMPLE_COUNT) {
+    return -1.0f;
+  }
+
+  return (readings[0] + readings[1]) / 2.0f;
+}
+
+int waterLevelPercentForDistance(float distanceCm) {
+  if (distanceCm <= WATER_FULL_DISTANCE_CM) return 100;
+  if (distanceCm >= WATER_EMPTY_DISTANCE_CM) return 0;
+
+  float percent = 100.0f *
+    (WATER_EMPTY_DISTANCE_CM - distanceCm) /
+    (WATER_EMPTY_DISTANCE_CM - WATER_FULL_DISTANCE_CM);
+  int roundedPercent = (int)(percent + 0.5f);
+  return constrain(roundedPercent, 0, 100);
+}
+
+const char* waterLevelStatusForPercent(int percent) {
+  if (percent <= WATER_EMPTY_PERCENT) return "EMPTY";
+  if (percent <= WATER_LOW_PERCENT) return "LOW";
+  return "OK";
+}
+
+void printWaterLevel() {
+  float distance = readWaterLevelDistanceCm();
+  if (distance < 0.0f) {
+    Serial.println("WATER_LEVEL|DISTANCE_CM=NA|PERCENT=NA|STATUS=SENSOR_ERROR");
+    return;
+  }
+
+  int percent = waterLevelPercentForDistance(distance);
+  Serial.print("WATER_LEVEL|DISTANCE_CM=");
+  Serial.print(distance, 1);
+  Serial.print("|PERCENT=");
+  Serial.print(percent);
+  Serial.print("|STATUS=");
+  Serial.println(waterLevelStatusForPercent(percent));
 }
 
 void testUltrasonicOnce() {
@@ -3337,7 +3399,9 @@ void handleLegacyCommand(char rawCommand) {
 
   switch (command) {
     case 'A':
-      startAutonomousMode();
+      // The HC-SR04 is now mounted over the water tank. The legacy obstacle
+      // avoidance mode must not drive using a water-surface distance.
+      Serial.println("ERROR|AUTONOMOUS_MODE_DISABLED");
       break;
 
     case 'F':
@@ -3553,6 +3617,8 @@ void handleTextCommand(const String& command) {
     Serial.println("ACK|PING");
   } else if (normalizedCommand == "GET_STATUS") {
     printControllerStatus();
+  } else if (normalizedCommand == "GET_WATER_LEVEL") {
+    printWaterLevel();
   } else if (normalizedCommand == "GET_HAND") {
     Serial.println(irStableDetected ? "HAND|DETECTED" : "HAND|WAITING");
   } else if (normalizedCommand.startsWith("LCD|STATE=")) {

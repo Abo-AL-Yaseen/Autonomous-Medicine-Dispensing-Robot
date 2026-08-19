@@ -52,6 +52,12 @@ class FakeHardwareController:
         self.navigation_calls: list[str] = []
         self.rtc_calls = 0
         self.water_calls: list[int] = []
+        self.water_level_calls = 0
+        self.water_level = {
+            "distance_cm": 7.3,
+            "percent": 68,
+            "status": "OK",
+        }
         self.disk_status = {
             "disk1": {"calibrated": False, "slot": 0},
             "disk2": {"calibrated": False, "slot": 0},
@@ -129,6 +135,11 @@ class FakeHardwareController:
         self._raise_hardware_error()
         self.water_calls.append(duration_ms)
         return {"duration_ms": duration_ms}
+
+    def get_water_level(self) -> dict[str, float | int | str | None]:
+        self._raise_hardware_error()
+        self.water_level_calls += 1
+        return dict(self.water_level)
 
     def forward(self) -> str:
         return self._record_movement("forward", "ACK|FORWARD")
@@ -521,6 +532,7 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/executor/status" in body["endpoints"]
     assert "/executor/start" in body["endpoints"]
     assert "/executor/return-home" in body["endpoints"]
+    assert "/water/level" in body["endpoints"]
     assert "/water/dispense" in body["endpoints"]
     assert "/movement/stop" in body["endpoints"]
     assert "/movement/manual/forward" in body["endpoints"]
@@ -1375,6 +1387,45 @@ def test_water_dispense_rejects_invalid_amount(
 
     assert response.status_code == 422
     assert fake_hardware.water_calls == []
+
+
+def test_water_level_returns_structured_valid_sensor_data(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.get("/water/level")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "distance_cm": 7.3,
+        "percent": 68,
+        "status": "OK",
+    }
+    assert fake_hardware.water_level_calls == 1
+    assert fake_hardware.water_calls == []
+
+
+def test_water_level_returns_sensor_error_without_a_fake_percentage(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.water_level = {
+        "distance_cm": None,
+        "percent": None,
+        "status": "SENSOR_ERROR",
+    }
+
+    response = client.get("/water/level")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": False,
+        "distance_cm": None,
+        "percent": None,
+        "status": "SENSOR_ERROR",
+    }
+    assert fake_hardware.water_level_calls == 1
 
 
 def test_water_conversion_uses_configured_flow_rate() -> None:

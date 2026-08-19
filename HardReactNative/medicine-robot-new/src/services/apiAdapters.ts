@@ -20,6 +20,8 @@ import type {
   Room,
   SchedulerTickResponse,
   WaterDispenseResponse,
+  WaterLevelResponse,
+  WaterLevelStatus,
 } from "../types";
 
 type UnknownRecord = Record<string, unknown>;
@@ -688,6 +690,64 @@ export const normalizeFastApiWaterDispense = (
     delivery_basis: "calibrated_time",
     calibration_ml_per_second: calibration,
     duration_ms: requireInteger(value.duration_ms, "FastAPI water dispense", "duration_ms"),
+  };
+};
+
+export const normalizeFastApiWaterLevel = (
+  payload: unknown,
+): WaterLevelResponse => {
+  const value = requireRecord(payload, "FastAPI water level");
+  const status = requireString(value.status, "FastAPI water level", "status");
+  if (
+    !(["OK", "LOW", "EMPTY", "SENSOR_ERROR"] as const).includes(
+      status as never,
+    )
+  ) {
+    return invalidResponse("FastAPI water level", "has an unknown status.");
+  }
+  const waterLevelStatus = status as WaterLevelStatus;
+  const success = requireBoolean(value.success, "FastAPI water level", "success");
+
+  if (waterLevelStatus === "SENSOR_ERROR") {
+    if (value.distance_cm !== null || value.percent !== null || success) {
+      return invalidResponse(
+        "FastAPI water level",
+        "must report null values and success=false for SENSOR_ERROR.",
+      );
+    }
+    return {
+      success,
+      distance_cm: null,
+      percent: null,
+      status: waterLevelStatus,
+    };
+  }
+
+  if (!success) {
+    return invalidResponse(
+      "FastAPI water level",
+      "must be successful for a valid sensor reading.",
+    );
+  }
+  if (
+    typeof value.distance_cm !== "number" ||
+    !Number.isFinite(value.distance_cm) ||
+    value.distance_cm < 0 ||
+    typeof value.percent !== "number" ||
+    !Number.isInteger(value.percent) ||
+    value.percent < 0 ||
+    value.percent > 100
+  ) {
+    return invalidResponse(
+      "FastAPI water level",
+      "has invalid distance or percentage values.",
+    );
+  }
+  return {
+    success,
+    distance_cm: value.distance_cm,
+    percent: value.percent,
+    status: waterLevelStatus,
   };
 };
 

@@ -430,6 +430,7 @@ def create_app(
                 "/executor/start",
                 "/executor/return-home",
                 "/dispense",
+                "/water/level",
                 "/water/dispense",
                 "/movement/forward",
                 "/movement/backward",
@@ -642,6 +643,17 @@ def create_app(
             lambda controller: controller.set_slot_zero(box_number),
         )
         return {"success": True, "box": box_number, **disk}
+
+    @application.get("/water/level")
+    def water_level(request: Request) -> dict[str, object]:
+        level = _run_hardware_operation(
+            request,
+            lambda controller: controller.get_water_level(),
+        )
+        return {
+            "success": level["status"] != "SENSOR_ERROR",
+            **level,
+        }
 
     @application.post("/water/dispense")
     def dispense_water(

@@ -34,12 +34,17 @@ import {
   ManualDriveState,
 } from "@/src/services/robot/manualDriveController";
 import { getRobotHardwareStatus } from "@/src/services/robot/robotHardwareService";
+import {
+  getWaterLevel,
+  waterLevelDisplay,
+} from "@/src/services/robot/waterLevelService";
 import { theme } from "@/src/theme/theme";
 import type {
   Medicine,
   MovementResponse,
   RobotConnection,
   RobotMode,
+  WaterLevelResponse,
 } from "@/src/types";
 
 const manualDriveRequests: Record<
@@ -81,6 +86,8 @@ export default function ManualControlScreen() {
   const [selectedMedicine, setSelectedMedicine] = useState("0");
   const [medicineQuantity, setMedicineQuantity] = useState(1);
   const [waterAmountMl, setWaterAmountMl] = useState(100);
+  const [waterLevel, setWaterLevel] =
+    useState<WaterLevelResponse | null>(null);
   const [directionPadResetSignal, setDirectionPadResetSignal] = useState(0);
   const manualDriveDispatcherRef =
     useRef<LatestManualDriveDispatcher | null>(null);
@@ -113,9 +120,10 @@ export default function ManualControlScreen() {
     const loadHardwareState = async () => {
       try {
         setLoading(true);
-        const [data, loadedMedicines] = await Promise.all([
+        const [data, loadedMedicines, loadedWaterLevel] = await Promise.all([
           getRobotHardwareStatus(),
           getMedicines(),
+          getWaterLevel().catch(() => null),
         ]);
         const mappedMedicines = loadedMedicines.filter(
           (medicine) => medicine.dispenser_box !== null,
@@ -126,6 +134,7 @@ export default function ManualControlScreen() {
         setMode(data.mode);
         setError(data.error ?? null);
         setMedicines(mappedMedicines);
+        setWaterLevel(loadedWaterLevel);
         setSelectedMedicine(
           mappedMedicines.length > 0 ? String(mappedMedicines[0].id) : "0",
         );
@@ -224,6 +233,7 @@ export default function ManualControlScreen() {
       setLoading(true);
       setError(null);
       await dispenseSelectedWater(waterAmountMl);
+      setWaterLevel(await getWaterLevel().catch(() => null));
       setStatus("Water Dispensed");
       Alert.alert(
         "Water Dispensed",
@@ -249,6 +259,8 @@ export default function ManualControlScreen() {
     setDirectionPadResetSignal((current) => current + 1);
     manualDriveDispatcherRef.current?.emergencyStop();
   };
+
+  const displayedWaterLevel = waterLevelDisplay(waterLevel);
 
   return (
     <View style={styles.safeArea}>
@@ -389,7 +401,16 @@ export default function ManualControlScreen() {
           />
           <StatusCard label="Connection" value={connection} />
           <StatusCard label="Mode" value={mode} />
+          <StatusCard label="Water Level" value={displayedWaterLevel.value} />
         </View>
+        <Text style={styles.waterLevelStatus}>
+          Water Status: {displayedWaterLevel.status}
+        </Text>
+        {displayedWaterLevel.warning ? (
+          <Text style={styles.waterLevelWarning}>
+            {displayedWaterLevel.warning}
+          </Text>
+        ) : null}
       </ScrollView>
     </View>
   );
@@ -430,6 +451,14 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     color: "#C62828",
     fontWeight: "600",
+  },
+  waterLevelStatus: {
+    color: theme.colors.textSecondary,
+    marginTop: 12,
+  },
+  waterLevelWarning: {
+    color: theme.colors.emergency,
+    marginTop: 4,
   },
   controlSection: {
     marginBottom: 28,

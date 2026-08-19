@@ -122,6 +122,55 @@ def test_hand_response_is_not_misrouted_as_an_async_navigation_event() -> None:
     assert SerialController._is_async_line("IR|HAND_DETECTED") is True
 
 
+def test_water_level_uses_the_existing_esp32_connection_and_strict_contract() -> None:
+    esp32 = RecordingSerialController(
+        {
+            "GET_WATER_LEVEL": (
+                "WATER_LEVEL|DISTANCE_CM=7.3|PERCENT=68|STATUS=OK"
+            ),
+        }
+    )
+    uno = RecordingSerialController()
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=uno,  # type: ignore[arg-type]
+    )
+
+    assert controller.get_water_level() == {
+        "distance_cm": 7.3,
+        "percent": 68,
+        "status": "OK",
+    }
+    assert esp32.commands == ["GET_WATER_LEVEL"]
+    assert uno.commands == []
+    assert SerialController._is_async_line(
+        "WATER_LEVEL|DISTANCE_CM=7.3|PERCENT=68|STATUS=OK"
+    ) is False
+
+
+def test_water_level_sensor_error_is_structured_without_a_fake_percentage() -> None:
+    assert RobotHardwareController.parse_water_level(
+        "WATER_LEVEL|DISTANCE_CM=NA|PERCENT=NA|STATUS=SENSOR_ERROR"
+    ) == {
+        "distance_cm": None,
+        "percent": None,
+        "status": "SENSOR_ERROR",
+    }
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "WATER_LEVEL|DISTANCE_CM=7.3|PERCENT=101|STATUS=OK",
+        "WATER_LEVEL|DISTANCE_CM=NA|PERCENT=0|STATUS=SENSOR_ERROR",
+        "WATER_LEVEL|DISTANCE_CM=7.3|PERCENT=68|STATUS=UNKNOWN",
+    ],
+)
+def test_water_level_parser_rejects_invalid_structured_responses(response: str) -> None:
+    with pytest.raises(ValueError):
+        RobotHardwareController.parse_water_level(response)
+
+
 def test_real_uno_disk_status_line_is_not_misrouted_as_async_telemetry() -> None:
     response = (
         "DISK_STATUS|DISK1_CALIBRATED=0|DISK1_SLOT=0|"

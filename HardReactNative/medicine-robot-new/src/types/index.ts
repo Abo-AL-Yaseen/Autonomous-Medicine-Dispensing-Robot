@@ -181,6 +181,15 @@ export interface WaterDispenseResponse {
   duration_ms: number;
 }
 
+export type WaterLevelStatus = "OK" | "LOW" | "EMPTY" | "SENSOR_ERROR";
+
+export interface WaterLevelResponse {
+  success: boolean;
+  distance_cm: number | null;
+  percent: number | null;
+  status: WaterLevelStatus;
+}
+
 export interface LineStatus {
   success: boolean;
   status: string;
