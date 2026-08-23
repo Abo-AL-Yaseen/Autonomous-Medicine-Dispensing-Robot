@@ -627,9 +627,20 @@ def create_app(
                 status_code=500,
                 detail={"code": "SYSTEM_CLOCK_MUST_BE_TIMEZONE_AWARE"},
             )
-        robot_datetime = system_datetime.astimezone(
+        localized_datetime = system_datetime.astimezone(
             ZoneInfo(settings.robot_timezone)
-        ).replace(tzinfo=None)
+        )
+        # DS1302 and /rtc/set share the same six whole-second fields. Rebuild
+        # the wall clock explicitly so system microseconds cannot make a
+        # successful firmware confirmation look like a mismatch.
+        robot_datetime = datetime(
+            localized_datetime.year,
+            localized_datetime.month,
+            localized_datetime.day,
+            localized_datetime.hour,
+            localized_datetime.minute,
+            localized_datetime.second,
+        )
         confirmed = _run_hardware_operation(
             request,
             lambda controller: controller.set_rtc_datetime(robot_datetime),

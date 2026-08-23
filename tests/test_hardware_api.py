@@ -52,6 +52,7 @@ class FakeHardwareController:
         self.navigation_calls: list[str] = []
         self.rtc_calls = 0
         self.rtc_set_calls: list[datetime] = []
+        self.rtc_set_confirmation: datetime | None = None
         self.water_calls: list[int] = []
         self.manual_pump_calls: list[str | int] = []
         self.water_level_calls = 0
@@ -142,7 +143,7 @@ class FakeHardwareController:
     def set_rtc_datetime(self, rtc_datetime: datetime) -> datetime:
         self._raise_hardware_error()
         self.rtc_set_calls.append(rtc_datetime)
-        return rtc_datetime
+        return self.rtc_set_confirmation or rtc_datetime
 
     def dispense_water(self, duration_ms: int) -> dict[str, int]:
         self._raise_hardware_error()
@@ -532,7 +533,16 @@ def client(
         controller_factory=fake_factory,
         laravel_client_factory=fake_laravel_factory,
         camera_factory=fake_camera_factory,
-        utc_now=lambda: datetime(2026, 8, 23, 10, 30, 0, tzinfo=timezone.utc),
+        utc_now=lambda: datetime(
+            2026,
+            8,
+            23,
+            10,
+            30,
+            0,
+            654321,
+            tzinfo=timezone.utc,
+        ),
     )
     with TestClient(application) as test_client:
         yield test_client
@@ -1074,6 +1084,7 @@ def test_rtc_set_writes_and_returns_the_confirmed_ds1302_value(
         "timezone": "Asia/Hebron",
     }
     assert fake_hardware.rtc_set_calls == [datetime(2026, 8, 23, 13, 30, 0)]
+    assert fake_hardware.rtc_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -1157,6 +1168,42 @@ def test_rtc_sync_system_converts_utc_to_robot_wall_clock_before_writing(
         "timezone": "Asia/Hebron",
     }
     assert fake_hardware.rtc_set_calls == [datetime(2026, 8, 23, 13, 30, 0)]
+    assert fake_hardware.rtc_calls == 0
+
+
+def test_rtc_sync_system_returns_the_same_set_path_confirmation_cleanly(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.rtc_set_confirmation = datetime(2026, 8, 23, 13, 30, 1)
+
+    response = client.post("/rtc/sync-system")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "datetime": "2026-08-23T13:30:01",
+        "source": "DS1302",
+        "timezone": "Asia/Hebron",
+    }
+    assert fake_hardware.rtc_set_calls == [datetime(2026, 8, 23, 13, 30, 0)]
+    assert fake_hardware.rtc_calls == 0
+
+
+def test_rtc_sync_system_true_hardware_failure_is_structured(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.hardware_error = SerialConnectionError("ESP32 unavailable")
+
+    response = client.post("/rtc/sync-system")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
+    }
+    assert fake_hardware.rtc_set_calls == []
+    assert fake_hardware.rtc_calls == 0
 
 
 def test_rtc_hardware_unavailable_is_safe(
