@@ -37,7 +37,7 @@ The API reads these optional environment variables:
 | `LARAVEL_API_TIMEOUT_SECONDS` | `2.0` seconds |
 | `MISSION_SCHEDULER_ENABLED` | `false` |
 | `MISSION_SCHEDULER_INTERVAL_SECONDS` | `5.0` seconds |
-| `MISSION_AUTO_EXECUTION_ENABLED` | `false` (reserved; does not auto-start yet) |
+| `MISSION_AUTO_EXECUTION_ENABLED` | `false` (start an accepted scheduled mission through the existing HOME coordinator) |
 | `NAVIGATION_AUTO_ENABLED` | `false` (intersection events are observable but cannot move the robot) |
 | `ARUCO_MIN_AREA_RATIO` | `1.4` (minimum largest/second-largest marker dominance) |
 | `MISSION_CLAIM_LEASE_SECONDS` | `60` seconds (Laravel stale-claim recovery) |
@@ -65,6 +65,19 @@ Turn the project hardware power switch **ON**, then run:
 python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000
 ```
 
+Production scheduled execution remains opt-in and must use one process:
+
+```bash
+ROBOT_TIMEZONE=Asia/Hebron \
+MISSION_SCHEDULER_ENABLED=true \
+MISSION_AUTO_EXECUTION_ENABLED=true \
+NAVIGATION_AUTO_ENABLED=true \
+python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+Do not add `--reload` or increase `--workers`; serial ownership, executor state,
+and the scheduler loop are process-local.
+
 Swagger documentation is available at `http://<raspberry-pi-address>:8000/docs`.
 
 ## USB camera preview
@@ -89,7 +102,7 @@ Laravel map; it never replaces a larger unexpected marker with a smaller one.
 
 ## DS1302 RTC API
 
-The Raspberry Pi reads the ESP32 using this exact read-only serial command:
+The Raspberry Pi reads the ESP32 using this exact serial command:
 
 ```text
 GET_RTC
@@ -98,6 +111,25 @@ RTC|YYYY=2026|MM=08|DD=09|HH=20|MIN=30|SEC=00
 
 `GET /rtc` returns the parsed wall-clock value, `source: DS1302`, and the
 configured `ROBOT_TIMEZONE`. It never changes the RTC time.
+
+Explicit writes use the same ESP32 serial connection and this exact protocol:
+
+```text
+SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=00
+ACK|SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=00
+```
+
+The firmware requires the exact field order and widths, validates the DS1302
+year range `2000..2099`, calendar/leap-day validity, hour `0..23`, and
+minute/second `0..59`, then reads the value back before acknowledging it.
+Failures are `ERROR|SET_RTC|INVALID_FORMAT`,
+`ERROR|SET_RTC|INVALID_DATETIME`, or `ERROR|SET_RTC|WRITE_FAILED`.
+
+`POST /rtc/set` accepts the six integer fields and returns the confirmed RTC
+wall clock. `POST /rtc/sync-system` is an explicit manual operation that
+converts the current system instant to `ROBOT_TIMEZONE` before writing its
+wall-clock fields. Neither endpoint creates another serial connection, and
+there is no continuous Linux-to-RTC synchronization.
 
 The DS1302 stores calendar and clock fields only; it has no timezone or UTC
 offset metadata. Those fields represent Palestine wall-clock time. Raspberry Pi
@@ -124,9 +156,12 @@ DS1302 wall-clock, and posts it to Laravel's
 }
 ```
 
-Before either the hardware check or RTC read, the scheduler requires the
-`MissionExecutor` to be `IDLE`. Any ready or future busy state returns
-`EXECUTOR_BUSY` without reading the RTC or calling Laravel. If Laravel claims a
+Before either the hardware check or RTC read, the scheduler normally requires
+the `MissionExecutor` to be `IDLE`. Running states return `EXECUTOR_BUSY`
+without reading the RTC or calling Laravel. If auto execution is enabled, the
+one exception is the already accepted scheduled mission in
+`READY_FOR_EXECUTION`: later ticks retry its existing coordinator start without
+reading the RTC or claiming another mission. If Laravel claims a
 mission but the executor boundary unexpectedly rejects it, the scheduler keeps
 that mission in memory and retries the same acceptance before permitting a new
 claim; `/scheduler/status` exposes its ID as
@@ -163,7 +198,9 @@ Laravel mission resource, including its nested room and medicine. For example:
 Laravel atomically fills `schedule_claimed_at` for the oldest eligible pending
 mission and leaves its status as `pending`. The Raspberry `MissionExecutor` then
 holds only the runtime fields required for the software state
-`READY_FOR_EXECUTION`. The scheduler itself does not start movement.
+`READY_FOR_EXECUTION`. When auto execution is enabled, the scheduler delegates
+startup to the existing navigation coordinator; it has no movement commands of
+its own.
 
 `schedule_claimed_at` is a Laravel-managed lease rather than a permanent claim.
 A pending, due mission becomes claimable again when its claim timestamp is at
@@ -184,22 +221,28 @@ Safe development endpoints are available even when the periodic loop is off:
 
 - `GET /scheduler/status` reports whether the loop is enabled/running, executor
   state, held mission ID, and the most recent tick result.
-- `POST /scheduler/tick` performs one claim-only cycle. It contains no movement
-  or dispensing behavior.
+- `POST /scheduler/tick` performs one scheduler cycle. With auto execution off,
+  it remains claim-only. With auto execution on, it can invoke the same
+  coordinator startup as `POST /executor/start`; it never contains separate
+  motor, navigation, or dispensing logic.
 
 ## Starting a ready mission
 
-Automatic execution remains disabled and is not connected to the scheduler.
-`MISSION_AUTO_EXECUTION_ENABLED` defaults to `false`; in this phase it is
-reported for diagnostics only and does not start a mission even if configured.
+`MISSION_AUTO_EXECUTION_ENABLED` defaults to `false`, preserving manual startup.
+When both scheduler and auto execution are enabled, a newly accepted scheduled
+mission is started through the same coordinator method used by the manual API.
+If HOME readiness is not confirmed, it remains `READY_FOR_EXECUTION`; later
+scheduler ticks retry HOME confirmation without another Laravel claim.
 
 The manual software trigger `POST /executor/start` performs exactly this first
 execution step for the currently ready mission:
 
 ```text
 READY_FOR_EXECUTION
-  -> verify hardware availability
+  -> confirm HOME marker and stopped HOME line signature
   -> STARTING
+  -> ESP32 U_TURN / ACK|U_TURN_STARTED
+  -> EVENT|U_TURN_COMPLETE
   -> ESP32 START_LINE_FOLLOW / ACK|LINE_FOLLOW_STARTED
   -> Laravel POST /api/missions/{id}/start-execution
   -> GOING_TO_ROOM
@@ -216,8 +259,9 @@ Laravel transition fails, the executor immediately calls the existing
 `STOP_LINE_FOLLOW` operation and requires `ACK|LINE_FOLLOW_STOPPED` before
 reporting `MISSION_STATUS_UPDATE_FAILED`. `GET /executor/status` reports the
 state, mission and target-room fields, dispenser box, last error, and configured
-auto-execution flag. Repeated starts while `STARTING` or `GOING_TO_ROOM` return
-`EXECUTOR_BUSY` without sending another line command.
+auto-execution flag. Repeated manual starts or scheduler ticks while `STARTING`
+or `GOING_TO_ROOM` return `EXECUTOR_BUSY` without sending another U-turn, line
+command, or Laravel status update.
 
 ## Intersection navigation coordinator
 

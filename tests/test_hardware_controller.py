@@ -97,6 +97,52 @@ def test_get_rtc_uses_machine_readable_contract() -> None:
     assert esp32.commands == ["GET_RTC"]
 
 
+def test_set_rtc_uses_machine_readable_contract_and_confirmed_readback() -> None:
+    requested = datetime(2026, 8, 23, 13, 30, 0)
+    command = "SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=00"
+    response = "ACK|SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=00"
+    esp32 = RecordingSerialController({command: response})
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.set_rtc_datetime(requested) == requested
+    assert esp32.commands == [command]
+
+
+def test_set_rtc_rejects_a_mismatched_readback_confirmation() -> None:
+    requested = datetime(2026, 8, 23, 13, 30, 0)
+    command = "SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=00"
+    response = "ACK|SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=01"
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController({command: response}),  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(UnexpectedSerialResponse, match="RTC_SET_CONFIRMATION_MISMATCH"):
+        controller.set_rtc_datetime(requested)
+
+
+@pytest.mark.parametrize(
+    "rtc_datetime",
+    [
+        datetime(1999, 12, 31, 23, 59, 59),
+        datetime.fromisoformat("2026-08-23T13:30:00+00:00"),
+    ],
+)
+def test_set_rtc_rejects_values_outside_its_wall_clock_contract(
+    rtc_datetime: datetime,
+) -> None:
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError):
+        controller.set_rtc_datetime(rtc_datetime)
+
+
 def test_hand_state_and_lcd_workflow_use_esp32_machine_readable_commands() -> None:
     esp32 = RecordingSerialController(
         {
@@ -275,6 +321,33 @@ def test_malformed_rtc_response_is_rejected(response: str) -> None:
         controller.get_rtc_datetime()
 
     assert connection.writes == [b"GET_RTC\n"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "ACK|SET_RTC|YYYY=2026|MM=13|DD=23|HH=13|MIN=30|SEC=00",
+        "ACK|SET_RTC|YYYY=2026|MM=02|DD=29|HH=13|MIN=30|SEC=00",
+        "ACK|SET_RTC|YYYY=2024|MM=02|DD=30|HH=13|MIN=30|SEC=00",
+        "ACK|SET_RTC|YYYY=2026|MM=08|DD=23|HH=24|MIN=30|SEC=00",
+        "ACK|SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=60|SEC=00",
+        "ACK|SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=60",
+        "ACK|SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30",
+    ],
+)
+def test_set_rtc_parser_rejects_invalid_or_malformed_confirmations(
+    response: str,
+) -> None:
+    with pytest.raises(ValueError):
+        RobotHardwareController.parse_rtc_set_response(response)
+
+
+def test_set_rtc_parser_accepts_a_valid_leap_day() -> None:
+    response = "ACK|SET_RTC|YYYY=2024|MM=02|DD=29|HH=23|MIN=59|SEC=59"
+
+    assert RobotHardwareController.parse_rtc_set_response(response) == datetime(
+        2024, 2, 29, 23, 59, 59
+    )
 
 
 def test_water_dispense_sends_one_bounded_duration_command() -> None:

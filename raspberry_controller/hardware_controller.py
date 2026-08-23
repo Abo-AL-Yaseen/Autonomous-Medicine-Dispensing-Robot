@@ -804,6 +804,41 @@ class RobotHardwareController:
         )
         return self.parse_rtc_response(response)
 
+    def set_rtc_datetime(self, rtc_datetime: datetime) -> datetime:
+        """Set the DS1302 wall clock and return the firmware-confirmed value."""
+
+        if not isinstance(rtc_datetime, datetime):
+            raise TypeError("rtc_datetime must be a datetime")
+        if rtc_datetime.tzinfo is not None:
+            raise ValueError("RTC datetime must be a timezone-naive wall-clock")
+        if not 2000 <= rtc_datetime.year <= 2099:
+            raise ValueError("RTC year must be between 2000 and 2099")
+
+        command = (
+            "SET_RTC"
+            f"|YYYY={rtc_datetime.year:04d}"
+            f"|MM={rtc_datetime.month:02d}"
+            f"|DD={rtc_datetime.day:02d}"
+            f"|HH={rtc_datetime.hour:02d}"
+            f"|MIN={rtc_datetime.minute:02d}"
+            f"|SEC={rtc_datetime.second:02d}"
+        )
+        response = self._request(
+            self.esp32,
+            command,
+            "VALID_RTC_SET_RESPONSE",
+            validator=self._is_valid_rtc_set_response,
+            response_prefix="ACK|SET_RTC|",
+        )
+        confirmed = self.parse_rtc_set_response(response)
+        if confirmed != rtc_datetime:
+            raise UnexpectedSerialResponse(
+                "RTC_SET_CONFIRMATION_MISMATCH"
+                f"|REQUESTED={rtc_datetime.isoformat(timespec='seconds')}"
+                f"|CONFIRMED={confirmed.isoformat(timespec='seconds')}"
+            )
+        return confirmed
+
     def dispense_water(self, duration_ms: int) -> dict[str, int]:
         """Run the ESP32 pump for one bounded, acknowledged duration."""
 
@@ -1023,9 +1058,25 @@ class RobotHardwareController:
             raise ValueError("invalid RTC date or time") from exc
 
     @classmethod
+    def parse_rtc_set_response(cls, response: str) -> datetime:
+        """Parse the exact ESP32 SET_RTC read-back acknowledgement."""
+
+        if not response.startswith("ACK|SET_RTC|"):
+            raise ValueError("invalid SET_RTC response structure")
+        return cls.parse_rtc_response(response.removeprefix("ACK|SET_"))
+
+    @classmethod
     def _is_valid_rtc_response(cls, response: str) -> bool:
         try:
             cls.parse_rtc_response(response)
+        except ValueError:
+            return False
+        return True
+
+    @classmethod
+    def _is_valid_rtc_set_response(cls, response: str) -> bool:
+        try:
+            cls.parse_rtc_set_response(response)
         except ValueError:
             return False
         return True

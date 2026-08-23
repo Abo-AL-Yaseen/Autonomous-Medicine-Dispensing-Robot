@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime
 
 import httpx
@@ -78,6 +79,9 @@ def build_scheduler(
     hardware: SafeSchedulerHardware,
     laravel: FakeLaravelClient,
     executor: MissionExecutor | None = None,
+    *,
+    auto_execution_enabled: bool = False,
+    start_ready_mission: Callable[[], dict[str, object]] | None = None,
 ) -> tuple[MissionScheduler, MissionExecutor]:
     executor = executor or MissionExecutor()
     scheduler = MissionScheduler(
@@ -86,6 +90,8 @@ def build_scheduler(
         laravel_client=laravel,
         executor=executor,
         timezone_name="Asia/Hebron",
+        auto_execution_enabled=auto_execution_enabled,
+        start_ready_mission=start_ready_mission,
     )
     return scheduler, executor
 
@@ -170,6 +176,135 @@ def test_repeated_ticks_while_executor_is_ready_never_claim_again() -> None:
     results = [scheduler.tick() for _ in range(3)]
 
     assert all(result.result is SchedulerResult.EXECUTOR_BUSY for result in results)
+    assert hardware.rtc_calls == 0
+    assert laravel.calls == []
+
+
+def test_auto_execution_starts_the_accepted_scheduled_mission_once() -> None:
+    hardware = SafeSchedulerHardware()
+    laravel = FakeLaravelClient()
+    mission = ClaimedMission(
+        8,
+        1,
+        2,
+        4,
+        room_number="204",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+    )
+    laravel.claimed_mission = mission
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        u_turn=lambda: u_turn_calls.append("u-turn") or "ACK|U_TURN_STARTED",
+        auto_execution_enabled=True,
+        require_home_readiness=True,
+    )
+    executor.set_home_readiness(True)
+    scheduler, _ = build_scheduler(
+        hardware,
+        laravel,
+        executor,
+        auto_execution_enabled=True,
+        start_ready_mission=lambda: executor.start_ready_mission().as_dict(),
+    )
+
+    started = scheduler.tick()
+    repeated = scheduler.tick()
+
+    assert started.result is SchedulerResult.AUTO_EXECUTION_STARTED
+    assert started.success is True
+    assert executor.state is MissionExecutionState.STARTING
+    assert repeated.result is SchedulerResult.EXECUTOR_BUSY
+    assert u_turn_calls == ["u-turn"]
+    assert hardware.rtc_calls == 1
+    assert len(laravel.calls) == 1
+
+
+def test_auto_execution_retries_ready_mission_until_home_is_ready() -> None:
+    hardware = SafeSchedulerHardware()
+    laravel = FakeLaravelClient()
+    laravel.claimed_mission = ClaimedMission(
+        8,
+        1,
+        2,
+        4,
+        room_number="204",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+    )
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        u_turn=lambda: u_turn_calls.append("u-turn") or "ACK|U_TURN_STARTED",
+        auto_execution_enabled=True,
+        require_home_readiness=True,
+    )
+    start_calls: list[int] = []
+
+    def start_ready_mission() -> dict[str, object]:
+        start_calls.append(executor.mission_id or -1)
+        return executor.start_ready_mission().as_dict()
+
+    scheduler, _ = build_scheduler(
+        hardware,
+        laravel,
+        executor,
+        auto_execution_enabled=True,
+        start_ready_mission=start_ready_mission,
+    )
+
+    first = scheduler.tick()
+    second = scheduler.tick()
+    executor.set_home_readiness(True)
+    third = scheduler.tick()
+    fourth = scheduler.tick()
+
+    assert first.result is SchedulerResult.READY_FOR_EXECUTION
+    assert second.result is SchedulerResult.READY_FOR_EXECUTION
+    assert executor.state is MissionExecutionState.STARTING
+    assert third.result is SchedulerResult.AUTO_EXECUTION_STARTED
+    assert fourth.result is SchedulerResult.EXECUTOR_BUSY
+    assert start_calls == [8, 8, 8]
+    assert u_turn_calls == ["u-turn"]
+    assert hardware.rtc_calls == 1
+    assert len(laravel.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "busy_state",
+    [
+        MissionExecutionState.STARTING,
+        MissionExecutionState.GOING_TO_ROOM,
+        MissionExecutionState.WAITING_FOR_HAND,
+        MissionExecutionState.DISPENSING,
+        MissionExecutionState.WATER_DISPENSING,
+        MissionExecutionState.WAITING_FOR_PICKUP,
+        MissionExecutionState.RETURNING_HOME,
+    ],
+)
+def test_busy_execution_states_never_claim_or_auto_start(
+    busy_state: MissionExecutionState,
+) -> None:
+    hardware = SafeSchedulerHardware()
+    laravel = FakeLaravelClient()
+    executor = MissionExecutor(auto_execution_enabled=True)
+    assert executor.accept(ClaimedMission(8, 1, 2, 4)) is True
+    with executor._lock:
+        executor._state = busy_state
+    start_calls: list[bool] = []
+    scheduler, _ = build_scheduler(
+        hardware,
+        laravel,
+        executor,
+        auto_execution_enabled=True,
+        start_ready_mission=lambda: start_calls.append(True) or {"success": True},
+    )
+
+    result = scheduler.tick()
+
+    assert result.result is SchedulerResult.EXECUTOR_BUSY
+    assert start_calls == []
     assert hardware.rtc_calls == 0
     assert laravel.calls == []
 
@@ -325,6 +460,18 @@ def test_scheduler_is_disabled_by_default(
     assert settings.interval_seconds == 5
     assert settings.laravel_api_url == "http://127.0.0.1:8000/api"
     assert settings.auto_execution_enabled is False
+
+
+def test_scheduler_and_auto_execution_can_be_enabled_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MISSION_SCHEDULER_ENABLED", "true")
+    monkeypatch.setenv("MISSION_AUTO_EXECUTION_ENABLED", "true")
+
+    settings = SchedulerSettings.from_environment()
+
+    assert settings.enabled is True
+    assert settings.auto_execution_enabled is True
 
 
 def test_disabled_loop_does_not_start_a_thread() -> None:

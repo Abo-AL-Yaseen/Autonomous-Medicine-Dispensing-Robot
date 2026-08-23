@@ -401,6 +401,7 @@ void stopLineFollowing();
 void setupRTC();
 void printRTC();
 void printRTCMachineReadable();
+void handleSetRTCCommand(const String& command);
 void setupLCD();
 void lcdShowStatus(String line1, String line2 = "", String line3 = "", String line4 = "");
 void showMedicineWorkflowStatus(const String& state);
@@ -2697,6 +2698,137 @@ void printRTCMachineReadable() {
   Serial.println(response);
 }
 
+static bool parseRTCDigits(
+  const String& command,
+  size_t start,
+  size_t width,
+  uint16_t& value
+) {
+  value = 0;
+  for (size_t index = start; index < start + width; index++) {
+    char character = command.charAt(index);
+    if (!isDigit(character)) {
+      return false;
+    }
+    value = (value * 10) + (character - '0');
+  }
+  return true;
+}
+
+static bool isRTCLeapYear(uint16_t year) {
+  return (year % 4 == 0) && ((year % 100 != 0) || (year % 400 == 0));
+}
+
+static uint8_t rtcDaysInMonth(uint16_t year, uint8_t month) {
+  static const uint8_t daysByMonth[] = {
+    31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+  };
+  if (month < 1 || month > 12) {
+    return 0;
+  }
+  if (month == 2 && isRTCLeapYear(year)) {
+    return 29;
+  }
+  return daysByMonth[month - 1];
+}
+
+void handleSetRTCCommand(const String& command) {
+  // Exact grammar:
+  // SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=00
+  if (
+    command.length() != 49 ||
+    !command.startsWith("SET_RTC|YYYY=") ||
+    command.substring(18, 21) != "MM=" ||
+    command.substring(24, 27) != "DD=" ||
+    command.substring(30, 33) != "HH=" ||
+    command.substring(36, 40) != "MIN=" ||
+    command.substring(43, 47) != "SEC=" ||
+    command.charAt(17) != '|' ||
+    command.charAt(23) != '|' ||
+    command.charAt(29) != '|' ||
+    command.charAt(35) != '|' ||
+    command.charAt(42) != '|'
+  ) {
+    Serial.println("ERROR|SET_RTC|INVALID_FORMAT");
+    return;
+  }
+
+  uint16_t year;
+  uint16_t month;
+  uint16_t day;
+  uint16_t hour;
+  uint16_t minute;
+  uint16_t second;
+  if (
+    !parseRTCDigits(command, 13, 4, year) ||
+    !parseRTCDigits(command, 21, 2, month) ||
+    !parseRTCDigits(command, 27, 2, day) ||
+    !parseRTCDigits(command, 33, 2, hour) ||
+    !parseRTCDigits(command, 40, 2, minute) ||
+    !parseRTCDigits(command, 47, 2, second)
+  ) {
+    Serial.println("ERROR|SET_RTC|INVALID_FORMAT");
+    return;
+  }
+
+  if (
+    year < 2000 || year > 2099 ||
+    month < 1 || month > 12 ||
+    day < 1 || day > rtcDaysInMonth(year, month) ||
+    hour > 23 || minute > 59 || second > 59
+  ) {
+    Serial.println("ERROR|SET_RTC|INVALID_DATETIME");
+    return;
+  }
+
+  if (rtc.GetIsWriteProtected()) {
+    rtc.SetIsWriteProtected(false);
+  }
+  if (rtc.GetIsWriteProtected()) {
+    Serial.println("ERROR|SET_RTC|WRITE_FAILED");
+    return;
+  }
+
+  RtcDateTime requested(year, month, day, hour, minute, second);
+  if (!requested.IsValid()) {
+    Serial.println("ERROR|SET_RTC|INVALID_DATETIME");
+    return;
+  }
+
+  rtc.SetDateTime(requested);
+  if (!rtc.GetIsRunning()) {
+    rtc.SetIsRunning(true);
+  }
+
+  RtcDateTime confirmed = rtc.GetDateTime();
+  if (
+    !confirmed.IsValid() ||
+    confirmed.Year() != year ||
+    confirmed.Month() != month ||
+    confirmed.Day() != day ||
+    confirmed.Hour() != hour ||
+    confirmed.Minute() != minute ||
+    confirmed.Second() != second
+  ) {
+    Serial.println("ERROR|SET_RTC|WRITE_FAILED");
+    return;
+  }
+
+  char response[72];
+  snprintf(
+    response,
+    sizeof(response),
+    "ACK|SET_RTC|YYYY=%04u|MM=%02u|DD=%02u|HH=%02u|MIN=%02u|SEC=%02u",
+    confirmed.Year(),
+    confirmed.Month(),
+    confirmed.Day(),
+    confirmed.Hour(),
+    confirmed.Minute(),
+    confirmed.Second()
+  );
+  Serial.println(response);
+}
+
 static void lcdPrintLine(uint8_t row, String text) {
   if (!lcdReady || row >= LCD_ROWS) return;
 
@@ -3678,6 +3810,8 @@ void handleTextCommand(const String& command) {
     Serial.println(state);
   } else if (normalizedCommand == "GET_RTC") {
     printRTCMachineReadable();
+  } else if (normalizedCommand.startsWith("SET_RTC")) {
+    handleSetRTCCommand(normalizedCommand);
   } else if (normalizedCommand.startsWith("MANUAL_")) {
     handleManualDriveCommand(normalizedCommand);
   } else if (normalizedCommand.startsWith("WATER_DISPENSE|MS=")) {

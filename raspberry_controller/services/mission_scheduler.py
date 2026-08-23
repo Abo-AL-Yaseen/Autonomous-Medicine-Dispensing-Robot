@@ -73,6 +73,8 @@ class SchedulerSettings:
 
 
 class SchedulerResult(str, Enum):
+    AUTO_EXECUTION_FAILED = "AUTO_EXECUTION_FAILED"
+    AUTO_EXECUTION_STARTED = "AUTO_EXECUTION_STARTED"
     EXECUTOR_ACCEPT_FAILED = "EXECUTOR_ACCEPT_FAILED"
     EXECUTOR_BUSY = "EXECUTOR_BUSY"
     HARDWARE_UNAVAILABLE = "HARDWARE_UNAVAILABLE"
@@ -111,20 +113,32 @@ class MissionScheduler:
         laravel_client: LaravelMissionClient,
         executor: MissionExecutor,
         timezone_name: str,
+        auto_execution_enabled: bool = False,
+        start_ready_mission: Callable[[], dict[str, object]] | None = None,
     ) -> None:
         self._hardware_available = hardware_available
         self._read_rtc = read_rtc
         self._laravel_client = laravel_client
         self._executor = executor
         self._timezone_name = timezone_name
+        self._auto_execution_enabled = auto_execution_enabled
+        self._start_ready_mission = start_ready_mission
         self._tick_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._last_tick_at: str | None = None
         self._last_result: SchedulerTickResult | None = None
         self._pending_acceptance: tuple[ClaimedMission, str] | None = None
+        self._scheduled_ready_mission_id: int | None = None
 
     def tick(self) -> SchedulerTickResult:
         with self._tick_lock:
+            if (
+                self._executor.state is MissionExecutionState.READY_FOR_EXECUTION
+                and self._auto_execution_enabled
+                and self._executor.mission_id == self._scheduled_ready_mission_id
+            ):
+                return self._start_scheduled_mission()
+
             # This is deliberately the first operational check. A scheduler
             # may only read the RTC or claim from Laravel while the executor
             # is IDLE. Using a negative IDLE check also protects future busy
@@ -255,12 +269,80 @@ class MissionScheduler:
             )
 
         self._pending_acceptance = None
+        self._scheduled_ready_mission_id = mission.id
+        if self._auto_execution_enabled:
+            return self._start_scheduled_mission(
+                robot_datetime_text=robot_datetime_text,
+            )
+
         return self._record(
             SchedulerTickResult(
                 result=SchedulerResult.READY_FOR_EXECUTION,
                 success=True,
                 mission_id=mission.id,
                 robot_datetime=robot_datetime_text,
+            )
+        )
+
+    def _start_scheduled_mission(
+        self,
+        *,
+        robot_datetime_text: str | None = None,
+    ) -> SchedulerTickResult:
+        mission_id = self._executor.mission_id
+        if self._start_ready_mission is None:
+            return self._record(
+                SchedulerTickResult(
+                    result=SchedulerResult.READY_FOR_EXECUTION,
+                    success=False,
+                    mission_id=mission_id,
+                    robot_datetime=robot_datetime_text,
+                    message="Automatic execution startup is not configured.",
+                )
+            )
+
+        try:
+            outcome = self._start_ready_mission()
+        except Exception as exc:
+            return self._record(
+                SchedulerTickResult(
+                    result=SchedulerResult.READY_FOR_EXECUTION,
+                    success=False,
+                    mission_id=mission_id,
+                    robot_datetime=robot_datetime_text,
+                    message=f"Automatic execution was deferred: {exc}",
+                )
+            )
+
+        if self._executor.state is MissionExecutionState.READY_FOR_EXECUTION:
+            message = outcome.get("message") or outcome.get("result")
+            return self._record(
+                SchedulerTickResult(
+                    result=SchedulerResult.READY_FOR_EXECUTION,
+                    success=False,
+                    mission_id=mission_id,
+                    robot_datetime=robot_datetime_text,
+                    message=str(message or "Automatic execution was deferred."),
+                )
+            )
+
+        self._scheduled_ready_mission_id = None
+        outcome_succeeded = bool(outcome.get("success"))
+        return self._record(
+            SchedulerTickResult(
+                result=(
+                    SchedulerResult.AUTO_EXECUTION_STARTED
+                    if outcome_succeeded
+                    else SchedulerResult.AUTO_EXECUTION_FAILED
+                ),
+                success=outcome_succeeded,
+                mission_id=mission_id,
+                robot_datetime=robot_datetime_text,
+                message=(
+                    str(outcome["message"])
+                    if outcome.get("message") is not None
+                    else None
+                ),
             )
         )
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import queue
 from collections.abc import Iterator
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -51,6 +51,7 @@ class FakeHardwareController:
         self.line_calls: list[str] = []
         self.navigation_calls: list[str] = []
         self.rtc_calls = 0
+        self.rtc_set_calls: list[datetime] = []
         self.water_calls: list[int] = []
         self.manual_pump_calls: list[str | int] = []
         self.water_level_calls = 0
@@ -137,6 +138,11 @@ class FakeHardwareController:
         self._raise_hardware_error()
         self.rtc_calls += 1
         return datetime(2026, 8, 9, 20, 30, 0)
+
+    def set_rtc_datetime(self, rtc_datetime: datetime) -> datetime:
+        self._raise_hardware_error()
+        self.rtc_set_calls.append(rtc_datetime)
+        return rtc_datetime
 
     def dispense_water(self, duration_ms: int) -> dict[str, int]:
         self._raise_hardware_error()
@@ -526,6 +532,7 @@ def client(
         controller_factory=fake_factory,
         laravel_client_factory=fake_laravel_factory,
         camera_factory=fake_camera_factory,
+        utc_now=lambda: datetime(2026, 8, 23, 10, 30, 0, tzinfo=timezone.utc),
     )
     with TestClient(application) as test_client:
         yield test_client
@@ -533,6 +540,29 @@ def client(
     assert fake_hardware.closed is True
     assert fake_laravel.closed is True
     assert fake_camera.closed is True
+
+
+@pytest.fixture
+def auto_client(
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+    fake_camera: FakeCameraService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[TestClient]:
+    monkeypatch.setenv("WATER_FLOW_ML_PER_SECOND", "50")
+    monkeypatch.setenv("ROBOT_TIMEZONE", "Asia/Hebron")
+    monkeypatch.setenv("MISSION_SCHEDULER_ENABLED", "false")
+    monkeypatch.setenv("MISSION_AUTO_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("NAVIGATION_AUTO_ENABLED", "false")
+    monkeypatch.setenv("CAMERA_ENABLED", "true")
+
+    application = create_app(
+        controller_factory=lambda _settings: fake_hardware,  # type: ignore[arg-type]
+        laravel_client_factory=lambda _settings: fake_laravel,  # type: ignore[arg-type]
+        camera_factory=lambda _settings: fake_camera,  # type: ignore[arg-type]
+    )
+    with TestClient(application) as test_client:
+        yield test_client
 
 
 def test_root_lists_api_information(client: TestClient) -> None:
@@ -547,6 +577,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/camera/stream" in body["endpoints"]
     assert "/dispense" in body["endpoints"]
     assert "/rtc" in body["endpoints"]
+    assert "/rtc/set" in body["endpoints"]
+    assert "/rtc/sync-system" in body["endpoints"]
     assert "/scheduler/status" in body["endpoints"]
     assert "/scheduler/tick" in body["endpoints"]
     assert "/executor/status" in body["endpoints"]
@@ -1018,6 +1050,115 @@ def test_rtc_returns_ds1302_datetime(client: TestClient) -> None:
     }
 
 
+def test_rtc_set_writes_and_returns_the_confirmed_ds1302_value(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.post(
+        "/rtc/set",
+        json={
+            "year": 2026,
+            "month": 8,
+            "day": 23,
+            "hour": 13,
+            "minute": 30,
+            "second": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "datetime": "2026-08-23T13:30:00",
+        "source": "DS1302",
+        "timezone": "Asia/Hebron",
+    }
+    assert fake_hardware.rtc_set_calls == [datetime(2026, 8, 23, 13, 30, 0)]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("month", 13),
+        ("day", 32),
+        ("hour", 24),
+        ("minute", 60),
+        ("second", 60),
+    ],
+)
+def test_rtc_set_rejects_out_of_range_fields(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    field: str,
+    value: int,
+) -> None:
+    payload = {
+        "year": 2026,
+        "month": 8,
+        "day": 23,
+        "hour": 13,
+        "minute": 30,
+        "second": 0,
+    }
+    payload[field] = value
+
+    assert client.post("/rtc/set", json=payload).status_code == 422
+    assert fake_hardware.rtc_set_calls == []
+
+
+@pytest.mark.parametrize(
+    "year,day,expected_status",
+    [(2024, 29, 200), (2026, 29, 422)],
+)
+def test_rtc_set_validates_leap_and_non_leap_dates(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    year: int,
+    day: int,
+    expected_status: int,
+) -> None:
+    response = client.post(
+        "/rtc/set",
+        json={
+            "year": year,
+            "month": 2,
+            "day": day,
+            "hour": 13,
+            "minute": 30,
+            "second": 0,
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert len(fake_hardware.rtc_set_calls) == (1 if expected_status == 200 else 0)
+
+
+def test_rtc_set_rejects_a_malformed_request(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.post("/rtc/set", json={"year": "2026"})
+
+    assert response.status_code == 422
+    assert fake_hardware.rtc_set_calls == []
+
+
+def test_rtc_sync_system_converts_utc_to_robot_wall_clock_before_writing(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.post("/rtc/sync-system")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "datetime": "2026-08-23T13:30:00",
+        "source": "DS1302",
+        "timezone": "Asia/Hebron",
+    }
+    assert fake_hardware.rtc_set_calls == [datetime(2026, 8, 23, 13, 30, 0)]
+
+
 def test_rtc_hardware_unavailable_is_safe(
     client: TestClient,
     fake_hardware: FakeHardwareController,
@@ -1109,6 +1250,72 @@ def test_manual_scheduler_tick_only_prepares_claimed_mission(
     assert fake_hardware.navigation_calls == []
     assert fake_hardware.dispense_calls == []
     assert fake_hardware.water_calls == []
+
+
+def test_auto_scheduler_tick_uses_existing_coordinator_startup(
+    auto_client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+) -> None:
+    mission = executable_mission()
+    fake_laravel.claimed_mission = mission
+
+    response = auto_client.post("/scheduler/tick")
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "AUTO_EXECUTION_STARTED"
+    assert response.json()["executor"]["state"] == "STARTING"
+    assert fake_hardware.navigation_calls == ["u-turn"]
+    assert fake_laravel.start_calls == []
+
+    auto_client.app.state.navigation_coordinator.process_serial_line(
+        "EVENT|U_TURN_COMPLETE|PATTERN=11011"
+    )
+
+    assert auto_client.app.state.mission_executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert fake_hardware.navigation_calls == ["u-turn"]
+    assert fake_hardware.line_calls[-1] == "start_line_follow"
+    assert fake_laravel.start_calls == [mission]
+
+
+def test_auto_scheduler_retries_home_without_reclaiming_or_duplicate_start(
+    auto_client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+    fake_camera: FakeCameraService,
+) -> None:
+    mission = executable_mission()
+    fake_laravel.claimed_mission = mission
+    fake_camera.detection = replace(fake_camera.detection, marker_id=0)
+
+    first = auto_client.post("/scheduler/tick")
+    second = auto_client.post("/scheduler/tick")
+
+    assert first.json()["result"] == "READY_FOR_EXECUTION"
+    assert second.json()["result"] == "READY_FOR_EXECUTION"
+    assert second.json()["executor"]["state"] == "READY_FOR_EXECUTION"
+    assert len(fake_laravel.calls) == 1
+    assert fake_hardware.rtc_calls == 1
+    assert fake_hardware.navigation_calls == []
+
+    fake_camera.detection = replace(fake_camera.detection, marker_id=10)
+    started = auto_client.post("/scheduler/tick")
+    repeated = auto_client.post("/scheduler/tick")
+
+    assert started.json()["result"] == "AUTO_EXECUTION_STARTED"
+    assert started.json()["executor"]["state"] == "STARTING"
+    assert repeated.json()["result"] == "EXECUTOR_BUSY"
+    assert fake_hardware.navigation_calls == ["u-turn"]
+    assert len(fake_laravel.calls) == 1
+    assert fake_laravel.start_calls == []
+
+    auto_client.app.state.navigation_coordinator.process_serial_line(
+        "EVENT|U_TURN_COMPLETE|PATTERN=11011"
+    )
+
+    assert auto_client.app.state.mission_executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert fake_hardware.navigation_calls == ["u-turn"]
+    assert fake_laravel.start_calls == [mission]
 
 
 def test_manual_scheduler_tick_does_not_claim_without_hardware(

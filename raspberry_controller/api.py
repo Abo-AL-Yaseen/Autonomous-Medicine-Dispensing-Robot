@@ -8,8 +8,9 @@ from math import ceil
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TypeVar
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -143,6 +144,29 @@ class NavigationDecisionPreviewRequest(BaseModel):
     marker_id: StrictInt = Field(ge=0)
 
 
+class RTCSetRequest(BaseModel):
+    """Strict DS1302 calendar and wall-clock fields."""
+
+    year: StrictInt = Field(ge=2000, le=2099)
+    month: StrictInt = Field(ge=1, le=12)
+    day: StrictInt = Field(ge=1, le=31)
+    hour: StrictInt = Field(ge=0, le=23)
+    minute: StrictInt = Field(ge=0, le=59)
+    second: StrictInt = Field(ge=0, le=59)
+
+    @model_validator(mode="after")
+    def validate_calendar_datetime(self) -> "RTCSetRequest":
+        datetime(
+            self.year,
+            self.month,
+            self.day,
+            self.hour,
+            self.minute,
+            self.second,
+        )
+        return self
+
+
 class WaterCalibrationError(ValueError):
     """Raised when no measured pump flow calibration is configured."""
 
@@ -222,6 +246,7 @@ def create_app(
     controller_factory: ControllerFactory = build_hardware_controller,
     laravel_client_factory: LaravelClientFactory = build_laravel_client,
     camera_factory: CameraFactory = build_camera_service,
+    utc_now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> FastAPI:
     """Create an API application, optionally with an injected test controller."""
 
@@ -350,18 +375,6 @@ def create_app(
             require_home_readiness=True,
         )
 
-        scheduler = MissionScheduler(
-            hardware_available=hardware_available,
-            read_rtc=read_rtc,
-            laravel_client=laravel_client,
-            executor=executor,
-            timezone_name=settings.robot_timezone,
-        )
-        scheduler_loop = MissionSchedulerLoop(
-            scheduler,
-            enabled=scheduler_settings.enabled,
-            interval_seconds=scheduler_settings.interval_seconds,
-        )
         navigation_coordinator = NavigationCoordinator(
             settings=navigation_settings,
             executor=executor,
@@ -383,6 +396,20 @@ def create_app(
             show_pickup_countdown=show_executor_pickup_countdown,
             load_navigation_map=laravel_client.get_navigation_map,
             home_line_position_is_valid=home_line_position_is_valid,
+        )
+        scheduler = MissionScheduler(
+            hardware_available=hardware_available,
+            read_rtc=read_rtc,
+            laravel_client=laravel_client,
+            executor=executor,
+            timezone_name=settings.robot_timezone,
+            auto_execution_enabled=scheduler_settings.auto_execution_enabled,
+            start_ready_mission=navigation_coordinator.begin_outbound_from_home,
+        )
+        scheduler_loop = MissionSchedulerLoop(
+            scheduler,
+            enabled=scheduler_settings.enabled,
+            interval_seconds=scheduler_settings.interval_seconds,
         )
         application.state.mission_executor = executor
         application.state.mission_scheduler = scheduler
@@ -454,6 +481,8 @@ def create_app(
                 "/ping",
                 "/status",
                 "/rtc",
+                "/rtc/set",
+                "/rtc/sync-system",
                 "/scheduler/status",
                 "/scheduler/tick",
                 "/executor/status",
@@ -563,6 +592,51 @@ def create_app(
         return {
             "success": True,
             "datetime": rtc_datetime.isoformat(timespec="seconds"),
+            "source": "DS1302",
+            "timezone": settings.robot_timezone,
+        }
+
+    @application.post("/rtc/set")
+    def rtc_set(payload: RTCSetRequest, request: Request) -> dict[str, object]:
+        requested = datetime(
+            payload.year,
+            payload.month,
+            payload.day,
+            payload.hour,
+            payload.minute,
+            payload.second,
+        )
+        confirmed = _run_hardware_operation(
+            request,
+            lambda controller: controller.set_rtc_datetime(requested),
+        )
+        settings: HardwareSettings = request.app.state.hardware_settings
+        return {
+            "success": True,
+            "datetime": confirmed.isoformat(timespec="seconds"),
+            "source": "DS1302",
+            "timezone": settings.robot_timezone,
+        }
+
+    @application.post("/rtc/sync-system")
+    def rtc_sync_system(request: Request) -> dict[str, object]:
+        settings: HardwareSettings = request.app.state.hardware_settings
+        system_datetime = utc_now()
+        if system_datetime.tzinfo is None:
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "SYSTEM_CLOCK_MUST_BE_TIMEZONE_AWARE"},
+            )
+        robot_datetime = system_datetime.astimezone(
+            ZoneInfo(settings.robot_timezone)
+        ).replace(tzinfo=None)
+        confirmed = _run_hardware_operation(
+            request,
+            lambda controller: controller.set_rtc_datetime(robot_datetime),
+        )
+        return {
+            "success": True,
+            "datetime": confirmed.isoformat(timespec="seconds"),
             "source": "DS1302",
             "timezone": settings.robot_timezone,
         }
