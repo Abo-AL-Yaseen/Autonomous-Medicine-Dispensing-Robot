@@ -1,5 +1,8 @@
 import { getMedicines } from "@/src/services/laravel/medicineService";
-import { startImmediateDelivery } from "@/src/services/deliveryService";
+import {
+  retryImmediateDeliveryStart,
+  startImmediateDelivery,
+} from "@/src/services/deliveryService";
 import { startRobotNavigation as startLaravelNavigation } from "@/src/services/laravel/navigationService";
 import { getLaravelRobotStatus } from "@/src/services/laravel/robotStatusService";
 import { getRooms } from "@/src/services/laravel/roomService";
@@ -31,6 +34,9 @@ export const startDelivery = async (payload: {
   room_id: number;
   items: { medicine_id: number; quantity: number }[];
 }) => startImmediateDelivery(payload);
+
+export const retryDeliveryStart = (missionId: number) =>
+  retryImmediateDeliveryStart(missionId);
 
 export const loadRooms = () => getRooms();
 export const loadMedicines = () => getMedicines();

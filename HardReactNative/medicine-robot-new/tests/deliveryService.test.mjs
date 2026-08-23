@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { runImmediateDeliveryFlow } from "../src/services/deliveryService.ts";
+import {
+  ImmediateDeliveryStartError,
+  retryImmediateDeliveryStart,
+  runImmediateDeliveryFlow,
+} from "../src/services/deliveryService.ts";
 
 const idleExecutor = {
   state: "IDLE",
@@ -96,6 +100,107 @@ test("immediate delivery creates, claims, and starts the same mission", async ()
     "claim",
     "start",
   ]);
+});
+
+test("immediate delivery accepts the existing U-turn-first executor startup", async () => {
+  let startCalls = 0;
+  const { dependencies } = buildDependencies({
+    start: async () => {
+      startCalls += 1;
+      return {
+        success: true,
+        result: "U_TURN_STARTED",
+        message: null,
+        executor: {
+          state: "STARTING",
+          mission_id: 42,
+          last_error: null,
+        },
+      };
+    },
+  });
+
+  const result = await runImmediateDeliveryFlow(
+    { room_id: 1, medicine_id: 2, quantity: 1 },
+    dependencies,
+  );
+
+  assert.equal(result.executor.executor.state, "STARTING");
+  assert.equal(startCalls, 1);
+});
+
+test("immediate delivery polls until only the newly created mission is ready", async () => {
+  let executorStatusCalls = 0;
+  let startCalls = 0;
+  const { dependencies } = buildDependencies({
+    getExecutorStatus: async () => {
+      executorStatusCalls += 1;
+      if (executorStatusCalls === 1) return idleExecutor;
+      return {
+        state: "READY_FOR_EXECUTION",
+        mission_id: 42,
+        last_error: null,
+      };
+    },
+    claim: async () => ({
+      success: true,
+      result: "NO_DUE_MISSION",
+      mission_id: null,
+      message: null,
+      executor: idleExecutor,
+    }),
+    start: async () => {
+      startCalls += 1;
+      return {
+        success: true,
+        result: "U_TURN_STARTED",
+        message: null,
+        executor: {
+          state: "STARTING",
+          mission_id: 42,
+          last_error: null,
+        },
+      };
+    },
+    wait: async () => {},
+  });
+
+  await runImmediateDeliveryFlow(
+    { room_id: 1, medicine_id: 2, quantity: 1 },
+    dependencies,
+  );
+
+  assert.equal(executorStatusCalls, 2);
+  assert.equal(startCalls, 1);
+});
+
+test("scheduler auto-start of the intended immediate mission is not started twice", async () => {
+  let startCalls = 0;
+  const { dependencies } = buildDependencies({
+    claim: async () => ({
+      success: true,
+      result: "AUTO_EXECUTION_STARTED",
+      mission_id: 42,
+      message: null,
+      executor: {
+        state: "STARTING",
+        mission_id: 42,
+        last_error: null,
+      },
+    }),
+    start: async () => {
+      startCalls += 1;
+      throw new Error("must not run");
+    },
+  });
+
+  const result = await runImmediateDeliveryFlow(
+    { room_id: 1, medicine_id: 2, quantity: 1 },
+    dependencies,
+  );
+
+  assert.equal(result.executor.result, "U_TURN_STARTED");
+  assert.equal(startCalls, 0);
 });
 
 test("immediate delivery preserves independently selected medicine items", async () => {
@@ -257,4 +362,70 @@ test("executor failure is returned instead of reporting the mission moving", asy
     ),
     /LINE_FOLLOW_START_FAILED: SERIAL_TIMEOUT: expected ACK/,
   );
+});
+
+test("HOME_NOT_CONFIRMED is clear and retryable without creating a mission", async () => {
+  let startCalls = 0;
+  const { dependencies } = buildDependencies({
+    start: async () => {
+      startCalls += 1;
+      throw new Error("HOME_NOT_CONFIRMED: HOME_NOT_CONFIRMED");
+    },
+  });
+
+  await assert.rejects(
+    runImmediateDeliveryFlow(
+      { room_id: 1, medicine_id: 2, quantity: 1 },
+      dependencies,
+    ),
+    (error) => {
+      assert.ok(error instanceof ImmediateDeliveryStartError);
+      assert.equal(error.message, "Robot is not correctly positioned at HOME.");
+      assert.equal(error.missionId, 42);
+      assert.equal(error.retryable, true);
+      return true;
+    },
+  );
+  assert.equal(startCalls, 1);
+
+  let retryStartCalls = 0;
+  const retried = await retryImmediateDeliveryStart(42, {
+    getExecutorStatus: async () => ({
+      state: "READY_FOR_EXECUTION",
+      mission_id: 42,
+      last_error: "HOME_NOT_CONFIRMED",
+    }),
+    start: async () => {
+      retryStartCalls += 1;
+      return {
+        success: true,
+        result: "U_TURN_STARTED",
+        message: null,
+        executor: {
+          state: "STARTING",
+          mission_id: 42,
+          last_error: null,
+        },
+      };
+    },
+  });
+
+  assert.equal(retried.executor.state, "STARTING");
+  assert.equal(retryStartCalls, 1);
+});
+
+test("scheduled delivery UI creates only the Laravel mission", () => {
+  const screen = readFileSync(
+    new URL("../src/screens/DeliveryScreen.tsx", import.meta.url),
+    "utf8",
+  );
+
+  const scheduledBranch = screen.slice(
+    screen.indexOf("if (scheduleForLater) {", screen.indexOf("const payload")),
+    screen.indexOf("const delivery = await startDelivery(payload);"),
+  );
+  assert.match(scheduledBranch, /await createMission/);
+  assert.doesNotMatch(scheduledBranch, /startDelivery|retryDeliveryStart/);
+  assert.match(screen, /pendingImmediateMissionId/);
+  assert.match(screen, /Retry Start/);
 });

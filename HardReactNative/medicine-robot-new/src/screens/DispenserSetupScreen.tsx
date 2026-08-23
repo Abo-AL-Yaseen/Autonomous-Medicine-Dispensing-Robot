@@ -3,12 +3,22 @@ import { Alert, Pressable, ScrollView, StyleSheet, View } from "react-native";
 import { useFocusEffect } from "@react-navigation/native";
 import { Text } from "react-native-paper";
 
+import { robotTimezone } from "@/src/config/api";
 import {
   getDispenserStatus,
   setDispenserSlotZero,
 } from "@/src/services/robot/dispenserCalibrationService";
+import { getRobotRtc } from "@/src/services/robot/executorService";
+import {
+  formatRobotClockTime,
+  syncAndRefreshRobotClock,
+} from "@/src/services/robot/robotClockService";
 import { theme } from "@/src/theme/theme";
-import { DispenserDiskStatus, DispenserStatus } from "@/src/types";
+import {
+  DispenserDiskStatus,
+  DispenserStatus,
+  RobotRtcResponse,
+} from "@/src/types";
 
 interface DiskCardProps {
   box: 1 | 2;
@@ -52,6 +62,12 @@ export default function DispenserSetupScreen() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [confirmingBox, setConfirmingBox] = useState<1 | 2 | null>(null);
+  const [robotClock, setRobotClock] = useState<RobotRtcResponse | null>(null);
+  const [clockLoading, setClockLoading] = useState(true);
+  const [clockSyncing, setClockSyncing] = useState(false);
+  const [clockError, setClockError] = useState<string | null>(null);
+  const [clockSuccess, setClockSuccess] = useState<string | null>(null);
+  const [retryClockSync, setRetryClockSync] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -70,10 +86,52 @@ export default function DispenserSetupScreen() {
     }
   }, []);
 
+  const refreshRobotClock = useCallback(async () => {
+    setClockLoading(true);
+    setClockError(null);
+    setClockSuccess(null);
+    setRetryClockSync(false);
+    try {
+      setRobotClock(await getRobotRtc());
+    } catch (refreshError) {
+      setRobotClock(null);
+      setClockError(
+        refreshError instanceof Error
+          ? refreshError.message
+          : "Unable to read the robot clock.",
+      );
+    } finally {
+      setClockLoading(false);
+    }
+  }, []);
+
+  const syncClock = useCallback(async () => {
+    setClockSyncing(true);
+    setClockError(null);
+    setClockSuccess(null);
+    setRetryClockSync(true);
+    try {
+      const confirmed = await syncAndRefreshRobotClock();
+      setRobotClock(confirmed);
+      setClockSuccess("Robot clock synchronized successfully.");
+      setRetryClockSync(false);
+    } catch (syncError) {
+      setClockError(
+        syncError instanceof Error
+          ? syncError.message
+          : "Robot clock hardware communication failed.",
+      );
+    } finally {
+      setClockSyncing(false);
+      setClockLoading(false);
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       void refresh();
-    }, [refresh]),
+      void refreshRobotClock();
+    }, [refresh, refreshRobotClock]),
   );
 
   const confirmSlotZero = async (box: 1 | 2) => {
@@ -97,11 +155,58 @@ export default function DispenserSetupScreen() {
   return (
     <View style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>Dispenser Setup</Text>
+        <Text style={styles.title}>Robot Setup</Text>
         <Text style={styles.warning}>
           Calibration is required after Arduino reset or power cycle. It does not move the motors.
         </Text>
         {loading ? <Text style={styles.loading}>Loading dispenser status…</Text> : null}
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Robot Clock</Text>
+          <Text style={styles.clockTime}>
+            {robotClock ? formatRobotClockTime(robotClock) : "--:--:--"}
+          </Text>
+          <Text style={styles.clockTimezone}>
+            Timezone: {robotClock?.timezone ?? robotTimezone}
+          </Text>
+          {clockLoading ? (
+            <Text style={styles.loading}>Loading robot clock...</Text>
+          ) : null}
+          {clockSuccess ? (
+            <Text style={styles.clockSuccess}>{clockSuccess}</Text>
+          ) : null}
+          {clockError ? (
+            <View style={styles.clockErrorBlock}>
+              <Text style={styles.errorText}>Robot clock unavailable</Text>
+              <Text style={styles.errorDetail}>{clockError}</Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Retry Robot Clock"
+                onPress={() =>
+                  void (retryClockSync ? syncClock() : refreshRobotClock())
+                }
+                style={styles.retry}
+              >
+                <Text style={styles.retryText}>Retry</Text>
+              </Pressable>
+            </View>
+          ) : null}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Sync Robot Clock"
+            disabled={clockSyncing || clockLoading}
+            onPress={() => void syncClock()}
+            style={({ pressed }) => [
+              styles.button,
+              styles.clockButton,
+              (clockSyncing || clockLoading) && styles.buttonDisabled,
+              pressed && !clockSyncing && !clockLoading && styles.buttonPressed,
+            ]}
+          >
+            <Text style={styles.buttonText}>
+              {clockSyncing ? "Synchronizing..." : "Sync Robot Clock"}
+            </Text>
+          </Pressable>
+        </View>
         {error ? (
           <View style={styles.errorCard}>
             <Text style={styles.errorText}>Robot dispenser service unavailable</Text>
@@ -130,6 +235,11 @@ const styles = StyleSheet.create({
   loading: { color: theme.colors.textSecondary, fontSize: 16 },
   card: { backgroundColor: theme.colors.card, borderRadius: 20, borderColor: theme.colors.border, borderWidth: 1, padding: 18, marginBottom: 16 },
   cardTitle: { color: theme.colors.textPrimary, fontSize: 21, fontWeight: "700" },
+  clockTime: { color: theme.colors.textPrimary, fontSize: 36, fontWeight: "700", letterSpacing: 1, marginTop: 12 },
+  clockTimezone: { color: theme.colors.textSecondary, fontSize: 14, marginTop: 4 },
+  clockButton: { marginTop: 16 },
+  clockSuccess: { color: theme.colors.success, fontWeight: "700", marginTop: 12 },
+  clockErrorBlock: { backgroundColor: "#FFF1F0", borderRadius: 14, padding: 12, marginTop: 12 },
   status: { fontSize: 16, fontWeight: "700", marginTop: 10 },
   calibrated: { color: theme.colors.success },
   notCalibrated: { color: theme.colors.emergency },

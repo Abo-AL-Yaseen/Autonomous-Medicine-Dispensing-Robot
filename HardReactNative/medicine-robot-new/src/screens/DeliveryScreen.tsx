@@ -23,7 +23,8 @@ import {
   buildRobotScheduleDateTime,
   missionExecutorStatusText,
 } from "@/src/services/apiAdapters";
-import { startDelivery } from "@/src/services/api";
+import { retryDeliveryStart, startDelivery } from "@/src/services/api";
+import { ImmediateDeliveryStartError } from "@/src/services/deliveryService";
 import { requiredDispenserBoxes } from "@/src/services/dispenserReadiness";
 import { getMedicines } from "@/src/services/laravel/medicineService";
 import { createMission } from "@/src/services/laravel/missionService";
@@ -59,6 +60,8 @@ export default function DeliveryScreen() {
   const [loadingRooms, setLoadingRooms] = useState(true);
   const [loadingMedicines, setLoadingMedicines] = useState(true);
   const [creatingMission, setCreatingMission] = useState(false);
+  const [pendingImmediateMissionId, setPendingImmediateMissionId] =
+    useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dispenserStatus, setDispenserStatus] = useState<DispenserStatus | null>(null);
   const [loadingDispenserStatus, setLoadingDispenserStatus] = useState(true);
@@ -227,6 +230,10 @@ export default function DeliveryScreen() {
     : null;
 
   const handleScheduleToggle = (enabled: boolean) => {
+    if (enabled && pendingImmediateMissionId !== null) {
+      setError("Retry the accepted immediate mission before scheduling another one.");
+      return;
+    }
     setScheduleForLater(enabled);
     setScheduleError(null);
   };
@@ -299,6 +306,46 @@ export default function DeliveryScreen() {
   const handleStartDelivery = async () => {
     if (submissionInProgress.current) return;
 
+    if (pendingImmediateMissionId !== null && !scheduleForLater) {
+      submissionInProgress.current = true;
+      try {
+        setCreatingMission(true);
+        setError(null);
+        const executor = await retryDeliveryStart(pendingImmediateMissionId);
+        if (
+          !executor.success ||
+          executor.executor.mission_id !== pendingImmediateMissionId ||
+          !["STARTING", "GOING_TO_ROOM"].includes(executor.executor.state)
+        ) {
+          throw new Error("FastAPI did not confirm that the mission is starting.");
+        }
+        setPendingImmediateMissionId(null);
+        setMissionState("Moving");
+        Alert.alert(
+          "Mission Started",
+          `Delivery to ${selectedRoomName} has started.`,
+        );
+      } catch (retryError) {
+        const message =
+          retryError instanceof Error
+            ? retryError.message
+            : "Unable to retry the accepted mission.";
+        if (
+          retryError instanceof ImmediateDeliveryStartError &&
+          !retryError.retryable
+        ) {
+          setPendingImmediateMissionId(null);
+        }
+        setError(message);
+        setMissionState("Waiting");
+        Alert.alert("Mission Not Started", message);
+      } finally {
+        submissionInProgress.current = false;
+        setCreatingMission(false);
+      }
+      return;
+    }
+
     const roomId = Number(selectedRoom);
     if (!roomId || selectedItems.length === 0) {
       setError(
@@ -368,17 +415,28 @@ export default function DeliveryScreen() {
       const delivery = await startDelivery(payload);
       if (
         delivery.executor.success !== true ||
-        delivery.executor.result !== "STARTED" ||
-        delivery.executor.executor.state !== "GOING_TO_ROOM"
+        delivery.executor.executor.mission_id !== delivery.mission.id ||
+        !["STARTING", "GOING_TO_ROOM"].includes(
+          delivery.executor.executor.state,
+        )
       ) {
-        throw new Error("FastAPI did not confirm that the mission started.");
+        throw new Error("FastAPI did not confirm that the mission is starting.");
       }
+      setPendingImmediateMissionId(null);
       setMissionState("Moving");
       Alert.alert(
         "Mission Started",
         `Delivery to ${selectedRoomName} has started.`,
       );
     } catch (e) {
+      if (
+        !scheduleForLater &&
+        e instanceof ImmediateDeliveryStartError &&
+        e.retryable &&
+        e.missionId !== null
+      ) {
+        setPendingImmediateMissionId(e.missionId);
+      }
       const message =
         e instanceof Error
           ? e.message
@@ -638,7 +696,13 @@ export default function DeliveryScreen() {
           ) : null}
 
           <PrimaryButton
-            label={scheduleForLater ? "Schedule Delivery" : "Start Delivery Now"}
+            label={
+              scheduleForLater
+                ? "Schedule Delivery"
+                : pendingImmediateMissionId !== null
+                  ? "Retry Start"
+                  : "Start Delivery Now"
+            }
             onPress={handleStartDelivery}
             disabled={
               creatingMission ||

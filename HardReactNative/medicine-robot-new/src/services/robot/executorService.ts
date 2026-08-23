@@ -1,4 +1,5 @@
 import {
+  getApiErrorCode,
   getApiErrorMessage,
   robotApi,
   unwrapAxiosData,
@@ -15,6 +16,18 @@ import {
   RobotRtcResponse,
   SchedulerTickResponse,
 } from "@/src/types";
+
+export const ROBOT_RTC_ENDPOINT = "/rtc";
+export const ROBOT_RTC_SYNC_ENDPOINT = "/rtc/sync-system";
+
+export const robotClockErrorMessage = (
+  code: string | null,
+  fallback: string,
+): string =>
+  code === "HARDWARE_UNAVAILABLE" ||
+  code === "HARDWARE_COMMUNICATION_FAILED"
+    ? "Robot clock hardware communication failed. Check the Raspberry and ESP32 connection."
+    : fallback;
 
 const outcomeErrorMessage = (error: unknown, fallback: string): string => {
   const message = getApiErrorMessage(error, fallback);
@@ -50,10 +63,30 @@ export const getMissionExecutorStatus =
 
 export const getRobotRtc = async (): Promise<RobotRtcResponse> => {
   try {
-    const response = await robotApi.get<unknown>("/rtc");
+    const response = await robotApi.get<unknown>(ROBOT_RTC_ENDPOINT);
     return normalizeRobotRtc(unwrapAxiosData(response));
   } catch (error) {
-    throw new Error(getApiErrorMessage(error, "Unable to read the robot RTC."));
+    throw new Error(
+      robotClockErrorMessage(
+        getApiErrorCode(error),
+        getApiErrorMessage(error, "Unable to read the robot RTC."),
+      ),
+    );
+  }
+};
+
+export const syncRobotRtc = async (): Promise<RobotRtcResponse> => {
+  try {
+    const response = await robotApi.post<unknown>(ROBOT_RTC_SYNC_ENDPOINT);
+    return normalizeRobotRtc(unwrapAxiosData(response));
+  } catch (error) {
+    const code = getApiErrorCode(error);
+    throw new Error(
+      robotClockErrorMessage(
+        code,
+        getApiErrorMessage(error, "Unable to synchronize the robot RTC."),
+      ),
+    );
   }
 };
 

@@ -4,7 +4,7 @@ export const laravelApiBaseUrl =
   process.env.EXPO_PUBLIC_LARAVEL_API_URL ?? "http://YOUR_PC_IP:8000/api";
 
 export const robotApiBaseUrl =
-  process.env.EXPO_PUBLIC_ROBOT_API_URL ?? "http://YOUR_PRIVATE_IP:8000";
+  process.env.EXPO_PUBLIC_ROBOT_API_URL ?? "http://ROBOT_API_NOT_CONFIGURED";
 
 export const robotTimezone =
   process.env.EXPO_PUBLIC_ROBOT_TIMEZONE ?? "Asia/Hebron";
