@@ -7,6 +7,7 @@ import {
   buildRobotScheduleDateTime,
   normalizeFastApiDispense,
   normalizeMissionExecutorStatus,
+  missionExecutorStatusText,
   normalizeExecutorStart,
   normalizeFastApiHealth,
   normalizeFastApiStatus,
@@ -154,6 +155,22 @@ test("accepts the automatic hand-wait executor state", () => {
 
   assert.equal(status.state, "WAITING_FOR_HAND");
   assert.equal(status.mission_id, 42);
+});
+
+test("accepts and labels the patient pickup executor countdown", () => {
+  const status = normalizeMissionExecutorStatus({
+    state: "WAITING_FOR_PICKUP",
+    mission_id: 42,
+    pickup_seconds_remaining: 30,
+    last_error: null,
+  });
+
+  assert.equal(status.state, "WAITING_FOR_PICKUP");
+  assert.equal(status.pickup_seconds_remaining, 30);
+  assert.equal(
+    missionExecutorStatusText(status),
+    "Waiting for patient pickup (30s)",
+  );
 });
 
 test("normalizes FastAPI health when hardware is disconnected", () => {

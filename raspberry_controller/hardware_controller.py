@@ -427,6 +427,7 @@ class RobotHardwareController:
         "HAND_WAITING",
         "HAND_DETECTED",
         "DISPENSING",
+        "WATER_DISPENSING",
         "MEDICINE_READY",
         "NO_HAND",
         "DISPENSE_FAILED",
@@ -771,6 +772,24 @@ class RobotHardwareController:
             f"LCD|STATE={state}",
             acknowledgement,
             response_prefix="ACK|LCD|STATE=",
+        )
+
+    def show_pickup_countdown(self, seconds_remaining: int) -> str:
+        """Render one bounded patient-pickup countdown update on the ESP32 LCD."""
+
+        if (
+            isinstance(seconds_remaining, bool)
+            or not isinstance(seconds_remaining, int)
+            or not 0 <= seconds_remaining <= 30
+        ):
+            raise ValueError("pickup countdown seconds must be between 0 and 30")
+        command = f"LCD|STATE=PICKUP_WAITING|SECONDS={seconds_remaining}"
+        acknowledgement = f"ACK|{command}"
+        return self._request(
+            self.esp32,
+            command,
+            acknowledgement,
+            response_prefix="ACK|LCD|STATE=PICKUP_WAITING|SECONDS=",
         )
 
     def get_rtc_datetime(self) -> datetime:

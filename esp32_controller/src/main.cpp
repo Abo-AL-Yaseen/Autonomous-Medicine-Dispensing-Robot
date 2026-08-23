@@ -2601,18 +2601,27 @@ static void printRTCDateTime(const RtcDateTime& dt) {
 
 void showMedicineWorkflowStatus(const String& state) {
   if (state == "HAND_WAITING") {
-    lcdShowStatus("Place hand below", "Waiting...");
+    lcdShowStatus("Take a cup", "Place under water", "Place hand below", "Waiting...");
   } else if (state == "HAND_DETECTED") {
     lcdShowStatus("Hand detected");
   } else if (state == "DISPENSING") {
-    lcdShowStatus("Dispensing...", "Please wait");
+    lcdShowStatus("Dispensing medicine", "Please wait");
+  } else if (state == "WATER_DISPENSING") {
+    lcdShowStatus("Dispensing water", "Please wait");
   } else if (state == "MEDICINE_READY") {
-    lcdShowStatus("Medicine ready");
+    lcdShowStatus("Medicine & water", "ready");
   } else if (state == "NO_HAND") {
     lcdShowStatus("No hand detected");
   } else if (state == "DISPENSE_FAILED") {
     lcdShowStatus("Dispense failed");
   }
+}
+
+void showPickupCountdown(unsigned int secondsRemaining) {
+  lcdShowStatus(
+    "Take med & water",
+    String("Returning in: ") + String(secondsRemaining)
+  );
 }
 
 void setupRTC() {
@@ -2819,7 +2828,7 @@ void runPumpForDuration(unsigned long durationMs) {
   stopAllOutputs();
   Serial.print("ACK|WATER|DURATION_MS=");
   Serial.println(durationMs);
-  lcdShowStatus("Water", "Dispensing");
+  lcdShowStatus("Dispensing water", "Please wait");
   pumpOn();
 
   bool completed = waitSafely(durationMs);
@@ -3630,12 +3639,33 @@ void handleTextCommand(const String& command) {
     printWaterLevel();
   } else if (normalizedCommand == "GET_HAND") {
     Serial.println(irStableDetected ? "HAND|DETECTED" : "HAND|WAITING");
+  } else if (normalizedCommand.startsWith("LCD|STATE=PICKUP_WAITING|SECONDS=")) {
+    String secondsText = normalizedCommand.substring(33);
+    if (secondsText.length() == 0) {
+      Serial.println("ERROR|INVALID_PICKUP_SECONDS");
+      return;
+    }
+    for (size_t i = 0; i < secondsText.length(); i++) {
+      if (!isDigit(secondsText.charAt(i))) {
+        Serial.println("ERROR|INVALID_PICKUP_SECONDS");
+        return;
+      }
+    }
+    unsigned long seconds = strtoul(secondsText.c_str(), nullptr, 10);
+    if (seconds > 30) {
+      Serial.println("ERROR|INVALID_PICKUP_SECONDS");
+      return;
+    }
+    showPickupCountdown((unsigned int)seconds);
+    Serial.print("ACK|LCD|STATE=PICKUP_WAITING|SECONDS=");
+    Serial.println(seconds);
   } else if (normalizedCommand.startsWith("LCD|STATE=")) {
     String state = normalizedCommand.substring(10);
     if (
       state != "HAND_WAITING" &&
       state != "HAND_DETECTED" &&
       state != "DISPENSING" &&
+      state != "WATER_DISPENSING" &&
       state != "MEDICINE_READY" &&
       state != "NO_HAND" &&
       state != "DISPENSE_FAILED"

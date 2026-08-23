@@ -129,6 +129,53 @@ def navigation_map_for_room_one() -> PhysicalNavigationMap:
     )
 
 
+def successful_dispense(box: int, quantity: int) -> dict[str, int]:
+    return {
+        "box_number": box,
+        "requested_pills": quantity,
+        "dispensed_pills": quantity,
+    }
+
+
+def complete_delivery_pickup(executor: MissionExecutor) -> None:
+    """Advance a room-arrived executor through the guarded zero countdown tick."""
+
+    assert executor.wait_for_hand_confirmation(1.0).success
+    assert executor.dispense_at_room().success
+    assert executor.dispense_water_at_room().success
+    assert executor.begin_pickup_wait()
+    assert executor.update_pickup_wait(0)
+    assert executor.complete_pickup_wait()
+
+
+def medicine_completed_executor(
+    *,
+    dispense_water,
+    get_water_level=None,
+    u_turn=lambda: "ACK|U_TURN_STARTED",
+) -> MissionExecutor:
+    dependencies = FakeExecutionDependencies()
+    executor = MissionExecutor(
+        hardware_available=lambda: dependencies.available,
+        start_line_follow=dependencies.start_line_follow,
+        stop_line_follow=dependencies.stop_line_follow,
+        u_turn=u_turn,
+        wait_for_hand=lambda _: True,
+        dispense_medicine=successful_dispense,
+        dispense_water=dispense_water,
+        get_water_level=get_water_level,
+        mark_mission_in_progress=dependencies.mark_in_progress,
+        load_navigation_map=navigation_map_for_room_one,
+        require_home_readiness=False,
+    )
+    assert executor.accept(valid_mission())
+    assert executor.start_ready_mission().success
+    executor.mark_arrived_at_room()
+    assert executor.wait_for_hand_confirmation(1.0).success
+    assert executor.dispense_at_room().success
+    return executor
+
+
 def test_accept_resolves_destination_from_laravel_map_without_hardware() -> None:
     dependencies = FakeExecutionDependencies()
     map_calls: list[str] = []
@@ -484,6 +531,7 @@ def test_multi_medicine_mission_dispenses_each_laravel_item_in_order() -> None:
             "requested_pills": quantity,
             "dispensed_pills": quantity,
         },
+        dispense_water=lambda duration: {"duration_ms": duration},
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
         require_home_readiness=False,
@@ -503,6 +551,10 @@ def test_multi_medicine_mission_dispenses_each_laravel_item_in_order() -> None:
 
     assert executor.dispense_at_room().success
     assert calls == [(1, 2), (2, 1)]
+    assert executor.dispense_water_at_room().success
+    assert executor.begin_pickup_wait()
+    assert executor.update_pickup_wait(0)
+    assert executor.complete_pickup_wait()
     assert executor.start_return_home().success
 
 
@@ -617,6 +669,76 @@ def test_calibrated_disks_allow_normal_multi_item_dispense() -> None:
     assert calls == [(1, 2), (2, 1)]
 
 
+def test_mission_water_is_exactly_4000_ms_and_runs_only_once_after_medicine() -> None:
+    water_calls: list[int] = []
+    executor = medicine_completed_executor(
+        dispense_water=lambda duration: water_calls.append(duration) or {
+            "duration_ms": duration
+        },
+        get_water_level=lambda: {"status": "OK"},
+    )
+
+    first = executor.dispense_water_at_room()
+    duplicate = executor.dispense_water_at_room()
+
+    assert first.success is True
+    assert duplicate.success is False
+    assert water_calls == [4000]
+    assert executor.state is MissionExecutionState.WATER_DISPENSE_COMPLETED
+
+
+def test_water_failure_preserves_error_and_prevents_pickup_countdown() -> None:
+    def fail_water(duration: int) -> dict[str, int]:
+        raise RuntimeError("PUMP_TIMEOUT")
+
+    executor = medicine_completed_executor(dispense_water=fail_water)
+
+    result = executor.dispense_water_at_room()
+
+    assert result.success is False
+    assert executor.state is MissionExecutionState.FAILED
+    assert executor.status()["last_error"] == "WATER_DISPENSE_FAILED: PUMP_TIMEOUT"
+    assert executor.begin_pickup_wait() is False
+    assert executor.start_return_home().success is False
+
+
+def test_empty_water_level_prevents_pump_and_pickup_wait() -> None:
+    water_calls: list[int] = []
+    executor = medicine_completed_executor(
+        dispense_water=lambda duration: water_calls.append(duration) or {
+            "duration_ms": duration
+        },
+        get_water_level=lambda: {"status": "EMPTY"},
+    )
+
+    result = executor.dispense_water_at_room()
+
+    assert result.success is False
+    assert water_calls == []
+    assert executor.status()["last_error"] == "WATER_DISPENSE_FAILED: WATER_EMPTY"
+    assert executor.begin_pickup_wait() is False
+
+
+def test_pickup_status_starts_at_30_and_return_requires_zero_tick() -> None:
+    u_turn_calls: list[str] = []
+    executor = medicine_completed_executor(
+        dispense_water=lambda duration: {"duration_ms": duration},
+        u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+    )
+    assert executor.dispense_water_at_room().success
+
+    assert executor.begin_pickup_wait() is True
+    assert executor.status()["state"] == "WAITING_FOR_PICKUP"
+    assert executor.status()["pickup_seconds_remaining"] == 30
+    assert executor.start_return_home().success is False
+    assert executor.update_pickup_wait(1)
+    assert executor.start_return_home().success is False
+    assert executor.update_pickup_wait(0)
+    assert executor.complete_pickup_wait()
+    assert executor.start_return_home().success is True
+    assert u_turn_calls == ["u_turn"]
+
+
 def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:
     dependencies = FakeExecutionDependencies()
     u_turn_calls: list[str] = []
@@ -625,6 +747,9 @@ def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:
         start_line_follow=dependencies.start_line_follow,
         stop_line_follow=dependencies.stop_line_follow,
         u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+        wait_for_hand=lambda _: True,
+        dispense_medicine=successful_dispense,
+        dispense_water=lambda duration: {"duration_ms": duration},
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
         require_home_readiness=False,
@@ -633,6 +758,7 @@ def test_return_home_starts_one_u_turn_and_retains_mission_context() -> None:
     assert executor.accept(mission) is True
     assert executor.start_ready_mission().success is True
     executor.mark_arrived_at_room()
+    complete_delivery_pickup(executor)
 
     first = executor.start_return_home()
     second = executor.start_return_home()
@@ -657,6 +783,9 @@ def test_return_home_invalid_state_and_hardware_failure_do_not_turn() -> None:
         start_line_follow=dependencies.start_line_follow,
         stop_line_follow=dependencies.stop_line_follow,
         u_turn=lambda: u_turn_calls.append("u_turn") or "ACK|U_TURN_STARTED",
+        wait_for_hand=lambda _: True,
+        dispense_medicine=successful_dispense,
+        dispense_water=lambda duration: {"duration_ms": duration},
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
         require_home_readiness=False,
@@ -668,11 +797,12 @@ def test_return_home_invalid_state_and_hardware_failure_do_not_turn() -> None:
     assert executor.accept(valid_mission()) is True
     assert executor.start_ready_mission().success is True
     executor.mark_arrived_at_room()
+    complete_delivery_pickup(executor)
     dependencies.available = False
     unavailable = executor.start_return_home()
 
     assert unavailable.result.value == "HARDWARE_UNAVAILABLE"
-    assert executor.state is MissionExecutionState.ARRIVED_AT_ROOM
+    assert executor.state is MissionExecutionState.WAITING_FOR_PICKUP
     assert u_turn_calls == []
 
 
@@ -684,6 +814,9 @@ def test_arrived_home_finalization_completes_and_clears_mission_context() -> Non
         start_line_follow=dependencies.start_line_follow,
         stop_line_follow=dependencies.stop_line_follow,
         u_turn=lambda: "ACK|U_TURN_STARTED",
+        wait_for_hand=lambda _: True,
+        dispense_medicine=successful_dispense,
+        dispense_water=lambda duration: {"duration_ms": duration},
         mark_mission_in_progress=dependencies.mark_in_progress,
         mark_mission_completed=completed_missions.append,
         load_navigation_map=navigation_map_for_room_one,
@@ -693,6 +826,7 @@ def test_arrived_home_finalization_completes_and_clears_mission_context() -> Non
     assert executor.accept(mission) is True
     assert executor.start_ready_mission().success is True
     executor.mark_arrived_at_room()
+    complete_delivery_pickup(executor)
     assert executor.start_return_home().success is True
     executor.mark_arrived_home()
 
@@ -708,8 +842,9 @@ def test_arrived_home_finalization_completes_and_clears_mission_context() -> Non
         "medicine_id": None,
         "dispenser_box": None,
         "quantity": None,
-            "last_error": None,
-            "auto_execution_enabled": False,
-            "home_ready": True,
-            "home_readiness_error": None,
-        }
+        "pickup_seconds_remaining": None,
+        "last_error": None,
+        "auto_execution_enabled": False,
+        "home_ready": True,
+        "home_readiness_error": None,
+    }

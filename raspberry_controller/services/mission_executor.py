@@ -21,6 +21,8 @@ from .navigation import (
 LINE_FOLLOW_STARTED_ACK = "ACK|LINE_FOLLOW_STARTED"
 LINE_FOLLOW_STOPPED_ACK = "ACK|LINE_FOLLOW_STOPPED"
 U_TURN_STARTED_ACK = "ACK|U_TURN_STARTED"
+MISSION_WATER_DISPENSE_MS = 4000
+MISSION_PICKUP_WAIT_SECONDS = 30
 
 
 class MissionExecutionState(str, Enum):
@@ -32,6 +34,9 @@ class MissionExecutionState(str, Enum):
     WAITING_FOR_HAND = "WAITING_FOR_HAND"
     DISPENSING = "DISPENSING"
     DISPENSE_COMPLETED = "DISPENSE_COMPLETED"
+    WATER_DISPENSING = "WATER_DISPENSING"
+    WATER_DISPENSE_COMPLETED = "WATER_DISPENSE_COMPLETED"
+    WAITING_FOR_PICKUP = "WAITING_FOR_PICKUP"
     RETURNING_HOME = "RETURNING_HOME"
     ARRIVED_HOME = "ARRIVED_HOME"
     FAILED = "FAILED"
@@ -62,6 +67,12 @@ class MissionDispenseResult(str, Enum):
     DISPENSE_COMPLETED = "DISPENSE_COMPLETED"
     DISPENSE_NOT_ALLOWED = "DISPENSE_NOT_ALLOWED"
     DISPENSE_FAILED = "DISPENSE_FAILED"
+
+
+class MissionWaterResult(str, Enum):
+    WATER_DISPENSE_COMPLETED = "WATER_DISPENSE_COMPLETED"
+    WATER_DISPENSE_NOT_ALLOWED = "WATER_DISPENSE_NOT_ALLOWED"
+    WATER_DISPENSE_FAILED = "WATER_DISPENSE_FAILED"
 
 
 class MissionHandResult(str, Enum):
@@ -118,6 +129,20 @@ class MissionDispenseOutcome:
 
 
 @dataclass(frozen=True)
+class MissionWaterOutcome:
+    result: MissionWaterResult
+    success: bool
+    message: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "success": self.success,
+            "result": self.result.value,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
 class MissionHandOutcome:
     result: MissionHandResult
     success: bool
@@ -143,6 +168,8 @@ class MissionExecutor:
         u_turn: Callable[[], str] | None = None,
         wait_for_hand: Callable[[float], bool] | None = None,
         dispense_medicine: Callable[[int, int], dict[str, int]] | None = None,
+        dispense_water: Callable[[int], dict[str, int]] | None = None,
+        get_water_level: Callable[[], dict[str, object]] | None = None,
         get_disk_status: Callable[[], dict[str, dict[str, bool | int]]] | None = None,
         mark_mission_in_progress: Callable[[ClaimedMission], None] | None = None,
         mark_mission_completed: Callable[[ClaimedMission], None] | None = None,
@@ -160,6 +187,8 @@ class MissionExecutor:
         self._u_turn = u_turn
         self._wait_for_hand = wait_for_hand
         self._dispense_medicine = dispense_medicine
+        self._dispense_water = dispense_water
+        self._get_water_level = get_water_level
         self._get_disk_status = get_disk_status
         self._mark_mission_in_progress = mark_mission_in_progress
         self._mark_mission_completed = mark_mission_completed
@@ -167,6 +196,7 @@ class MissionExecutor:
         self._route_planner: LaravelRoutePlanner | None = None
         self._destination_node: PhysicalNode | None = None
         self._hand_confirmed = False
+        self._pickup_seconds_remaining: int | None = None
         self._auto_execution_enabled = auto_execution_enabled
         self._require_home_readiness = require_home_readiness
         self._home_ready = not require_home_readiness
@@ -236,6 +266,7 @@ class MissionExecutor:
             self._destination_node = destination_node
             self._last_error = None
             self._hand_confirmed = False
+            self._pickup_seconds_remaining = None
             self._state = MissionExecutionState.READY_FOR_EXECUTION
             return True
 
@@ -353,13 +384,13 @@ class MissionExecutor:
         return MissionHandOutcome(MissionHandResult.HAND_CONFIRMED, True)
 
     def start_return_home(self) -> MissionReturnOutcome:
-        """Validate ARRIVED_AT_ROOM and start exactly one existing U-turn."""
+        """Start one existing U-turn only after the pickup countdown reaches zero."""
 
         with self._lock:
-            if self._state not in {
-                MissionExecutionState.ARRIVED_AT_ROOM,
-                MissionExecutionState.DISPENSE_COMPLETED,
-            }:
+            if (
+                self._state is not MissionExecutionState.WAITING_FOR_PICKUP
+                or self._pickup_seconds_remaining != 0
+            ):
                 return MissionReturnOutcome(
                     MissionReturnResult.RETURN_NOT_ALLOWED,
                     False,
@@ -390,10 +421,10 @@ class MissionExecutor:
             if self._u_turn is None:
                 raise RuntimeError("U-turn operation is not configured")
             with self._lock:
-                if self._state not in {
-                    MissionExecutionState.ARRIVED_AT_ROOM,
-                    MissionExecutionState.DISPENSE_COMPLETED,
-                }:
+                if (
+                    self._state is not MissionExecutionState.WAITING_FOR_PICKUP
+                    or self._pickup_seconds_remaining != 0
+                ):
                     return MissionReturnOutcome(
                         MissionReturnResult.RETURN_NOT_ALLOWED,
                         False,
@@ -502,6 +533,92 @@ class MissionExecutor:
             True,
         )
 
+    def dispense_water_at_room(self) -> MissionWaterOutcome:
+        """Run the fixed, mission-owned water dispense only after medicine."""
+
+        with self._lock:
+            if self._state is not MissionExecutionState.DISPENSE_COMPLETED:
+                return MissionWaterOutcome(
+                    MissionWaterResult.WATER_DISPENSE_NOT_ALLOWED,
+                    False,
+                    f"MissionExecutor is {self._state.value}.",
+                )
+            self._state = MissionExecutionState.WATER_DISPENSING
+            self._last_error = None
+
+        try:
+            if self._get_water_level is not None:
+                level = self._get_water_level()
+                level_status = level.get("status")
+                if level_status == "EMPTY":
+                    raise RuntimeError("WATER_EMPTY")
+                if level_status == "SENSOR_ERROR":
+                    raise RuntimeError("WATER_LEVEL_SENSOR_ERROR")
+                if level_status not in {"OK", "LOW"}:
+                    raise RuntimeError(
+                        f"WATER_LEVEL_INVALID_STATUS: {level_status!r}"
+                    )
+            if self._dispense_water is None:
+                raise RuntimeError("Water dispense operation is not configured")
+            result = self._dispense_water(MISSION_WATER_DISPENSE_MS)
+            if result.get("duration_ms") != MISSION_WATER_DISPENSE_MS:
+                raise RuntimeError(
+                    "Water dispense did not confirm the required 4000 ms duration"
+                )
+        except Exception as exc:
+            message = f"WATER_DISPENSE_FAILED: {exc}"
+            with self._lock:
+                self._state = MissionExecutionState.FAILED
+                self._last_error = message
+            return MissionWaterOutcome(
+                MissionWaterResult.WATER_DISPENSE_FAILED,
+                False,
+                message,
+            )
+
+        with self._lock:
+            self._state = MissionExecutionState.WATER_DISPENSE_COMPLETED
+            self._last_error = None
+        return MissionWaterOutcome(
+            MissionWaterResult.WATER_DISPENSE_COMPLETED,
+            True,
+        )
+
+    def begin_pickup_wait(self, seconds: int = MISSION_PICKUP_WAIT_SECONDS) -> bool:
+        """Expose the completed delivery while the patient picks it up."""
+
+        if seconds <= 0:
+            raise ValueError("pickup wait seconds must be positive")
+        with self._lock:
+            if self._state is not MissionExecutionState.WATER_DISPENSE_COMPLETED:
+                return False
+            self._state = MissionExecutionState.WAITING_FOR_PICKUP
+            self._pickup_seconds_remaining = seconds
+            self._last_error = None
+            return True
+
+    def update_pickup_wait(self, seconds_remaining: int) -> bool:
+        """Record one coordinator-owned countdown tick without dispatching motion."""
+
+        if seconds_remaining < 0:
+            raise ValueError("pickup countdown cannot be negative")
+        with self._lock:
+            if self._state is not MissionExecutionState.WAITING_FOR_PICKUP:
+                return False
+            self._pickup_seconds_remaining = seconds_remaining
+            return True
+
+    def complete_pickup_wait(self) -> bool:
+        """Confirm the zero tick while retaining the guarded pickup-wait state."""
+
+        with self._lock:
+            if (
+                self._state is not MissionExecutionState.WAITING_FOR_PICKUP
+                or self._pickup_seconds_remaining != 0
+            ):
+                return False
+            return True
+
     def mark_arrived_home(self) -> None:
         """Record return arrival while retaining mission diagnostic context."""
 
@@ -551,6 +668,7 @@ class MissionExecutor:
             self._mission = None
             self._route_planner = None
             self._destination_node = None
+            self._pickup_seconds_remaining = None
             self._last_error = None
             self._state = MissionExecutionState.IDLE
         return True
@@ -708,6 +826,7 @@ class MissionExecutor:
                 "medicine_id": mission.medicine_id if mission else None,
                 "dispenser_box": mission.dispenser_box if mission else None,
                 "quantity": mission.quantity if mission else None,
+                "pickup_seconds_remaining": self._pickup_seconds_remaining,
                 "last_error": self._last_error,
                 "auto_execution_enabled": self._auto_execution_enabled,
                 "home_ready": self._home_ready,

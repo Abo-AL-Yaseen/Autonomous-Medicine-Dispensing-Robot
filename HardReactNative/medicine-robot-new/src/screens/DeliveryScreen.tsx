@@ -19,13 +19,17 @@ import { RobotStatusCard } from "@/src/components/RobotStatusCard";
 import { RoomSelector } from "@/src/components/RoomSelector";
 import { useRobotStatus } from "@/src/hooks/useRobotStatus";
 import { robotTimezone } from "@/src/config/api";
-import { buildRobotScheduleDateTime } from "@/src/services/apiAdapters";
+import {
+  buildRobotScheduleDateTime,
+  missionExecutorStatusText,
+} from "@/src/services/apiAdapters";
 import { startDelivery } from "@/src/services/api";
 import { requiredDispenserBoxes } from "@/src/services/dispenserReadiness";
 import { getMedicines } from "@/src/services/laravel/medicineService";
 import { createMission } from "@/src/services/laravel/missionService";
 import { getRooms } from "@/src/services/laravel/roomService";
 import { getDispenserStatus } from "@/src/services/robot/dispenserCalibrationService";
+import { getMissionExecutorStatus } from "@/src/services/robot/executorService";
 import {
   createPickerWallClockSelection,
   formatApiScheduleSummary,
@@ -45,6 +49,7 @@ export default function DeliveryScreen() {
   const [selectedRoom, setSelectedRoom] = useState("0");
   const [selectedQuantities, setSelectedQuantities] = useState<Record<number, number>>({});
   const [missionState, setMissionState] = useState<MissionState>("Waiting");
+  const [executorStatusDetail, setExecutorStatusDetail] = useState<string | null>(null);
   const [scheduleForLater, setScheduleForLater] = useState(false);
   const [scheduledDate, setScheduledDate] =
     useState<PickerWallClockSelection | null>(null);
@@ -62,6 +67,38 @@ export default function DeliveryScreen() {
   const router = useRouter();
 
   const robotStatus = useRobotStatus();
+
+  useEffect(() => {
+    if (missionState === "Waiting") {
+      setExecutorStatusDetail(null);
+      return;
+    }
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const pollExecutor = async () => {
+      try {
+        const status = await getMissionExecutorStatus();
+        if (cancelled) return;
+        setExecutorStatusDetail(missionExecutorStatusText(status));
+        if (status.state === "WAITING_FOR_PICKUP") setMissionState("Delivering");
+        if (status.state === "RETURNING_HOME") setMissionState("Returning");
+        if (status.state === "ARRIVED_HOME") setMissionState("Completed");
+        if (status.state !== "IDLE" && status.state !== "FAILED") {
+          timer = setTimeout(pollExecutor, 1000);
+        }
+      } catch {
+        if (!cancelled) timer = setTimeout(pollExecutor, 3000);
+      }
+    };
+
+    void pollExecutor();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [missionState]);
 
   useEffect(() => {
     const loadOptions = async () => {
@@ -618,7 +655,7 @@ export default function DeliveryScreen() {
         </View>
 
         <View style={styles.bottomSpacer}>
-          <MissionStatusCard state={missionState} />
+          <MissionStatusCard state={missionState} detail={executorStatusDetail} />
         </View>
       </ScrollView>
     </View>

@@ -13,7 +13,10 @@ from raspberry_controller.services.camera import (
     FreshConfirmationSession,
     MarkerDetectionResult,
 )
-from raspberry_controller.services.laravel_api_client import ClaimedMission
+from raspberry_controller.services.laravel_api_client import (
+    ClaimedMission,
+    ClaimedMissionItem,
+)
 from raspberry_controller.services.mission_executor import (
     MissionExecutionState,
     MissionExecutor,
@@ -166,6 +169,7 @@ class HardwareRecorder:
         self.water: list[object] = []
         self.return_home: list[object] = []
         self.medicine_status: list[str] = []
+        self.pickup_countdowns: list[int] = []
         self.command_event = threading.Event()
         self.dispense_event = threading.Event()
         self.return_started_event = threading.Event()
@@ -193,9 +197,17 @@ class HardwareRecorder:
             "dispensed_pills": quantity,
         }
 
+    def dispense_water(self, duration_ms: int) -> dict[str, int]:
+        self.water.append(duration_ms)
+        return {"duration_ms": duration_ms}
+
     def show_medicine_workflow_status(self, state: str) -> str:
         self.medicine_status.append(state)
         return f"ACK|LCD|STATE={state}"
+
+    def show_pickup_countdown(self, seconds_remaining: int) -> str:
+        self.pickup_countdowns.append(seconds_remaining)
+        return f"ACK|LCD|STATE=PICKUP_WAITING|SECONDS={seconds_remaining}"
 
 
 def confirmed_marker(marker_id: int) -> MarkerDetectionResult:
@@ -218,6 +230,7 @@ def going_executor(
     u_turn: Callable[[], str] | None = None,
     wait_for_hand: Callable[[float], bool] | None = None,
     dispense_medicine: Callable[[int, int], dict[str, int]] | None = None,
+    dispense_water: Callable[[int], dict[str, int]] | None = None,
 ) -> MissionExecutor:
     executor = MissionExecutor(
         hardware_available=lambda: True,
@@ -226,6 +239,7 @@ def going_executor(
         u_turn=u_turn,
         wait_for_hand=wait_for_hand or (lambda timeout: True),
         dispense_medicine=dispense_medicine,
+        dispense_water=dispense_water or (lambda duration: {"duration_ms": duration}),
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=load_map,
         require_home_readiness=False,
@@ -244,8 +258,15 @@ def arrived_executor(
         room_id,
         u_turn=hardware.u_turn,
         dispense_medicine=hardware.dispense_medicine,
+        dispense_water=hardware.dispense_water,
     )
     executor.mark_arrived_at_room()
+    assert executor.wait_for_hand_confirmation(1.0).success
+    assert executor.dispense_at_room().success
+    assert executor.dispense_water_at_room().success
+    assert executor.begin_pickup_wait()
+    assert executor.update_pickup_wait(0)
+    assert executor.complete_pickup_wait()
     return executor
 
 
@@ -257,11 +278,14 @@ def coordinator(
     enabled: bool = True,
     arrived_home_observation_seconds: float = 1.0,
     home_line_position_is_valid: Callable[[], bool] = lambda: True,
+    pickup_wait_seconds: int = 30,
+    wait_for_pickup_tick: Callable[[float], bool] = lambda _: False,
 ) -> NavigationCoordinator:
     return NavigationCoordinator(
         settings=NavigationCoordinatorSettings(
             enabled=enabled,
             arrived_home_observation_seconds=arrived_home_observation_seconds,
+            pickup_wait_seconds=pickup_wait_seconds,
         ),
         executor=executor,
         camera_service=camera,  # type: ignore[arg-type]
@@ -271,6 +295,8 @@ def coordinator(
         intersection_straight=lambda: hardware.command("STRAIGHT"),
         stop_line_follow=hardware.stop_line_follow,
         show_medicine_workflow_status=hardware.show_medicine_workflow_status,
+        show_pickup_countdown=hardware.show_pickup_countdown,
+        wait_for_pickup_tick=wait_for_pickup_tick,
         load_navigation_map=approved_navigation_map,
         home_line_position_is_valid=home_line_position_is_valid,
     )
@@ -673,6 +699,7 @@ def test_expected_room_marker_is_used_for_arrival_after_previous_decision() -> N
         1,
         u_turn=hardware.u_turn,
         dispense_medicine=hardware.dispense_medicine,
+        dispense_water=hardware.dispense_water,
     )
     camera = FakeCamera(confirmed_marker(0), confirmed_marker(11))
     service = coordinator(executor, camera, hardware)
@@ -799,6 +826,7 @@ def test_arrived_automatically_dispenses_and_retains_mission() -> None:
         1,
         u_turn=hardware.u_turn,
         dispense_medicine=hardware.dispense_medicine,
+        dispense_water=hardware.dispense_water,
     )
     mission_id = executor.mission_id
     service = coordinator(
@@ -814,7 +842,8 @@ def test_arrived_automatically_dispenses_and_retains_mission() -> None:
     assert hardware.navigation == ["U_TURN"]
     assert hardware.line == ["stop"]
     assert hardware.dispense == [(1, 1)]
-    assert hardware.water == []
+    assert hardware.water == [4000]
+    assert hardware.pickup_countdowns == list(range(30, -1, -1))
     assert hardware.return_home == []
     assert executor.state is MissionExecutionState.RETURNING_HOME
     assert executor.mission_id == mission_id
@@ -839,6 +868,7 @@ def test_room_arrival_exposes_dispensing_while_uno_is_busy() -> None:
         1,
         u_turn=hardware.u_turn,
         dispense_medicine=blocking_dispense,
+        dispense_water=hardware.dispense_water,
     )
     service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
 
@@ -860,6 +890,7 @@ def test_duplicate_room_arrival_never_dispenses_or_turns_twice() -> None:
         1,
         u_turn=hardware.u_turn,
         dispense_medicine=hardware.dispense_medicine,
+        dispense_water=hardware.dispense_water,
     )
     service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
 
@@ -881,6 +912,7 @@ def test_dispense_quantity_two_must_complete_two_before_return() -> None:
         u_turn=hardware.u_turn,
         wait_for_hand=lambda timeout: True,
         dispense_medicine=hardware.dispense_medicine,
+        dispense_water=hardware.dispense_water,
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=approved_navigation_map,
         require_home_readiness=False,
@@ -948,6 +980,7 @@ def test_room_one_full_automatic_arrival_dispense_return_home_chain() -> None:
         1,
         u_turn=hardware.u_turn,
         dispense_medicine=hardware.dispense_medicine,
+        dispense_water=hardware.dispense_water,
     )
     mission_id = executor.mission_id
     camera = FakeCamera(
@@ -972,7 +1005,7 @@ def test_room_one_full_automatic_arrival_dispense_return_home_chain() -> None:
     assert hardware.dispense == [(1, 1)]
     assert hardware.navigation == ["U_TURN", "STRAIGHT"]
     assert hardware.line == ["stop", "stop"]
-    assert hardware.water == []
+    assert hardware.water == [4000]
     assert service.status()["state"] == "ARRIVED_HOME"
 
 
@@ -1091,8 +1124,8 @@ def test_marker_zero_continues_to_home_and_only_home_marks_arrived() -> None:
 
     assert hardware.navigation == ["U_TURN", "STRAIGHT"]
     assert hardware.line == []
-    assert hardware.dispense == []
-    assert hardware.water == []
+    assert hardware.dispense == [(1, 1)]
+    assert hardware.water == [4000]
     assert executor.state is MissionExecutionState.RETURNING_HOME
     assert executor.mission_id == mission_id
     assert service.status()["state"] == "COMMAND_SENT"
@@ -1126,6 +1159,7 @@ def test_arrival_waits_for_hand_before_exactly_one_dispense_and_return() -> None
         u_turn=hardware.u_turn,
         wait_for_hand=wait_for_hand,
         dispense_medicine=hardware.dispense_medicine,
+        dispense_water=hardware.dispense_water,
     )
     service = coordinator(executor, FakeCamera(confirmed_marker(11)), hardware)
 
@@ -1148,8 +1182,82 @@ def test_arrival_waits_for_hand_before_exactly_one_dispense_and_return() -> None
         "HAND_WAITING",
         "HAND_DETECTED",
         "DISPENSING",
+        "WATER_DISPENSING",
         "MEDICINE_READY",
     ]
+
+
+def test_medicine_water_pickup_countdown_order_and_stationary_wait() -> None:
+    hardware = HardwareRecorder()
+    events: list[object] = []
+    stationary_snapshots: list[tuple[str, list[str]]] = []
+
+    def dispense_medicine(box: int, quantity: int) -> dict[str, int]:
+        events.append(("medicine", box, quantity))
+        return {
+            "box_number": box,
+            "requested_pills": quantity,
+            "dispensed_pills": quantity,
+        }
+
+    def dispense_water(duration_ms: int) -> dict[str, int]:
+        events.append(("water", duration_ms))
+        return {"duration_ms": duration_ms}
+
+    mission = ClaimedMission(
+        777,
+        1,
+        99,
+        2,
+        room_number="1",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-10T09:00:00+00:00",
+        mission_items=(
+            ClaimedMissionItem(99, 2, 1),
+            ClaimedMissionItem(42, 1, 2),
+        ),
+    )
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=lambda: "ACK|LINE_FOLLOW_STARTED",
+        stop_line_follow=lambda: "ACK|LINE_FOLLOW_STOPPED",
+        u_turn=hardware.u_turn,
+        wait_for_hand=lambda _: True,
+        dispense_medicine=dispense_medicine,
+        dispense_water=dispense_water,
+        mark_mission_in_progress=lambda _: None,
+        load_navigation_map=approved_navigation_map,
+        require_home_readiness=False,
+    )
+    assert executor.accept(mission)
+    assert executor.start_ready_mission().success
+    executor.mark_arrived_at_room()
+
+    def pickup_tick(seconds: float) -> bool:
+        assert seconds == 1.0
+        stationary_snapshots.append((executor.state.value, list(hardware.navigation)))
+        return False
+
+    service = coordinator(
+        executor,
+        FakeCamera(),
+        hardware,
+        wait_for_pickup_tick=pickup_tick,
+    )
+
+    service._run_post_arrival_workflow()
+
+    assert events == [
+        ("medicine", 1, 2),
+        ("medicine", 2, 1),
+        ("water", 4000),
+    ]
+    assert hardware.pickup_countdowns == list(range(30, -1, -1))
+    assert len(stationary_snapshots) == 30
+    assert all(state == "WAITING_FOR_PICKUP" for state, _ in stationary_snapshots)
+    assert all(commands == [] for _, commands in stationary_snapshots)
+    assert hardware.navigation == ["U_TURN"]
+    assert executor.state is MissionExecutionState.RETURNING_HOME
 
 
 def test_hand_timeout_sends_no_dispense_and_does_not_return_home() -> None:
@@ -1272,8 +1380,8 @@ def test_second_mission_starts_cleanly_after_arrived_home_cleanup() -> None:
     assert executor.state is MissionExecutionState.GOING_TO_ROOM
     assert hardware.navigation == ["U_TURN", "STRAIGHT", "LEFT"]
     assert hardware.line == ["stop"]
-    assert hardware.dispense == []
-    assert hardware.water == []
+    assert hardware.dispense == [(1, 1)]
+    assert hardware.water == [4000]
 
 
 def test_disabled_preview_never_moves_or_changes_executor_state() -> None:

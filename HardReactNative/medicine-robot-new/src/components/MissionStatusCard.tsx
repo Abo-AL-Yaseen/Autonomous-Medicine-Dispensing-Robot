@@ -7,6 +7,7 @@ import { MissionState } from "@/src/types";
 
 interface MissionStatusCardProps {
   state: MissionState;
+  detail?: string | null;
 }
 
 const stateColors: Record<MissionState, string> = {
@@ -25,7 +26,7 @@ const stateTextColors: Record<MissionState, string> = {
   Completed: "#1B7A39",
 };
 
-export function MissionStatusCard({ state }: MissionStatusCardProps) {
+export function MissionStatusCard({ state, detail }: MissionStatusCardProps) {
   return (
     <View style={styles.card}>
       <Text style={styles.label}>Mission Status</Text>
@@ -34,6 +35,7 @@ export function MissionStatusCard({ state }: MissionStatusCardProps) {
           {state}
         </Text>
       </View>
+      {detail ? <Text style={styles.detail}>{detail}</Text> : null}
     </View>
   );
 }
@@ -63,5 +65,10 @@ const styles = StyleSheet.create({
   badgeText: {
     fontSize: 16,
     fontWeight: "700",
+  },
+  detail: {
+    color: theme.colors.textSecondary,
+    fontSize: 14,
+    marginTop: 12,
   },
 });

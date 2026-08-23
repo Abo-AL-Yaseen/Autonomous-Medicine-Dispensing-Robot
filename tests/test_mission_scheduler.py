@@ -194,11 +194,12 @@ def test_idle_executor_may_claim_a_due_mission() -> None:
         "medicine_id": 2,
         "dispenser_box": None,
         "quantity": 4,
-            "last_error": None,
-            "auto_execution_enabled": False,
-            "home_ready": False,
-            "home_readiness_error": "HOME_NOT_CONFIRMED",
-        }
+        "pickup_seconds_remaining": None,
+        "last_error": None,
+        "auto_execution_enabled": False,
+        "home_ready": False,
+        "home_readiness_error": "HOME_NOT_CONFIRMED",
+    }
 
 
 def test_due_mission_may_be_claimed_after_arrived_home_cleanup() -> None:

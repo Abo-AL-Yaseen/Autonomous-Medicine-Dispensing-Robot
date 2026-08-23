@@ -10,6 +10,7 @@ from enum import Enum
 
 from ..camera import ArucoCameraService, FreshConfirmationSession
 from ..mission_executor import (
+    MISSION_PICKUP_WAIT_SECONDS,
     MissionExecutionState,
     MissionExecutor,
     MissionRouteUnavailableError,
@@ -34,6 +35,7 @@ class NavigationCoordinatorSettings:
     enabled: bool = False
     arrived_home_observation_seconds: float = 1.0
     hand_wait_timeout_seconds: float = 30.0
+    pickup_wait_seconds: int = MISSION_PICKUP_WAIT_SECONDS
 
     @classmethod
     def from_environment(cls) -> "NavigationCoordinatorSettings":
@@ -79,6 +81,8 @@ class NavigationCoordinatorState(str, Enum):
     ARRIVED_AT_ROOM = "ARRIVED_AT_ROOM"
     WAITING_FOR_HAND = "WAITING_FOR_HAND"
     DISPENSING = "DISPENSING"
+    WATER_DISPENSING = "WATER_DISPENSING"
+    WAITING_FOR_PICKUP = "WAITING_FOR_PICKUP"
     RETURNING_HOME = "RETURNING_HOME"
     ARRIVED_HOME = "ARRIVED_HOME"
     ERROR = "ERROR"
@@ -99,6 +103,8 @@ class NavigationCoordinator:
         intersection_straight: Callable[[], str],
         stop_line_follow: Callable[[], str],
         show_medicine_workflow_status: Callable[[str], str] | None = None,
+        show_pickup_countdown: Callable[[int], str] | None = None,
+        wait_for_pickup_tick: Callable[[float], bool] | None = None,
         load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
         home_line_position_is_valid: Callable[[], bool] | None = None,
     ) -> None:
@@ -118,12 +124,14 @@ class NavigationCoordinator:
         self._show_medicine_workflow_status = (
             show_medicine_workflow_status or (lambda state: "")
         )
+        self._show_pickup_countdown = show_pickup_countdown or (lambda seconds: "")
         self._load_navigation_map = load_navigation_map
         self._home_line_position_is_valid = home_line_position_is_valid
         self._lock = threading.Lock()
         self._processing_lock = threading.Lock()
         self._post_arrival_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._wait_for_pickup_tick = wait_for_pickup_tick or self._stop_event.wait
         self._thread: threading.Thread | None = None
         self._post_arrival_thread: threading.Thread | None = None
         self._post_arrival_mission_id: int | None = None
@@ -410,10 +418,11 @@ class NavigationCoordinator:
         """Start one validated room U-turn and prepare return marker tracking."""
 
         with self._processing_lock:
-            if self._executor.state not in {
-                MissionExecutionState.ARRIVED_AT_ROOM,
-                MissionExecutionState.DISPENSE_COMPLETED,
-            }:
+            executor_status = self._executor.status()
+            if (
+                self._executor.state is not MissionExecutionState.WAITING_FOR_PICKUP
+                or executor_status["pickup_seconds_remaining"] != 0
+            ):
                 return {
                     "success": False,
                     "result": "RETURN_NOT_ALLOWED",
@@ -877,7 +886,7 @@ class NavigationCoordinator:
             self._post_arrival_thread.start()
 
     def _run_post_arrival_workflow(self) -> None:
-        """Wait for a hand, dispense once, then start the validated return."""
+        """Run the one guarded hand, medicine, water, pickup, return workflow."""
 
         with self._lock:
             self._state = NavigationCoordinatorState.WAITING_FOR_HAND
@@ -919,9 +928,48 @@ class NavigationCoordinator:
             return
 
         try:
+            self._show_medicine_workflow_status("WATER_DISPENSING")
+        except Exception:
+            self._record_error("LCD_STATUS_FAILED")
+            return
+
+        with self._lock:
+            self._state = NavigationCoordinatorState.WATER_DISPENSING
+        water = self._executor.dispense_water_at_room()
+        if not water.success:
+            try:
+                self._show_medicine_workflow_status("DISPENSE_FAILED")
+            except Exception:
+                pass
+            self._record_error(water.result.value)
+            return
+
+        try:
             self._show_medicine_workflow_status("MEDICINE_READY")
         except Exception:
             self._record_error("LCD_STATUS_FAILED")
+            return
+
+        if not self._executor.begin_pickup_wait(self._settings.pickup_wait_seconds):
+            self._record_error("PICKUP_WAIT_NOT_ALLOWED")
+            return
+        with self._lock:
+            self._state = NavigationCoordinatorState.WAITING_FOR_PICKUP
+
+        for seconds_remaining in range(self._settings.pickup_wait_seconds, -1, -1):
+            if not self._executor.update_pickup_wait(seconds_remaining):
+                self._record_error("PICKUP_WAIT_NOT_ALLOWED")
+                return
+            try:
+                self._show_pickup_countdown(seconds_remaining)
+            except Exception:
+                self._record_error("LCD_STATUS_FAILED")
+                return
+            if seconds_remaining > 0 and self._wait_for_pickup_tick(1.0):
+                return
+
+        if not self._executor.complete_pickup_wait():
+            self._record_error("PICKUP_WAIT_NOT_ALLOWED")
             return
 
         returned = self.begin_return_home()

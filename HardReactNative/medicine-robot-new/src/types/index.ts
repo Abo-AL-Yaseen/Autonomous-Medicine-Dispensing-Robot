@@ -108,12 +108,20 @@ export type MissionExecutorState =
   | "GOING_TO_ROOM"
   | "ARRIVED_AT_ROOM"
   | "WAITING_FOR_HAND"
+  | "DISPENSING"
+  | "DISPENSE_COMPLETED"
+  | "WATER_DISPENSING"
+  | "WATER_DISPENSE_COMPLETED"
+  | "WAITING_FOR_PICKUP"
+  | "RETURNING_HOME"
+  | "ARRIVED_HOME"
   | "FAILED";
 
 export interface MissionExecutorStatus {
   state: MissionExecutorState;
   mission_id: number | null;
   last_error: string | null;
+  pickup_seconds_remaining?: number | null;
 }
 
 export interface RobotRtcResponse {

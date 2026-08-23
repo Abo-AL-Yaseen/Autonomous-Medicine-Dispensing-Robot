@@ -304,6 +304,18 @@ def create_app(
             with hardware_lock:
                 return controller.get_disk_status()
 
+        def dispense_executor_water(duration_ms: int) -> dict[str, int]:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.dispense_water(duration_ms)
+
+        def get_executor_water_level() -> dict[str, object]:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.get_water_level()
+
         def wait_for_executor_hand(timeout_seconds: float) -> bool:
             if not application.state.hardware_connected:
                 raise HardwareControllerError("robot hardware is disconnected")
@@ -315,6 +327,12 @@ def create_app(
             with hardware_lock:
                 return controller.show_medicine_workflow_status(state)
 
+        def show_executor_pickup_countdown(seconds_remaining: int) -> str:
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                return controller.show_pickup_countdown(seconds_remaining)
+
         executor = MissionExecutor(
             hardware_available=hardware_available,
             start_line_follow=start_executor_line_follow,
@@ -322,6 +340,8 @@ def create_app(
             u_turn=lambda: run_navigation_hardware(controller.u_turn),
             wait_for_hand=wait_for_executor_hand,
             dispense_medicine=dispense_executor_medicine,
+            dispense_water=dispense_executor_water,
+            get_water_level=get_executor_water_level,
             get_disk_status=get_executor_disk_status,
             mark_mission_in_progress=laravel_client.start_claimed_mission,
             mark_mission_completed=laravel_client.complete_claimed_mission,
@@ -360,6 +380,7 @@ def create_app(
                 controller.stop_line_follow
             ),
             show_medicine_workflow_status=show_executor_medicine_status,
+            show_pickup_countdown=show_executor_pickup_countdown,
             load_navigation_map=laravel_client.get_navigation_map,
             home_line_position_is_valid=home_line_position_is_valid,
         )

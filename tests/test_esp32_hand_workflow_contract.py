@@ -33,16 +33,38 @@ def test_hand_and_lcd_commands_are_machine_readable_and_do_not_touch_navigation(
         "HAND_WAITING",
         "HAND_DETECTED",
         "DISPENSING",
+        "WATER_DISPENSING",
         "MEDICINE_READY",
         "NO_HAND",
         "DISPENSE_FAILED",
     ):
         assert f'"{state}"' in firmware
     assert 'Serial.print("ACK|LCD|STATE=");' in firmware
+    assert 'lcdShowStatus("Take a cup", "Place under water", "Place hand below", "Waiting...");' in firmware
+    assert 'lcdShowStatus("Dispensing medicine", "Please wait");' in firmware
+    assert 'lcdShowStatus("Dispensing water", "Please wait");' in firmware
+    assert 'lcdShowStatus("Medicine & water", "ready");' in firmware
+    assert '"Take med & water"' in firmware
+    assert 'String("Returning in: ") + String(secondsRemaining)' in firmware
+    assert 'normalizedCommand.startsWith("LCD|STATE=PICKUP_WAITING|SECONDS=")' in firmware
     assert "startLineFollowing();" not in firmware[
         firmware.index('normalizedCommand == "GET_HAND"'):
         firmware.index('normalizedCommand == "GET_HAND"') + 1200
     ]
+
+
+def test_timed_water_path_always_turns_pump_off_before_completion() -> None:
+    firmware = source()
+    start = firmware.index("void runPumpForDuration(unsigned long durationMs) {")
+    end = firmware.index("//", start)
+    timed_water = firmware[start:end]
+
+    assert "pumpOn();" in timed_water
+    assert "bool completed = waitSafely(durationMs);" in timed_water
+    assert "pumpOff();" in timed_water
+    assert timed_water.index("pumpOff();") < timed_water.index(
+        'Serial.print("DONE|WATER|DURATION_MS=");'
+    )
 
 
 def test_serial_parser_dispatches_only_complete_single_character_legacy_lines() -> None:

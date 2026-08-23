@@ -117,6 +117,21 @@ def test_hand_state_and_lcd_workflow_use_esp32_machine_readable_commands() -> No
     assert esp32.commands == ["GET_HAND", "LCD|STATE=HAND_WAITING"]
 
 
+def test_pickup_countdown_uses_one_bounded_structured_lcd_command() -> None:
+    command = "LCD|STATE=PICKUP_WAITING|SECONDS=30"
+    esp32 = RecordingSerialController({command: f"ACK|{command}"})
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    assert controller.show_pickup_countdown(30) == f"ACK|{command}"
+    assert esp32.commands == [command]
+
+    with pytest.raises(ValueError):
+        controller.show_pickup_countdown(31)
+
+
 def test_hand_response_is_not_misrouted_as_an_async_navigation_event() -> None:
     assert SerialController._is_async_line("HAND|DETECTED") is False
     assert SerialController._is_async_line("IR|HAND_DETECTED") is True

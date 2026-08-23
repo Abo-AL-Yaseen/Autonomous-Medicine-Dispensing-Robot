@@ -98,6 +98,13 @@ const missionExecutorStates: readonly MissionExecutorState[] = [
   "GOING_TO_ROOM",
   "ARRIVED_AT_ROOM",
   "WAITING_FOR_HAND",
+  "DISPENSING",
+  "DISPENSE_COMPLETED",
+  "WATER_DISPENSING",
+  "WATER_DISPENSE_COMPLETED",
+  "WAITING_FOR_PICKUP",
+  "RETURNING_HOME",
+  "ARRIVED_HOME",
   "FAILED",
 ];
 
@@ -129,7 +136,34 @@ export const normalizeMissionExecutorStatus = (
         "FastAPI executor status",
         "last_error",
       ) ?? null,
+    pickup_seconds_remaining:
+      value.pickup_seconds_remaining === undefined ||
+      value.pickup_seconds_remaining === null
+        ? null
+        : requireInteger(
+            value.pickup_seconds_remaining,
+            "FastAPI executor status",
+            "pickup_seconds_remaining",
+            0,
+          ),
   };
+};
+
+export const missionExecutorStatusText = (
+  status: MissionExecutorStatus,
+): string => {
+  if (status.state === "WAITING_FOR_PICKUP") {
+    return status.pickup_seconds_remaining === null ||
+      status.pickup_seconds_remaining === undefined
+      ? "Waiting for patient pickup"
+      : `Waiting for patient pickup (${status.pickup_seconds_remaining}s)`;
+  }
+
+  return status.state
+    .toLowerCase()
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 };
 
 export const normalizeRobotRtc = (payload: unknown): RobotRtcResponse => {

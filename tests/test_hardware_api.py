@@ -75,6 +75,7 @@ class FakeHardwareController:
         self.return_home_calls: list[str] = []
         self.hand_wait_calls: list[float] = []
         self.medicine_status_calls: list[str] = []
+        self.pickup_countdown_calls: list[int] = []
         self.hand_detected = True
         self.esp32_events: queue.Queue[str] = queue.Queue()
 
@@ -126,6 +127,11 @@ class FakeHardwareController:
         self._raise_hardware_error()
         self.medicine_status_calls.append(state)
         return f"ACK|LCD|STATE={state}"
+
+    def show_pickup_countdown(self, seconds_remaining: int) -> str:
+        self._raise_hardware_error()
+        self.pickup_countdown_calls.append(seconds_remaining)
+        return f"ACK|LCD|STATE=PICKUP_WAITING|SECONDS={seconds_remaining}"
 
     def get_rtc_datetime(self) -> datetime:
         self._raise_hardware_error()
@@ -1042,10 +1048,11 @@ def test_scheduler_status_is_idle_and_disabled_by_default(
         "medicine_id": None,
         "dispenser_box": None,
         "quantity": None,
-            "last_error": None,
-            "auto_execution_enabled": False,
-            "home_ready": True,
-            "home_readiness_error": None,
+        "pickup_seconds_remaining": None,
+        "last_error": None,
+        "auto_execution_enabled": False,
+        "home_ready": True,
+        "home_readiness_error": None,
         "pending_acceptance_mission_id": None,
         "last_tick_at": None,
         "last_result": None,
@@ -1091,10 +1098,11 @@ def test_manual_scheduler_tick_only_prepares_claimed_mission(
         "medicine_id": 2,
         "dispenser_box": None,
         "quantity": 4,
-            "last_error": None,
-            "auto_execution_enabled": False,
-            "home_ready": True,
-            "home_readiness_error": None,
+        "pickup_seconds_remaining": None,
+        "last_error": None,
+        "auto_execution_enabled": False,
+        "home_ready": True,
+        "home_readiness_error": None,
     }
     assert fake_hardware.movement_calls == []
     assert fake_hardware.line_calls == ["get_line_status"]
@@ -1194,15 +1202,24 @@ def test_executor_dispense_reuses_api_hardware_and_manual_return_endpoint(
     fake_hardware.disk_status["disk1"] = {"calibrated": True, "slot": 0}
 
     dispense = executor.dispense_at_room()
+    water = executor.dispense_water_at_room()
+    assert executor.begin_pickup_wait()
+    waiting = client.get("/executor/status")
+    assert waiting.status_code == 200
+    assert waiting.json()["state"] == "WAITING_FOR_PICKUP"
+    assert waiting.json()["pickup_seconds_remaining"] == 30
+    assert executor.update_pickup_wait(0)
+    assert executor.complete_pickup_wait()
     returned = client.post("/executor/return-home")
 
     assert dispense.success is True
+    assert water.success is True
     assert returned.status_code == 200
     assert returned.json()["result"] == "RETURN_STARTED"
     assert returned.json()["executor"]["state"] == "RETURNING_HOME"
     assert fake_hardware.dispense_calls == [(1, 4)]
     assert fake_hardware.navigation_calls == ["u-turn", "u-turn"]
-    assert fake_hardware.water_calls == []
+    assert fake_hardware.water_calls == [4000]
 
 
 def test_executor_start_does_nothing_when_hardware_is_unavailable(
