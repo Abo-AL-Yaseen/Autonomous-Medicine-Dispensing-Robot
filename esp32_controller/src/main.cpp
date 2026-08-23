@@ -180,11 +180,11 @@ const uint8_t MANUAL_PIVOT_PWM = TURN_SPEED;
 #define PUMP_RUN_MS          2000   // مدة اختبار المضخة بالأمر P
 const unsigned long WATER_MIN_DURATION_MS = 100;
 const unsigned long WATER_MAX_DURATION_MS = 60000;
-// TEMPORARY tank calibration defaults. Measure the installed tank and replace
-// these values before relying on the reported percentage.
-const float WATER_FULL_DISTANCE_CM = 5.0f;
-const float WATER_EMPTY_DISTANCE_CM = 25.0f;
+const float WATER_FULL_DISTANCE_CM = 2.3f;
+const float WATER_EMPTY_DISTANCE_CM = 6.9f;
 const uint8_t WATER_LEVEL_SAMPLE_COUNT = 2;
+const uint8_t WATER_LEVEL_MAX_ATTEMPTS = 4;
+const unsigned long WATER_LEVEL_PING_INTERVAL_MS = 60;
 const uint8_t WATER_LOW_PERCENT = 20;
 const uint8_t WATER_EMPTY_PERCENT = 5;
 
@@ -634,10 +634,17 @@ float readWaterLevelDistanceCm() {
   float readings[WATER_LEVEL_SAMPLE_COUNT];
   uint8_t validReadings = 0;
 
-  for (uint8_t sample = 0; sample < WATER_LEVEL_SAMPLE_COUNT; sample++) {
+  for (uint8_t attempt = 0; attempt < WATER_LEVEL_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      delay(WATER_LEVEL_PING_INTERVAL_MS);
+    }
+
     float distance = readUltrasonicCm();
     if (distance >= 0.0f) {
       readings[validReadings++] = distance;
+      if (validReadings == WATER_LEVEL_SAMPLE_COUNT) {
+        break;
+      }
     }
   }
 

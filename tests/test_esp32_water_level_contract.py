@@ -15,8 +15,8 @@ def test_water_level_uses_the_existing_hc_sr04_pins_and_calibration_constants() 
 
     assert "const int ULTRASONIC_TRIG_PIN = 18;" in firmware
     assert "const int ULTRASONIC_ECHO_PIN = 34;" in firmware
-    assert "const float WATER_FULL_DISTANCE_CM = 5.0f;" in firmware
-    assert "const float WATER_EMPTY_DISTANCE_CM = 25.0f;" in firmware
+    assert "const float WATER_FULL_DISTANCE_CM = 2.3f;" in firmware
+    assert "const float WATER_EMPTY_DISTANCE_CM = 6.9f;" in firmware
     assert "int waterLevelPercentForDistance(float distanceCm)" in firmware
     assert "if (distanceCm <= WATER_FULL_DISTANCE_CM) return 100;" in firmware
     assert "if (distanceCm >= WATER_EMPTY_DISTANCE_CM) return 0;" in firmware
@@ -24,8 +24,8 @@ def test_water_level_uses_the_existing_hc_sr04_pins_and_calibration_constants() 
 
 
 def test_water_level_formula_clamps_full_empty_and_middle_distances() -> None:
-    full_distance_cm = 5.0
-    empty_distance_cm = 25.0
+    full_distance_cm = 2.3
+    empty_distance_cm = 6.9
 
     def percent(distance_cm: float) -> int:
         if distance_cm <= full_distance_cm:
@@ -38,11 +38,13 @@ def test_water_level_formula_clamps_full_empty_and_middle_distances() -> None:
             / (empty_distance_cm - full_distance_cm)
         )
 
-    assert percent(4.0) == 100
-    assert percent(5.0) == 100
-    assert percent(15.0) == 50
-    assert percent(25.0) == 0
-    assert percent(30.0) == 0
+    assert percent(2.0) == 100
+    assert percent(2.3) == 100
+    assert percent(3.45) == 75
+    assert percent(4.6) == 50
+    assert percent(5.75) == 25
+    assert percent(6.9) == 0
+    assert percent(8.0) == 0
 
 
 def test_water_level_protocol_reports_valid_readings_and_sensor_errors() -> None:
@@ -55,6 +57,27 @@ def test_water_level_protocol_reports_valid_readings_and_sensor_errors() -> None
     assert "const uint8_t WATER_EMPTY_PERCENT = 5;" in firmware
     assert 'return "LOW";' in firmware
     assert 'return "EMPTY";' in firmware
+
+
+def test_water_level_collects_two_valid_readings_with_spaced_bounded_retries() -> None:
+    firmware = source()
+    sampling_start = firmware.index("float readWaterLevelDistanceCm() {")
+    sampling = firmware[
+        sampling_start:
+        firmware.index(
+            "int waterLevelPercentForDistance(float distanceCm) {",
+            sampling_start,
+        )
+    ]
+
+    assert "const uint8_t WATER_LEVEL_SAMPLE_COUNT = 2;" in firmware
+    assert "const uint8_t WATER_LEVEL_MAX_ATTEMPTS = 4;" in firmware
+    assert "const unsigned long WATER_LEVEL_PING_INTERVAL_MS = 60;" in firmware
+    assert "attempt < WATER_LEVEL_MAX_ATTEMPTS" in sampling
+    assert "delay(WATER_LEVEL_PING_INTERVAL_MS);" in sampling
+    assert "if (distance >= 0.0f)" in sampling
+    assert "if (validReadings == WATER_LEVEL_SAMPLE_COUNT)" in sampling
+    assert "if (validReadings != WATER_LEVEL_SAMPLE_COUNT)" in sampling
 
 
 def test_legacy_ultrasonic_obstacle_mode_cannot_drive_from_water_distance() -> None:
