@@ -4,6 +4,7 @@ import { Text } from "react-native-paper";
 
 import RobotIcon from "@/src/assets/RobotIcon";
 import { DirectionPad } from "@/src/components/DirectionPad";
+import { LiveCameraModal } from "@/src/components/LiveCameraModal";
 import { MedicineSelector } from "@/src/components/MedicineSelector";
 import { PrimaryButton } from "@/src/components/PrimaryButton";
 import { QuantitySelector } from "@/src/components/QuantitySelector";
@@ -80,6 +81,7 @@ const manualDriveLabels: Record<ManualDriveState, string> = {
 };
 
 export default function ManualControlScreen() {
+  const [cameraVisible, setCameraVisible] = useState(false);
   const [status, setStatus] = useState("Ready");
   const [battery, setBattery] = useState<number | null>(null);
   const [connection, setConnection] =
@@ -318,6 +320,12 @@ export default function ManualControlScreen() {
       >
         <Text style={styles.title}>Manual Control</Text>
 
+        <PrimaryButton
+          label="Open Live Camera"
+          onPress={() => setCameraVisible(true)}
+          style={styles.cameraButton}
+        />
+
         <View style={styles.robotArea}>
           <RobotIcon />
         </View>
@@ -499,6 +507,10 @@ export default function ManualControlScreen() {
           </Text>
         ) : null}
       </ScrollView>
+      <LiveCameraModal
+        visible={cameraVisible}
+        onClose={() => setCameraVisible(false)}
+      />
     </View>
   );
 }
@@ -518,6 +530,9 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: theme.colors.textPrimary,
     letterSpacing: -0.8,
+    marginBottom: 20,
+  },
+  cameraButton: {
     marginBottom: 20,
   },
   robotArea: {

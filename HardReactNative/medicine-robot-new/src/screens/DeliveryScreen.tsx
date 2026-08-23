@@ -14,6 +14,7 @@ import {
 import { Text } from "react-native-paper";
 
 import { MissionStatusCard } from "@/src/components/MissionStatusCard";
+import { LiveCameraModal } from "@/src/components/LiveCameraModal";
 import { PrimaryButton } from "@/src/components/PrimaryButton";
 import { RobotStatusCard } from "@/src/components/RobotStatusCard";
 import { RoomSelector } from "@/src/components/RoomSelector";
@@ -45,6 +46,7 @@ import { theme } from "@/src/theme/theme";
 import { DispenserStatus, Medicine, MissionState, Room } from "@/src/types";
 
 export default function DeliveryScreen() {
+  const [cameraVisible, setCameraVisible] = useState(false);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [medicines, setMedicines] = useState<Medicine[]>([]);
   const [selectedRoom, setSelectedRoom] = useState("0");
@@ -467,6 +469,12 @@ export default function DeliveryScreen() {
           location={robotStatus.location || selectedRoomName}
         />
 
+        <PrimaryButton
+          label="Open Live Camera"
+          onPress={() => setCameraVisible(true)}
+          style={styles.cameraButton}
+        />
+
         <View style={styles.sectionBlock}>
           <RoomSelector
             value={selectedRoom}
@@ -722,6 +730,10 @@ export default function DeliveryScreen() {
           <MissionStatusCard state={missionState} detail={executorStatusDetail} />
         </View>
       </ScrollView>
+      <LiveCameraModal
+        visible={cameraVisible}
+        onClose={() => setCameraVisible(false)}
+      />
     </View>
   );
 }
@@ -756,6 +768,9 @@ const styles = StyleSheet.create({
   },
   medicineList: {
     marginBottom: 20,
+  },
+  cameraButton: {
+    marginTop: 18,
   },
   medicineLabel: {
     color: theme.colors.textPrimary,

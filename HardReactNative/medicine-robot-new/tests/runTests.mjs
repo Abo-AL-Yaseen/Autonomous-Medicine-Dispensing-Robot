@@ -5,3 +5,4 @@ import "./robotClock.test.mjs";
 import "./manualDrive.test.mjs";
 import "./manualPump.test.mjs";
 import "./waterLevel.test.mjs";
+import "./liveCamera.test.mjs";
