@@ -3475,6 +3475,7 @@ void handleLegacyCommand(char rawCommand) {
       }
       stopAllOutputs();
       lcdShowStatus("Pump", "OFF");
+      Serial.println("ACK|PUMP|STATE=OFF");
       Serial.println("Pump OFF. Motors stopped.");
       break;
 
@@ -3522,6 +3523,7 @@ void handleLegacyCommand(char rawCommand) {
       stopAllOutputs();
       pumpOn();
       lcdShowStatus("Pump", "ON");
+      Serial.println("ACK|PUMP|STATE=ON");
       Serial.println("Pump ON continuously. Send X or S to stop.");
       break;
 

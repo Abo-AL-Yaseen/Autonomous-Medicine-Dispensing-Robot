@@ -4,6 +4,7 @@ import type {
   DispenserSetZeroResponse,
   DispenserStatus,
   Medicine,
+  ManualPumpResponse,
   MedicineDispensePayload,
   MedicineDispenseResponse,
   Mission,
@@ -748,6 +749,44 @@ export const normalizeFastApiWaterLevel = (
     distance_cm: value.distance_cm,
     percent: value.percent,
     status: waterLevelStatus,
+  };
+};
+
+export const normalizeFastApiManualPump = (
+  payload: unknown,
+): ManualPumpResponse => {
+  const value = requireRecord(payload, "FastAPI manual pump");
+  const pump = requireString(value.pump, "FastAPI manual pump", "pump");
+  if (pump !== "ON" && pump !== "OFF") {
+    return invalidResponse(
+      "FastAPI manual pump",
+      "expected 'pump' to be 'ON' or 'OFF'.",
+    );
+  }
+
+  const ranSeconds = value.ran_seconds;
+  if (
+    ranSeconds !== undefined &&
+    (requireInteger(ranSeconds, "FastAPI manual pump", "ran_seconds") > 30)
+  ) {
+    return invalidResponse(
+      "FastAPI manual pump",
+      "expected 'ran_seconds' to be at most 30.",
+    );
+  }
+
+  return {
+    success: requireBoolean(value.success, "FastAPI manual pump", "success"),
+    pump,
+    ...(ranSeconds === undefined
+      ? {}
+      : {
+          ran_seconds: requireInteger(
+            ranSeconds,
+            "FastAPI manual pump",
+            "ran_seconds",
+          ),
+        }),
   };
 };
 

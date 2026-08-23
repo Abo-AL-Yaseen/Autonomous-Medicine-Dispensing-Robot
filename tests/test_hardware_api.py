@@ -52,6 +52,7 @@ class FakeHardwareController:
         self.navigation_calls: list[str] = []
         self.rtc_calls = 0
         self.water_calls: list[int] = []
+        self.manual_pump_calls: list[str | int] = []
         self.water_level_calls = 0
         self.water_level = {
             "distance_cm": 7.3,
@@ -135,6 +136,19 @@ class FakeHardwareController:
         self._raise_hardware_error()
         self.water_calls.append(duration_ms)
         return {"duration_ms": duration_ms}
+
+    def start_manual_pump(self) -> None:
+        self._raise_hardware_error()
+        self.manual_pump_calls.append("start")
+
+    def stop_manual_pump(self) -> None:
+        self._raise_hardware_error()
+        self.manual_pump_calls.append("stop")
+
+    def run_manual_pump(self, seconds: int) -> dict[str, int]:
+        self._raise_hardware_error()
+        self.manual_pump_calls.extend([seconds, "stop"])
+        return {"ran_seconds": seconds}
 
     def get_water_level(self) -> dict[str, float | int | str | None]:
         self._raise_hardware_error()
@@ -534,6 +548,9 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/executor/return-home" in body["endpoints"]
     assert "/water/level" in body["endpoints"]
     assert "/water/dispense" in body["endpoints"]
+    assert "/water/pump/start" in body["endpoints"]
+    assert "/water/pump/stop" in body["endpoints"]
+    assert "/water/pump/run" in body["endpoints"]
     assert "/movement/stop" in body["endpoints"]
     assert "/movement/manual/forward" in body["endpoints"]
     assert "/movement/manual/forward-right" in body["endpoints"]
@@ -1426,6 +1443,61 @@ def test_water_level_returns_sensor_error_without_a_fake_percentage(
         "status": "SENSOR_ERROR",
     }
     assert fake_hardware.water_level_calls == 1
+
+
+def test_manual_pump_start_and_stop_use_the_existing_hardware_controller(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    started = client.post("/water/pump/start")
+    stopped = client.post("/water/pump/stop")
+
+    assert started.status_code == 200
+    assert started.json() == {"success": True, "pump": "ON"}
+    assert stopped.status_code == 200
+    assert stopped.json() == {"success": True, "pump": "OFF"}
+    assert fake_hardware.manual_pump_calls == ["start", "stop"]
+
+
+def test_manual_pump_run_is_bounded_and_stops_after_completion(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    response = client.post("/water/pump/run", json={"seconds": 5})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "pump": "OFF",
+        "ran_seconds": 5,
+    }
+    assert fake_hardware.manual_pump_calls == [5, "stop"]
+
+
+@pytest.mark.parametrize("seconds", [0, -1, 31])
+def test_manual_pump_run_rejects_unsafe_durations(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    seconds: int,
+) -> None:
+    response = client.post("/water/pump/run", json={"seconds": seconds})
+
+    assert response.status_code == 422
+    assert fake_hardware.manual_pump_calls == []
+
+
+def test_manual_pump_hardware_failure_is_structured(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    fake_hardware.hardware_error = SerialConnectionError("SERIAL_WRITE_FAILED")
+
+    response = client.post("/water/pump/start")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "HARDWARE_COMMUNICATION_FAILED"}
+    }
 
 
 def test_water_conversion_uses_configured_flow_rate() -> None:

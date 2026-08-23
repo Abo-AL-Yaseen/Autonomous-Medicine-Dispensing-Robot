@@ -190,6 +190,12 @@ export interface WaterLevelResponse {
   status: WaterLevelStatus;
 }
 
+export interface ManualPumpResponse {
+  success: boolean;
+  pump: "ON" | "OFF";
+  ran_seconds?: number;
+}
+
 export interface LineStatus {
   success: boolean;
   status: string;

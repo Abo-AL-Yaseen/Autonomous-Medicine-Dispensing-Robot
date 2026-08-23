@@ -38,6 +38,11 @@ import {
   getWaterLevel,
   waterLevelDisplay,
 } from "@/src/services/robot/waterLevelService";
+import {
+  runManualPump,
+  startManualPump,
+  stopManualPump,
+} from "@/src/services/robot/manualPumpService";
 import { theme } from "@/src/theme/theme";
 import type {
   Medicine,
@@ -88,7 +93,9 @@ export default function ManualControlScreen() {
   const [waterAmountMl, setWaterAmountMl] = useState(100);
   const [waterLevel, setWaterLevel] =
     useState<WaterLevelResponse | null>(null);
+  const [pumpLoading, setPumpLoading] = useState(false);
   const [directionPadResetSignal, setDirectionPadResetSignal] = useState(0);
+  const pumpRequestInFlightRef = useRef(false);
   const manualDriveDispatcherRef =
     useRef<LatestManualDriveDispatcher | null>(null);
 
@@ -248,6 +255,47 @@ export default function ManualControlScreen() {
     }
   };
 
+  const refreshWaterLevel = async () => {
+    setWaterLevel(await getWaterLevel().catch(() => null));
+  };
+
+  const handleManualPump = async (
+    action: () => Promise<{ success: boolean; pump: "ON" | "OFF" }>,
+    nextStatus: string,
+    refreshAfter: boolean,
+  ) => {
+    if (
+      !requireConnectedHardware() ||
+      pumpLoading ||
+      pumpRequestInFlightRef.current
+    ) {
+      return;
+    }
+
+    try {
+      pumpRequestInFlightRef.current = true;
+      setPumpLoading(true);
+      setError(null);
+      const result = await action();
+      if (!result.success) {
+        throw new Error("The robot API rejected the pump command.");
+      }
+      if (refreshAfter) {
+        await refreshWaterLevel();
+      }
+      setStatus(nextStatus);
+      Alert.alert("Water Pump", nextStatus);
+    } catch (e) {
+      const message =
+        e instanceof Error ? e.message : "Water pump command failed.";
+      setError(message);
+      Alert.alert("Water Pump Error", message);
+    } finally {
+      pumpRequestInFlightRef.current = false;
+      setPumpLoading(false);
+    }
+  };
+
   const handleManualDriveStateChange = (
     driveState: ManualDriveState,
     force = false,
@@ -386,8 +434,47 @@ export default function ManualControlScreen() {
           <PrimaryButton
             label="Dispense Water"
             onPress={handleDispenseWater}
-            disabled={loading}
+            disabled={loading || pumpLoading}
             loading={loading}
+          />
+        </View>
+
+        <View style={styles.controlSection}>
+          <Text style={styles.sectionTitle}>Water Pump</Text>
+          <Text style={styles.calibrationHint}>
+            Manual maintenance control. Stop the pump before leaving this screen.
+          </Text>
+          <PrimaryButton
+            label="Start Pump"
+            onPress={() =>
+              handleManualPump(startManualPump, "Pump Started", false)
+            }
+            disabled={loading || pumpLoading}
+            loading={pumpLoading}
+          />
+          <PrimaryButton
+            label="Stop Pump"
+            onPress={() =>
+              handleManualPump(stopManualPump, "Pump Stopped", true)
+            }
+            disabled={loading || pumpLoading}
+            loading={pumpLoading}
+          />
+          <PrimaryButton
+            label="Run 5s"
+            onPress={() =>
+              handleManualPump(() => runManualPump(5), "Pump ran for 5 seconds", true)
+            }
+            disabled={loading || pumpLoading}
+            loading={pumpLoading}
+          />
+          <PrimaryButton
+            label="Run 10s"
+            onPress={() =>
+              handleManualPump(() => runManualPump(10), "Pump ran for 10 seconds", true)
+            }
+            disabled={loading || pumpLoading}
+            loading={pumpLoading}
           />
         </View>
 

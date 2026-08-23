@@ -158,6 +158,60 @@ def test_water_level_sensor_error_is_structured_without_a_fake_percentage() -> N
     }
 
 
+def test_manual_pump_reuses_existing_esp32_commands_and_stops_after_timed_run() -> None:
+    esp32 = RecordingSerialController(
+        {
+            "O": "ACK|PUMP|STATE=ON",
+            "X": "ACK|PUMP|STATE=OFF",
+        }
+    )
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    controller.start_manual_pump()
+    controller.stop_manual_pump()
+    assert controller.run_manual_pump(5) == {"ran_seconds": 5}
+
+    assert esp32.commands == ["O", "X", "WATER_DISPENSE|MS=5000", "X"]
+
+
+@pytest.mark.parametrize("seconds", [0, -1, 31])
+def test_manual_pump_rejects_unsafe_timed_runs(seconds: int) -> None:
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError):
+        controller.run_manual_pump(seconds)
+
+
+def test_manual_pump_attempts_a_final_stop_after_a_timed_run_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+    )
+    stopped: list[bool] = []
+
+    def fail_duration_command(_duration_ms: int) -> dict[str, int]:
+        raise HardwareControllerError("TIMED_PUMP_FAILED")
+
+    def record_final_stop() -> None:
+        stopped.append(True)
+
+    monkeypatch.setattr(controller, "dispense_water", fail_duration_command)
+    monkeypatch.setattr(controller, "stop_manual_pump", record_final_stop)
+
+    with pytest.raises(HardwareControllerError, match="TIMED_PUMP_FAILED"):
+        controller.run_manual_pump(5)
+
+    assert stopped == [True]
+
+
 @pytest.mark.parametrize(
     "response",
     [

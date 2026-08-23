@@ -128,6 +128,15 @@ class WaterDispenseRequest(BaseModel):
     amount_ml: StrictInt = Field(ge=1, le=1000)
 
 
+class ManualPumpRunRequest(BaseModel):
+    """Bounded manual pump duration for workshop maintenance."""
+
+    seconds: StrictInt = Field(
+        ge=1,
+        le=RobotHardwareController.MANUAL_PUMP_MAX_SECONDS,
+    )
+
+
 class NavigationDecisionPreviewRequest(BaseModel):
     """A marker observation used only for read-only route diagnostics."""
 
@@ -432,6 +441,9 @@ def create_app(
                 "/dispense",
                 "/water/level",
                 "/water/dispense",
+                "/water/pump/start",
+                "/water/pump/stop",
+                "/water/pump/run",
                 "/movement/forward",
                 "/movement/backward",
                 "/movement/left",
@@ -678,6 +690,37 @@ def create_app(
             "delivery_basis": "calibrated_time",
             "calibration_ml_per_second": settings.water_flow_ml_per_second,
             "duration_ms": result["duration_ms"],
+        }
+
+    @application.post("/water/pump/start")
+    def start_manual_pump(request: Request) -> dict[str, object]:
+        _run_hardware_operation(
+            request,
+            lambda controller: controller.start_manual_pump(),
+        )
+        return {"success": True, "pump": "ON"}
+
+    @application.post("/water/pump/stop")
+    def stop_manual_pump(request: Request) -> dict[str, object]:
+        _run_hardware_operation(
+            request,
+            lambda controller: controller.stop_manual_pump(),
+        )
+        return {"success": True, "pump": "OFF"}
+
+    @application.post("/water/pump/run")
+    def run_manual_pump(
+        payload: ManualPumpRunRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        result = _run_hardware_operation(
+            request,
+            lambda controller: controller.run_manual_pump(payload.seconds),
+        )
+        return {
+            "success": True,
+            "pump": "OFF",
+            **result,
         }
 
     @application.post("/movement/forward")

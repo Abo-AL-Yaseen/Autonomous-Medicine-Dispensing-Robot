@@ -472,6 +472,7 @@ class RobotHardwareController:
     }
     WATER_MIN_DURATION_MS = 100
     WATER_MAX_DURATION_MS = 60000
+    MANUAL_PUMP_MAX_SECONDS = 30
     WATER_LEVEL_STATUSES = {"OK", "LOW", "EMPTY", "SENSOR_ERROR"}
     DISK_SLOT_COUNT = 8
 
@@ -817,6 +818,36 @@ class RobotHardwareController:
                 )
 
         return {"duration_ms": duration_ms}
+
+    def start_manual_pump(self) -> None:
+        """Start the existing ESP32 continuous pump command for maintenance."""
+
+        self._request(self.esp32, "O", "ACK|PUMP|STATE=ON")
+
+    def stop_manual_pump(self) -> None:
+        """Idempotently stop the existing ESP32 continuous pump command."""
+
+        self._request(self.esp32, "X", "ACK|PUMP|STATE=OFF")
+
+    def run_manual_pump(self, seconds: int) -> dict[str, int]:
+        """Run the existing bounded pump path and always issue a final stop."""
+
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, int)
+            or seconds <= 0
+            or seconds > self.MANUAL_PUMP_MAX_SECONDS
+        ):
+            raise ValueError(
+                "seconds must be between 1 and "
+                f"{self.MANUAL_PUMP_MAX_SECONDS}"
+            )
+
+        try:
+            self.dispense_water(seconds * 1000)
+        finally:
+            self.stop_manual_pump()
+        return {"ran_seconds": seconds}
 
     def dispense(self, box_number: int, pill_count: int) -> dict[str, int]:
         """Dispense pills sequentially, requiring an ACK and DONE for each pill."""
