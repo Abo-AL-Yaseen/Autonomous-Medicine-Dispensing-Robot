@@ -842,7 +842,7 @@ def test_arrived_automatically_dispenses_and_retains_mission() -> None:
     assert hardware.navigation == ["U_TURN"]
     assert hardware.line == ["stop"]
     assert hardware.dispense == [(1, 1)]
-    assert hardware.water == [4000]
+    assert hardware.water == [3000]
     assert hardware.pickup_countdowns == list(range(30, -1, -1))
     assert hardware.return_home == []
     assert executor.state is MissionExecutionState.RETURNING_HOME
@@ -1005,7 +1005,7 @@ def test_room_one_full_automatic_arrival_dispense_return_home_chain() -> None:
     assert hardware.dispense == [(1, 1)]
     assert hardware.navigation == ["U_TURN", "STRAIGHT"]
     assert hardware.line == ["stop", "stop"]
-    assert hardware.water == [4000]
+    assert hardware.water == [3000]
     assert service.status()["state"] == "ARRIVED_HOME"
 
 
@@ -1125,7 +1125,7 @@ def test_marker_zero_continues_to_home_and_only_home_marks_arrived() -> None:
     assert hardware.navigation == ["U_TURN", "STRAIGHT"]
     assert hardware.line == []
     assert hardware.dispense == [(1, 1)]
-    assert hardware.water == [4000]
+    assert hardware.water == [3000]
     assert executor.state is MissionExecutionState.RETURNING_HOME
     assert executor.mission_id == mission_id
     assert service.status()["state"] == "COMMAND_SENT"
@@ -1250,7 +1250,7 @@ def test_medicine_water_pickup_countdown_order_and_stationary_wait() -> None:
     assert events == [
         ("medicine", 1, 2),
         ("medicine", 2, 1),
-        ("water", 4000),
+        ("water", 3000),
     ]
     assert hardware.pickup_countdowns == list(range(30, -1, -1))
     assert len(stationary_snapshots) == 30
@@ -1381,7 +1381,7 @@ def test_second_mission_starts_cleanly_after_arrived_home_cleanup() -> None:
     assert hardware.navigation == ["U_TURN", "STRAIGHT", "LEFT"]
     assert hardware.line == ["stop"]
     assert hardware.dispense == [(1, 1)]
-    assert hardware.water == [4000]
+    assert hardware.water == [3000]
 
 
 def test_disabled_preview_never_moves_or_changes_executor_state() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,13 +17,16 @@ from .navigation import (
     RouteDecision,
     RoutePlan,
 )
+from .voice_service import VoiceAnnouncer, VoiceEvent
 
 
 LINE_FOLLOW_STARTED_ACK = "ACK|LINE_FOLLOW_STARTED"
 LINE_FOLLOW_STOPPED_ACK = "ACK|LINE_FOLLOW_STOPPED"
 U_TURN_STARTED_ACK = "ACK|U_TURN_STARTED"
-MISSION_WATER_DISPENSE_MS = 4000
+MISSION_WATER_DISPENSE_MS = 3000
 MISSION_PICKUP_WAIT_SECONDS = 30
+
+logger = logging.getLogger(__name__)
 
 
 class MissionExecutionState(str, Enum):
@@ -174,6 +178,7 @@ class MissionExecutor:
         mark_mission_in_progress: Callable[[ClaimedMission], None] | None = None,
         mark_mission_completed: Callable[[ClaimedMission], None] | None = None,
         load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
+        voice: VoiceAnnouncer | None = None,
         auto_execution_enabled: bool = False,
         require_home_readiness: bool = True,
     ) -> None:
@@ -193,6 +198,7 @@ class MissionExecutor:
         self._mark_mission_in_progress = mark_mission_in_progress
         self._mark_mission_completed = mark_mission_completed
         self._load_navigation_map = load_navigation_map
+        self._voice = voice
         self._route_planner: LaravelRoutePlanner | None = None
         self._destination_node: PhysicalNode | None = None
         self._hand_confirmed = False
@@ -333,6 +339,8 @@ class MissionExecutor:
                 )
             self._state = MissionExecutionState.ARRIVED_AT_ROOM
             self._hand_confirmed = False
+            mission_id = self._mission.id if self._mission else None
+        self._announce_voice(VoiceEvent.ARRIVED_AT_ROOM, mission_id)
 
     def wait_for_hand_confirmation(self, timeout_seconds: float) -> MissionHandOutcome:
         """Wait once for the ESP32's debounced hand confirmation at the room."""
@@ -350,6 +358,11 @@ class MissionExecutor:
             self._state = MissionExecutionState.WAITING_FOR_HAND
             self._hand_confirmed = False
             self._last_error = None
+            mission_id = self._mission.id if self._mission else None
+
+        # This instruction is queued before the existing hand-sensor wait.
+        # Playback remains informational and never delays sensor handling.
+        self._announce_voice(VoiceEvent.WAITING_FOR_HAND, mission_id)
 
         try:
             if self._wait_for_hand is None:
@@ -381,6 +394,7 @@ class MissionExecutor:
                 )
             self._hand_confirmed = True
             self._last_error = None
+        self._announce_voice(VoiceEvent.HAND_DETECTED, mission_id)
         return MissionHandOutcome(MissionHandResult.HAND_CONFIRMED, True)
 
     def start_return_home(self) -> MissionReturnOutcome:
@@ -450,6 +464,7 @@ class MissionExecutor:
                 message,
             )
 
+        self._announce_voice(VoiceEvent.RETURNING_HOME, mission.id)
         return MissionReturnOutcome(MissionReturnResult.RETURN_STARTED, True)
 
     def dispense_at_room(self) -> MissionDispenseOutcome:
@@ -489,6 +504,9 @@ class MissionExecutor:
             self._state = MissionExecutionState.DISPENSING
             self._hand_confirmed = False
             self._last_error = None
+            mission_id = mission.id
+
+        self._announce_voice(VoiceEvent.DISPENSING, mission_id)
 
         try:
             if self._get_disk_status is not None:
@@ -519,6 +537,7 @@ class MissionExecutor:
             with self._lock:
                 self._state = MissionExecutionState.FAILED
                 self._last_error = message
+            self._announce_voice(VoiceEvent.MEDICINE_FAILED, mission_id)
             return MissionDispenseOutcome(
                 MissionDispenseResult.DISPENSE_FAILED,
                 False,
@@ -528,6 +547,7 @@ class MissionExecutor:
         with self._lock:
             self._state = MissionExecutionState.DISPENSE_COMPLETED
             self._last_error = None
+        self._announce_voice(VoiceEvent.MEDICINE_COMPLETED, mission_id)
         return MissionDispenseOutcome(
             MissionDispenseResult.DISPENSE_COMPLETED,
             True,
@@ -545,6 +565,7 @@ class MissionExecutor:
                 )
             self._state = MissionExecutionState.WATER_DISPENSING
             self._last_error = None
+            mission_id = self._mission.id if self._mission else None
 
         try:
             if self._get_water_level is not None:
@@ -563,13 +584,15 @@ class MissionExecutor:
             result = self._dispense_water(MISSION_WATER_DISPENSE_MS)
             if result.get("duration_ms") != MISSION_WATER_DISPENSE_MS:
                 raise RuntimeError(
-                    "Water dispense did not confirm the required 4000 ms duration"
+                    "Water dispense did not confirm the required "
+                    f"{MISSION_WATER_DISPENSE_MS} ms duration"
                 )
         except Exception as exc:
             message = f"WATER_DISPENSE_FAILED: {exc}"
             with self._lock:
                 self._state = MissionExecutionState.FAILED
                 self._last_error = message
+            self._announce_voice(VoiceEvent.WATER_FAILED, mission_id)
             return MissionWaterOutcome(
                 MissionWaterResult.WATER_DISPENSE_FAILED,
                 False,
@@ -579,6 +602,7 @@ class MissionExecutor:
         with self._lock:
             self._state = MissionExecutionState.WATER_DISPENSE_COMPLETED
             self._last_error = None
+        self._announce_voice(VoiceEvent.DELIVERY_COMPLETED, mission_id)
         return MissionWaterOutcome(
             MissionWaterResult.WATER_DISPENSE_COMPLETED,
             True,
@@ -628,6 +652,8 @@ class MissionExecutor:
                     "MissionExecutor is not returning home"
                 )
             self._state = MissionExecutionState.ARRIVED_HOME
+            mission_id = self._mission.id if self._mission else None
+        self._announce_voice(VoiceEvent.ARRIVED_HOME, mission_id)
 
     def finalize_arrived_home(self) -> bool:
         """Complete the confirmed mission and release its runtime context.
@@ -799,6 +825,7 @@ class MissionExecutor:
             self._state = MissionExecutionState.GOING_TO_ROOM
             self._last_error = None
 
+        self._announce_voice(VoiceEvent.MISSION_STARTED, mission.id)
         return MissionStartOutcome(MissionStartResult.STARTED, True)
 
     def fail_start_u_turn(self) -> MissionStartOutcome:
@@ -872,3 +899,17 @@ class MissionExecutor:
             self._state = MissionExecutionState.FAILED
             self._last_error = message
         return MissionStartOutcome(result, False, message)
+
+    def _announce_voice(
+        self,
+        event: VoiceEvent,
+        mission_id: int | None,
+    ) -> None:
+        """Keep optional voice failures outside the authoritative state machine."""
+
+        if self._voice is None:
+            return
+        try:
+            self._voice.say(event, scope=mission_id)
+        except Exception as exc:
+            logger.warning("VOICE enqueue failed: %s", exc)

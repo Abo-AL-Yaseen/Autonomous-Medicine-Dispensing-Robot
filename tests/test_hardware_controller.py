@@ -16,6 +16,7 @@ from raspberry_controller.hardware_controller import (
     HardwareControllerError,
     RobotHardwareController,
     SerialController,
+    SerialResponseTimeout,
     UnexpectedSerialResponse,
 )
 from raspberry_controller.services.laravel_api_client import ClaimedMission
@@ -226,16 +227,18 @@ def test_manual_pump_reuses_existing_esp32_commands_and_stops_after_timed_run() 
             "X": "ACK|PUMP|STATE=OFF",
         }
     )
+    uno = RecordingSerialController()
     controller = RobotHardwareController(
         esp32=esp32,  # type: ignore[arg-type]
-        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=uno,  # type: ignore[arg-type]
     )
 
     controller.start_manual_pump()
     controller.stop_manual_pump()
     assert controller.run_manual_pump(5) == {"ran_seconds": 5}
 
-    assert esp32.commands == ["O", "X", "WATER_DISPENSE|MS=5000", "X"]
+    assert esp32.commands == ["O", "X", "X"]
+    assert uno.commands == ["WATER_DISPENSE|MS=5000"]
 
 
 @pytest.mark.parametrize("seconds", [0, -1, 31])
@@ -350,22 +353,79 @@ def test_set_rtc_parser_accepts_a_valid_leap_day() -> None:
     )
 
 
-def test_water_dispense_sends_one_bounded_duration_command() -> None:
+def test_water_dispense_uses_only_uno_and_requires_matching_ack_and_done() -> None:
     connection = FakeSerialConnection(
         [
             b"ACK|WATER|DURATION_MS=2000\n",
             b"DONE|WATER|DURATION_MS=2000\n",
         ]
     )
-    esp32 = SerialController("mock", 115200, startup_delay=0, read_timeout=0.05)
-    esp32._connection = connection
+    esp32 = RecordingSerialController()
+    uno = SerialController("uno", 9600, startup_delay=0, read_timeout=0.05)
+    uno._connection = connection
     controller = RobotHardwareController(
-        esp32=esp32,
-        arduino_uno=RecordingSerialController(),  # type: ignore[arg-type]
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=uno,
     )
 
     assert controller.dispense_water(2000) == {"duration_ms": 2000}
     assert connection.writes == [b"WATER_DISPENSE|MS=2000\n"]
+    assert esp32.commands == []
+    uno.close()
+
+
+def test_water_dispense_does_not_complete_from_ack_without_done() -> None:
+    connection = FakeSerialConnection(
+        [b"ACK|WATER|DURATION_MS=100\n"]
+    )
+    uno = SerialController("uno", 9600, startup_delay=0, read_timeout=0.02)
+    uno._connection = connection
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=uno,
+    )
+
+    with pytest.raises(SerialResponseTimeout):
+        controller.dispense_water(100)
+
+    assert connection.writes == [b"WATER_DISPENSE|MS=100\n"]
+    uno.close()
+
+
+def test_water_dispense_rejects_a_done_for_another_duration() -> None:
+    connection = FakeSerialConnection(
+        [
+            b"ACK|WATER|DURATION_MS=2000\n",
+            b"DONE|WATER|DURATION_MS=1999\n",
+        ]
+    )
+    uno = SerialController("uno", 9600, startup_delay=0, read_timeout=0.05)
+    uno._connection = connection
+    controller = RobotHardwareController(
+        esp32=RecordingSerialController(),  # type: ignore[arg-type]
+        arduino_uno=uno,
+    )
+
+    with pytest.raises(UnexpectedSerialResponse):
+        controller.dispense_water(2000)
+
+    uno.close()
+
+
+@pytest.mark.parametrize("duration_ms", [99, 60001, True, 100.0])
+def test_water_dispense_rejects_invalid_durations(duration_ms: object) -> None:
+    esp32 = RecordingSerialController()
+    uno = RecordingSerialController()
+    controller = RobotHardwareController(
+        esp32=esp32,  # type: ignore[arg-type]
+        arduino_uno=uno,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError):
+        controller.dispense_water(duration_ms)  # type: ignore[arg-type]
+
+    assert esp32.commands == []
+    assert uno.commands == []
 
 
 def test_dispense_preserves_exact_ack_done_contract_per_confirmed_pill() -> None:

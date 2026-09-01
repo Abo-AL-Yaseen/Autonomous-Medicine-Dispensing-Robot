@@ -1473,7 +1473,7 @@ def test_executor_dispense_reuses_api_hardware_and_manual_return_endpoint(
     assert returned.json()["executor"]["state"] == "RETURNING_HOME"
     assert fake_hardware.dispense_calls == [(1, 4)]
     assert fake_hardware.navigation_calls == ["u-turn", "u-turn"]
-    assert fake_hardware.water_calls == [4000]
+    assert fake_hardware.water_calls == [3000]
 
 
 def test_executor_start_does_nothing_when_hardware_is_unavailable(

@@ -411,6 +411,7 @@ class RobotHardwareController:
         "STATUS|DISPENSING_1",
         "STATUS|DISPENSING_2",
         "STATUS|DISPENSING_BOTH",
+        "STATUS|WATER_DISPENSING",
     )
     ESP32_STATUS_RESPONSES = (
         "STATUS|IDLE",
@@ -840,7 +841,7 @@ class RobotHardwareController:
         return confirmed
 
     def dispense_water(self, duration_ms: int) -> dict[str, int]:
-        """Run the ESP32 pump for one bounded, acknowledged duration."""
+        """Run the Arduino UNO pump for one bounded, confirmed duration."""
 
         if (
             isinstance(duration_ms, bool)
@@ -856,18 +857,18 @@ class RobotHardwareController:
         command = f"WATER_DISPENSE|MS={duration_ms}"
         acknowledgement = f"ACK|WATER|DURATION_MS={duration_ms}"
         completion = f"DONE|WATER|DURATION_MS={duration_ms}"
-        with self._esp32_transaction_lock:
-            with self.esp32.response_transaction():
-                self.esp32.send_command(command)
-                self.esp32.wait_for_response(
+        with self._arduino_transaction_lock:
+            with self.arduino_uno.response_transaction():
+                self.arduino_uno.send_command(command)
+                self.arduino_uno.wait_for_response(
                     acknowledgement,
                     response_prefix="ACK|WATER|",
                 )
-                self.esp32.wait_for_response(
+                self.arduino_uno.wait_for_response(
                     completion,
                     response_prefix="DONE|WATER|",
                     overall_timeout=(
-                        (duration_ms / 1000) + self.esp32.read_timeout
+                        (duration_ms / 1000) + self.arduino_uno.read_timeout
                     ),
                 )
 

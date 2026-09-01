@@ -220,3 +220,58 @@ def test_slot_position_advances_after_the_physical_motor_move_even_on_timeout() 
     assert 'strcmp(command, "GET_DISK_STATUS")' in source
     assert "DISK1_CALIBRATED" in source
     assert "DISK2_CALIBRATED" in source
+
+
+def test_active_low_water_relay_uses_conflict_free_d2_and_starts_off() -> None:
+    source = sketch_source()
+
+    assert "const uint8_t PUMP_RELAY_PIN = 2;" in source
+    assert "const byte PILL_SENSOR_1_PIN = 3;" in source
+    assert "const byte PILL_SENSOR_2_PIN = 12;" in source
+    assert "Stepper motor1(STEPS_PER_REV, 4, 6, 5, 7);" in source
+    assert "Stepper motor2(STEPS_PER_REV, 8, 10, 9, 11);" in source
+
+    setup = source[source.index("void setup()"):source.index("void loop()")]
+    off_index = setup.index("digitalWrite(PUMP_RELAY_PIN, HIGH);")
+    output_index = setup.index("pinMode(PUMP_RELAY_PIN, OUTPUT);")
+    serial_index = setup.index("Serial.begin(9600);")
+    assert off_index < output_index < serial_index
+
+
+def test_water_protocol_is_bounded_non_blocking_and_done_follows_pump_off() -> None:
+    source = sketch_source()
+
+    assert "const unsigned long WATER_MIN_DURATION_MS = 100;" in source
+    assert "const unsigned long WATER_MAX_DURATION_MS = 60000;" in source
+    assert 'strncmp(command, "WATER_DISPENSE|MS=", 18)' in source
+    assert 'F("ERROR|INVALID_WATER_DURATION")' in source
+    assert "updateWaterDispense();" in source
+
+    start = source[source.index("void startWaterDispense"):source.index("void updateWaterDispense")]
+    assert start.index('F("ACK|WATER|DURATION_MS=")') < start.index(
+        "digitalWrite(PUMP_RELAY_PIN, LOW);"
+    )
+
+    update = source[source.index("void updateWaterDispense"):source.index("bool parseWaterDuration")]
+    assert "delay(" not in update
+    assert update.index("stopWaterPump();") < update.index(
+        'F("DONE|WATER|DURATION_MS=")'
+    )
+
+
+def test_stop_and_all_water_command_errors_leave_the_relay_off() -> None:
+    source = sketch_source()
+
+    execute = source[source.index("void executeCommand"):source.index("void processCommandLine")]
+    stop = execute[execute.index('strcmp(command, "STOP")'):execute.index(
+        "if (\n    waterDispenseActive"
+    )]
+    assert stop.index("stopWaterPump();") < stop.index('F("ACK|STOP")')
+    assert "ERROR|CONTROLLER_BUSY" in execute
+    assert "ERROR|INVALID_WATER_DURATION" in execute
+    assert "stopWaterPump();" in execute
+
+    overlong = source[source.index("void processCommandLine"):source.index("void setup()")]
+    assert overlong.index("stopWaterPump();") < overlong.index(
+        'F("ERROR|COMMAND_TOO_LONG")'
+    )

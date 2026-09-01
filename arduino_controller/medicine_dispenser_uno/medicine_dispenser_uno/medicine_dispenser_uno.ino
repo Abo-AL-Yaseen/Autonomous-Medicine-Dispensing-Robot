@@ -18,6 +18,12 @@ const byte PILL_SENSOR_1_PIN = 3;
 const byte PILL_SENSOR_2_PIN = 12;
 const byte PILL_SENSOR_ACTIVE_STATE = LOW;
 
+// Active-low water-pump relay. D2 is intentionally outside the two stepper
+// ranges (D4-D11) and the pill-sensor pins (D3 and D12).
+const uint8_t PUMP_RELAY_PIN = 2;
+const unsigned long WATER_MIN_DURATION_MS = 100;
+const unsigned long WATER_MAX_DURATION_MS = 60000;
+
 // A pill can create a very short LOW pulse. The pin-change ISR records both
 // edges even while Stepper.step() is waiting for the next motor step.
 const unsigned long PILL_MIN_PULSE_US = 200;
@@ -39,10 +45,14 @@ enum ControllerState {
   IDLE,
   DISPENSING_1,
   DISPENSING_2,
-  DISPENSING_BOTH
+  DISPENSING_BOTH,
+  WATER_DISPENSING
 };
 
 ControllerState controllerState = IDLE;
+bool waterDispenseActive = false;
+unsigned long waterDispenseStartedMs = 0;
+unsigned long waterDispenseDurationMs = 0;
 
 // The disks have no limit switches or homing sensors.  They begin uncalibrated
 // on every boot and become slot 0 only after the operator manually aligns the
@@ -85,6 +95,74 @@ volatile unsigned long pillSensor2RisingEdgeCount = 0;
 volatile bool pillSensor1ArmedDuringCommand = false;
 volatile bool pillSensor2ArmedDuringCommand = false;
 
+void stopWaterPump() {
+  digitalWrite(PUMP_RELAY_PIN, HIGH);
+  waterDispenseActive = false;
+  waterDispenseStartedMs = 0;
+  waterDispenseDurationMs = 0;
+  if (controllerState == WATER_DISPENSING) {
+    controllerState = IDLE;
+  }
+}
+
+void startWaterDispense(unsigned long durationMs) {
+  Serial.print(F("ACK|WATER|DURATION_MS="));
+  Serial.println(durationMs);
+  waterDispenseStartedMs = millis();
+  waterDispenseDurationMs = durationMs;
+  waterDispenseActive = true;
+  controllerState = WATER_DISPENSING;
+  digitalWrite(PUMP_RELAY_PIN, LOW);
+}
+
+void updateWaterDispense() {
+  if (
+    !waterDispenseActive ||
+    millis() - waterDispenseStartedMs < waterDispenseDurationMs
+  ) {
+    return;
+  }
+
+  unsigned long completedDurationMs = waterDispenseDurationMs;
+  stopWaterPump();
+  Serial.print(F("DONE|WATER|DURATION_MS="));
+  Serial.println(completedDurationMs);
+}
+
+bool parseWaterDuration(const char *command, unsigned long *durationMs) {
+  const char prefix[] = "WATER_DISPENSE|MS=";
+  const char *durationText = command + strlen(prefix);
+  if (*durationText == '\0') {
+    return false;
+  }
+
+  unsigned long parsedDurationMs = 0;
+  while (*durationText != '\0') {
+    if (*durationText < '0' || *durationText > '9') {
+      return false;
+    }
+    byte digit = *durationText - '0';
+    if (
+      parsedDurationMs >
+      (WATER_MAX_DURATION_MS - digit) / 10
+    ) {
+      return false;
+    }
+    parsedDurationMs = parsedDurationMs * 10 + digit;
+    durationText++;
+  }
+
+  if (
+    parsedDurationMs < WATER_MIN_DURATION_MS ||
+    parsedDurationMs > WATER_MAX_DURATION_MS
+  ) {
+    return false;
+  }
+
+  *durationMs = parsedDurationMs;
+  return true;
+}
+
 void printStatus() {
   switch (controllerState) {
     case DISPENSING_1:
@@ -95,6 +173,9 @@ void printStatus() {
       break;
     case DISPENSING_BOTH:
       Serial.println(F("STATUS|DISPENSING_BOTH"));
+      break;
+    case WATER_DISPENSING:
+      Serial.println(F("STATUS|WATER_DISPENSING"));
       break;
     default:
       Serial.println(F("STATUS|IDLE"));
@@ -430,6 +511,7 @@ DispenseResult runConfirmedPill(
 }
 
 void printDispenseError(const char *command, DispenseResult result) {
+  stopWaterPump();
   Serial.print(F("ERROR|"));
   Serial.print(command);
   Serial.print(F("|CODE="));
@@ -443,6 +525,7 @@ void printDispenseError(const char *command, DispenseResult result) {
 }
 
 void printDispenseBothError(byte box, DispenseResult result) {
+  stopWaterPump();
   Serial.print(F("ERROR|DISPENSE_BOTH|BOX="));
   Serial.print(box);
   Serial.print(F("|CODE="));
@@ -493,6 +576,22 @@ void monitorPillSensors() {
 }
 
 void executeCommand(const char *command) {
+  if (strcmp(command, "STOP") == 0) {
+    stopWaterPump();
+    Serial.println(F("ACK|STOP"));
+    return;
+  }
+
+  if (
+    waterDispenseActive &&
+    strcmp(command, "PING") != 0 &&
+    strcmp(command, "GET_STATUS") != 0
+  ) {
+    stopWaterPump();
+    Serial.println(F("ERROR|CONTROLLER_BUSY"));
+    return;
+  }
+
   if (strcmp(command, "PING") == 0) {
     Serial.println(F("ACK|PING"));
   } else if (strcmp(command, "GET_STATUS") == 0) {
@@ -513,6 +612,14 @@ void executeCommand(const char *command) {
     printPillIrqDebug();
   } else if (strcmp(command, "MONITOR_PILL_SENSORS") == 0) {
     monitorPillSensors();
+  } else if (strncmp(command, "WATER_DISPENSE|MS=", 18) == 0) {
+    unsigned long durationMs;
+    if (!parseWaterDuration(command, &durationMs)) {
+      stopWaterPump();
+      Serial.println(F("ERROR|INVALID_WATER_DURATION"));
+      return;
+    }
+    startWaterDispense(durationMs);
   } else if (strcmp(command, "DISPENSE_1") == 0) {
     Serial.println(F("ACK|DISPENSE_1"));
     resetPillIrqDebug();
@@ -599,12 +706,14 @@ void executeCommand(const char *command) {
     runMotor2(PILL_STEPS);
     Serial.println(F("DONE|7"));
   } else {
+    stopWaterPump();
     Serial.println(F("ERROR|UNKNOWN_COMMAND"));
   }
 }
 
 void processCommandLine() {
   if (discardingLongCommand) {
+    stopWaterPump();
     Serial.println(F("ERROR|COMMAND_TOO_LONG"));
     discardingLongCommand = false;
     commandLength = 0;
@@ -642,6 +751,10 @@ void processCommandLine() {
 }
 
 void setup() {
+  // Load the inactive level before enabling the output to avoid a LOW pulse
+  // while the active-low relay pin changes from its reset input state.
+  digitalWrite(PUMP_RELAY_PIN, HIGH);
+  pinMode(PUMP_RELAY_PIN, OUTPUT);
   Serial.begin(9600);
 
   motor1.setSpeed(12);
@@ -688,4 +801,6 @@ void loop() {
       discardingLongCommand = true;
     }
   }
+
+  updateWaterDispense();
 }
