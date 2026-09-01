@@ -2500,16 +2500,46 @@ static void updateUturnNavigation(unsigned long now) {
 
     updateUturnOriginalLineClearance();
 
-    bool validConfirmedLineSample =
+    bool validLineContact =
       uturnOriginalLineCleared &&
       intersectionTurnAngleDeg >= UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG &&
       isValidUturnSearchPattern();
-    if (validConfirmedLineSample) {
+    if (validLineContact) {
+      bool firstContact = uturnConsecutiveValidLineReadings == 0;
       if (uturnConsecutiveValidLineReadings < 255) {
         uturnConsecutiveValidLineReadings++;
       }
-    } else {
+
+      // Remove fast-pivot torque on the first eligible contact. The remaining
+      // temporal confirmation samples are collected while stationary so the
+      // sensor array cannot be driven past O5/O4 at PWM 180.
+      stopMotorOutputs();
+      if (firstContact) {
+        Serial.print("UTURN|CONTACT=FIRST|ANGLE_DEG=");
+        Serial.print(intersectionTurnAngleDeg, 1);
+        Serial.print("|PATTERN=");
+        printLinePatternBits(latestLinePattern);
+        Serial.print("|ACTIVE_COUNT=");
+        Serial.print(latestLineActiveCount);
+        Serial.println(
+          "|EXPECTED_FIRST_SENSOR=O5|ACTION=STOP_CONFIRM"
+        );
+      } else {
+        Serial.print("UTURN|CONTACT_CONFIRM|COUNT=");
+        Serial.print(uturnConsecutiveValidLineReadings);
+        Serial.print("|PATTERN=");
+        printLinePatternBits(latestLinePattern);
+        Serial.println("|MOTION=STOPPED");
+      }
+    } else if (uturnConsecutiveValidLineReadings > 0) {
+      uint8_t previousConfirmationCount =
+        uturnConsecutiveValidLineReadings;
       uturnConsecutiveValidLineReadings = 0;
+      Serial.print("UTURN|CONTACT=REJECTED|PREVIOUS_COUNT=");
+      Serial.print(previousConfirmationCount);
+      Serial.print("|PATTERN=");
+      printLinePatternBits(latestLinePattern);
+      Serial.println("|ACTION=RESUME_FAST_PIVOT");
     }
 
     printUturnDiagnostic(now);
@@ -2521,7 +2551,12 @@ static void updateUturnNavigation(unsigned long now) {
         "UTURN|TRANSITION=PIVOT_SEARCH_TO_SENSOR_ALIGN|"
         "REASON=LINE_CONFIRMED|ANGLE_DEG="
       );
-      Serial.println(intersectionTurnAngleDeg, 1);
+      Serial.print(intersectionTurnAngleDeg, 1);
+      Serial.print("|PATTERN=");
+      printLinePatternBits(latestLinePattern);
+      Serial.print("|CONFIRM_COUNT=");
+      Serial.println(uturnConsecutiveValidLineReadings);
+      uturnConsecutiveValidLineReadings = 0;
       startSensorGuidedPivotAlignment(now);
       return;
     }
@@ -2533,6 +2568,11 @@ static void updateUturnNavigation(unsigned long now) {
 
     if (intersectionTurnAngleDeg >= UTURN_MAX_ANGLE_DEG) {
       failIntersectionNavigationWithUturnReason("MAX_ANGLE");
+      return;
+    }
+
+    if (uturnConsecutiveValidLineReadings > 0) {
+      // Hold motor output off until the temporal contact confirmation finishes.
       return;
     }
 
