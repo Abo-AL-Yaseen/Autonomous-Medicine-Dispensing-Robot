@@ -142,7 +142,7 @@ const uint8_t INTERSECTION_LINE_CONFIRM_READINGS = 3;
 // physical-right pivot must clear the original line before sensor reacquisition
 // is allowed, then the existing alignment and line-lock controllers take over.
 const uint8_t UTURN_PIVOT_PWM = 180;
-const float UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG = 170.0f;
+const float UTURN_SENSOR_SEARCH_MIN_ANGLE_DEG = 110.0f;
 const float UTURN_MAX_ANGLE_DEG = 320.0f;
 const unsigned long UTURN_PIVOT_TIMEOUT_MS = 22000;
 const uint8_t UTURN_SENSOR_ALIGN_PWM = 160;
