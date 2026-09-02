@@ -414,6 +414,36 @@ test("HOME_NOT_CONFIRMED is clear and retryable without creating a mission", asy
   assert.equal(retryStartCalls, 1);
 });
 
+test("backend water preflight rejection preserves the accepted mission for retry", async () => {
+  for (const [result, message] of [
+    ["WATER_EMPTY", "Water tank is empty. Fill it before starting delivery."],
+    [
+      "WATER_LEVEL_SENSOR_ERROR",
+      "Unable to verify the water level. Check the ultrasonic sensor.",
+    ],
+  ]) {
+    const { dependencies } = buildDependencies({
+      start: async () => {
+        throw new Error(`${result}: backend preflight rejected`);
+      },
+    });
+
+    await assert.rejects(
+      runImmediateDeliveryFlow(
+        { room_id: 1, medicine_id: 2, quantity: 1 },
+        dependencies,
+      ),
+      (error) => {
+        assert.ok(error instanceof ImmediateDeliveryStartError);
+        assert.equal(error.message, message);
+        assert.equal(error.missionId, 42);
+        assert.equal(error.retryable, true);
+        return true;
+      },
+    );
+  }
+});
+
 test("scheduled delivery UI creates only the Laravel mission", () => {
   const screen = readFileSync(
     new URL("../src/screens/DeliveryScreen.tsx", import.meta.url),

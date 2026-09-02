@@ -15,6 +15,7 @@ from ..mission_executor import (
     MISSION_PICKUP_WAIT_SECONDS,
     MissionExecutionState,
     MissionExecutor,
+    MissionStartResult,
     MissionRouteUnavailableError,
 )
 from .route_planner import (
@@ -467,10 +468,21 @@ class NavigationCoordinator:
 
             outcome = self._executor.start_ready_mission()
             if not outcome.success:
+                water_preflight_rejected = outcome.result in {
+                    MissionStartResult.WATER_EMPTY,
+                    MissionStartResult.WATER_LEVEL_SENSOR_ERROR,
+                }
                 with self._lock:
-                    self._armed = False
+                    self._armed = water_preflight_rejected
                     self._expected_marker_id = None
-                    self._state = NavigationCoordinatorState.ERROR
+                    self._expected_mission_id = None
+                    self._state = (
+                        NavigationCoordinatorState.WAITING_FOR_INTERSECTION
+                        if water_preflight_rejected and self.enabled
+                        else NavigationCoordinatorState.DISABLED
+                        if water_preflight_rejected
+                        else NavigationCoordinatorState.ERROR
+                    )
                     self._last_error = outcome.result.value
                 return {
                     **outcome.as_dict(),

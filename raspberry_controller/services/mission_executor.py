@@ -59,6 +59,8 @@ class MissionStartResult(str, Enum):
     HARDWARE_UNAVAILABLE = "HARDWARE_UNAVAILABLE"
     EXECUTOR_BUSY = "EXECUTOR_BUSY"
     INVALID_MISSION = "INVALID_MISSION"
+    WATER_EMPTY = "WATER_EMPTY"
+    WATER_LEVEL_SENSOR_ERROR = "WATER_LEVEL_SENSOR_ERROR"
     LINE_FOLLOW_START_FAILED = "LINE_FOLLOW_START_FAILED"
     MISSION_STATUS_UPDATE_FAILED = "MISSION_STATUS_UPDATE_FAILED"
 
@@ -899,6 +901,11 @@ class MissionExecutor:
                     self._last_error,
                 )
 
+            water_preflight = self._water_start_preflight_locked()
+            if water_preflight is not None:
+                self._last_error = water_preflight.result.value
+                return water_preflight
+
             self._state = MissionExecutionState.STARTING
             self._last_error = None
 
@@ -1096,6 +1103,31 @@ class MissionExecutor:
         self._manual_recovery_previous_state = None
         self._manual_recovery_reason = None
         self._manual_recovery_deadline = None
+
+    def _water_start_preflight_locked(self) -> MissionStartOutcome | None:
+        """Reject unsafe water states before any autonomous motor command."""
+
+        if self._get_water_level is None:
+            return None
+        try:
+            level = self._get_water_level()
+            level_status = level.get("status")
+        except Exception:
+            level_status = "SENSOR_ERROR"
+
+        if level_status == "EMPTY":
+            return MissionStartOutcome(
+                MissionStartResult.WATER_EMPTY,
+                False,
+                "Water tank is empty. Fill it before starting delivery.",
+            )
+        if level_status not in {"OK", "LOW"}:
+            return MissionStartOutcome(
+                MissionStartResult.WATER_LEVEL_SENSOR_ERROR,
+                False,
+                "Unable to verify the water level. Check the ultrasonic sensor.",
+            )
+        return None
 
     def _announce_voice(
         self,

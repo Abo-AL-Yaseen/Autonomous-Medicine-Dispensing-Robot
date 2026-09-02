@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from raspberry_controller.services.laravel_api_client import (
     ClaimedMission,
     ClaimedMissionItem,
@@ -41,6 +43,9 @@ class FakeExecutionDependencies:
         self.camera_calls: list[str] = []
         self.dispense_calls: list[object] = []
         self.water_calls: list[object] = []
+        self.water_level_calls = 0
+        self.water_level_status = "OK"
+        self.water_level_error: Exception | None = None
         self.return_home_calls: list[str] = []
 
     def start_line_follow(self) -> str:
@@ -57,6 +62,12 @@ class FakeExecutionDependencies:
         self.updated_missions.append(mission)
         if self.update_error:
             raise self.update_error
+
+    def get_water_level(self) -> dict[str, object]:
+        self.water_level_calls += 1
+        if self.water_level_error is not None:
+            raise self.water_level_error
+        return {"status": self.water_level_status}
 
 
 class ClaimTrackingLaravelClient:
@@ -97,6 +108,7 @@ def ready_executor(
         hardware_available=lambda: dependencies.available,
         start_line_follow=dependencies.start_line_follow,
         stop_line_follow=dependencies.stop_line_follow,
+        get_water_level=dependencies.get_water_level,
         mark_mission_in_progress=dependencies.mark_in_progress,
         require_home_readiness=False,
     )
@@ -155,6 +167,14 @@ def medicine_completed_executor(
     u_turn=lambda: "ACK|U_TURN_STARTED",
 ) -> MissionExecutor:
     dependencies = FakeExecutionDependencies()
+    start_preflight_pending = True
+
+    def mission_water_level() -> dict[str, object]:
+        if start_preflight_pending:
+            return {"status": "OK"}
+        assert get_water_level is not None
+        return get_water_level()
+
     executor = MissionExecutor(
         hardware_available=lambda: dependencies.available,
         start_line_follow=dependencies.start_line_follow,
@@ -163,13 +183,14 @@ def medicine_completed_executor(
         wait_for_hand=lambda _: True,
         dispense_medicine=successful_dispense,
         dispense_water=dispense_water,
-        get_water_level=get_water_level,
+        get_water_level=(mission_water_level if get_water_level is not None else None),
         mark_mission_in_progress=dependencies.mark_in_progress,
         load_navigation_map=navigation_map_for_room_one,
         require_home_readiness=False,
     )
     assert executor.accept(valid_mission())
     assert executor.start_ready_mission().success
+    start_preflight_pending = False
     executor.mark_arrived_at_room()
     assert executor.wait_for_hand_confirmation(1.0).success
     assert executor.dispense_at_room().success
@@ -227,6 +248,72 @@ def test_hardware_unavailable_does_not_start_or_update_laravel() -> None:
     assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
     assert dependencies.line_calls == []
     assert dependencies.updated_missions == []
+
+
+@pytest.mark.parametrize(
+    ("water_status", "expected_result"),
+    [
+        ("EMPTY", MissionStartResult.WATER_EMPTY),
+        ("SENSOR_ERROR", MissionStartResult.WATER_LEVEL_SENSOR_ERROR),
+    ],
+)
+def test_water_preflight_rejects_before_any_autonomous_movement(
+    water_status: str,
+    expected_result: MissionStartResult,
+) -> None:
+    dependencies = FakeExecutionDependencies()
+    dependencies.water_level_status = water_status
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        start_line_follow=dependencies.start_line_follow,
+        u_turn=lambda: u_turn_calls.append("u-turn") or "ACK|U_TURN_STARTED",
+        get_water_level=dependencies.get_water_level,
+        mark_mission_in_progress=dependencies.mark_in_progress,
+    )
+    assert executor.accept(valid_mission()) is True
+    executor.set_home_readiness(True)
+
+    result = executor.start_ready_mission()
+
+    assert result.result is expected_result
+    assert result.success is False
+    assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
+    assert executor.mission_id == valid_mission().id
+    assert dependencies.water_level_calls == 1
+    assert u_turn_calls == []
+    assert dependencies.line_calls == []
+    assert dependencies.updated_missions == []
+
+
+def test_water_preflight_sensor_request_failure_is_retryable() -> None:
+    dependencies = FakeExecutionDependencies()
+    dependencies.water_level_error = RuntimeError("ultrasonic timeout")
+    executor = ready_executor(dependencies)
+
+    rejected = executor.start_ready_mission()
+    dependencies.water_level_error = None
+    retried = executor.start_ready_mission()
+
+    assert rejected.result is MissionStartResult.WATER_LEVEL_SENSOR_ERROR
+    assert retried.result is MissionStartResult.STARTED
+    assert dependencies.water_level_calls == 2
+    assert dependencies.line_calls == ["start"]
+    assert dependencies.updated_missions == [valid_mission()]
+
+
+@pytest.mark.parametrize("water_status", ["OK", "LOW"])
+def test_water_preflight_allows_ok_and_low(water_status: str) -> None:
+    dependencies = FakeExecutionDependencies()
+    dependencies.water_level_status = water_status
+    executor = ready_executor(dependencies)
+
+    result = executor.start_ready_mission()
+
+    assert result.result is MissionStartResult.STARTED
+    assert dependencies.water_level_calls == 1
+    assert dependencies.line_calls == ["start"]
+    assert dependencies.updated_missions == [valid_mission()]
 
 
 def test_invalid_claimed_mission_never_touches_hardware_or_laravel() -> None:

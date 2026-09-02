@@ -1434,6 +1434,57 @@ def test_executor_start_uses_high_level_line_follow_then_laravel(
     assert fake_laravel.start_calls == [mission]
 
 
+@pytest.mark.parametrize(
+    ("water_level", "expected_result", "expected_message"),
+    [
+        (
+            {"distance_cm": 6.9, "percent": 0, "status": "EMPTY"},
+            "WATER_EMPTY",
+            "Water tank is empty. Fill it before starting delivery.",
+        ),
+        (
+            {"distance_cm": None, "percent": None, "status": "SENSOR_ERROR"},
+            "WATER_LEVEL_SENSOR_ERROR",
+            "Unable to verify the water level. Check the ultrasonic sensor.",
+        ),
+    ],
+)
+def test_executor_water_preflight_is_structured_and_safely_retryable(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+    fake_laravel: FakeLaravelClient,
+    water_level: dict[str, object],
+    expected_result: str,
+    expected_message: str,
+) -> None:
+    mission = executable_mission()
+    assert client.app.state.mission_executor.accept(mission) is True
+    fake_hardware.water_level = water_level
+
+    rejected = client.post("/executor/start")
+
+    assert rejected.status_code == 409
+    assert rejected.json()["result"] == expected_result
+    assert rejected.json()["message"] == expected_message
+    assert rejected.json()["executor"]["state"] == "READY_FOR_EXECUTION"
+    assert fake_hardware.water_level_calls == 1
+    assert fake_hardware.navigation_calls == []
+    assert "start_line_follow" not in fake_hardware.line_calls
+    assert fake_laravel.start_calls == []
+
+    fake_hardware.water_level = {
+        "distance_cm": 2.3,
+        "percent": 100,
+        "status": "OK",
+    }
+    retried = client.post("/executor/start")
+
+    assert retried.status_code == 202
+    assert retried.json()["result"] == "U_TURN_STARTED"
+    assert fake_hardware.water_level_calls == 2
+    assert fake_hardware.navigation_calls == ["u-turn"]
+
+
 def test_executor_return_home_rejects_non_arrived_state_without_movement(
     client: TestClient,
     fake_hardware: FakeHardwareController,

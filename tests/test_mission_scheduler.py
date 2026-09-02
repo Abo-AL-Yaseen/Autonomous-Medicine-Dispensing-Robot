@@ -271,6 +271,55 @@ def test_auto_execution_retries_ready_mission_until_home_is_ready() -> None:
     assert len(laravel.calls) == 1
 
 
+def test_auto_execution_retries_same_mission_until_water_is_ready() -> None:
+    hardware = SafeSchedulerHardware()
+    laravel = FakeLaravelClient()
+    laravel.claimed_mission = ClaimedMission(
+        8,
+        1,
+        2,
+        4,
+        room_number="204",
+        dispenser_box=1,
+        schedule_claimed_at="2026-08-09T18:40:00+00:00",
+    )
+    water_status = ["EMPTY"]
+    water_level_calls: list[str] = []
+    u_turn_calls: list[str] = []
+    executor = MissionExecutor(
+        hardware_available=lambda: True,
+        u_turn=lambda: u_turn_calls.append("u-turn") or "ACK|U_TURN_STARTED",
+        get_water_level=lambda: water_level_calls.append(water_status[0])
+        or {"status": water_status[0]},
+        auto_execution_enabled=True,
+        require_home_readiness=True,
+    )
+    executor.set_home_readiness(True)
+    scheduler, _ = build_scheduler(
+        hardware,
+        laravel,
+        executor,
+        auto_execution_enabled=True,
+        start_ready_mission=lambda: executor.start_ready_mission().as_dict(),
+    )
+
+    first = scheduler.tick()
+    second = scheduler.tick()
+    water_status[0] = "LOW"
+    third = scheduler.tick()
+
+    assert first.result is SchedulerResult.READY_FOR_EXECUTION
+    assert second.result is SchedulerResult.READY_FOR_EXECUTION
+    assert first.message == "Water tank is empty. Fill it before starting delivery."
+    assert executor.state is MissionExecutionState.STARTING
+    assert third.result is SchedulerResult.AUTO_EXECUTION_STARTED
+    assert water_level_calls == ["EMPTY", "EMPTY", "LOW"]
+    assert u_turn_calls == ["u-turn"]
+    assert hardware.rtc_calls == 1
+    assert len(laravel.calls) == 1
+    assert executor.mission_id == 8
+
+
 @pytest.mark.parametrize(
     "busy_state",
     [

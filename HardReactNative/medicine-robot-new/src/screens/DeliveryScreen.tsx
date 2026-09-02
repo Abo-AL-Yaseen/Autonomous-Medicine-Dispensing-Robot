@@ -50,6 +50,11 @@ import {
   resumeManualRecovery,
 } from "@/src/services/robot/executorService";
 import {
+  getMissionReadyWaterLevel,
+  getWaterLevel,
+  waterLevelDisplay,
+} from "@/src/services/robot/waterLevelService";
+import {
   LatestManualDriveDispatcher,
   ManualDriveState,
 } from "@/src/services/robot/manualDriveController";
@@ -71,6 +76,7 @@ import {
   MissionState,
   MovementResponse,
   Room,
+  WaterLevelResponse,
 } from "@/src/types";
 
 const recoveryDriveRequests: Record<
@@ -118,6 +124,12 @@ export default function DeliveryScreen() {
   const [dispenserStatus, setDispenserStatus] = useState<DispenserStatus | null>(null);
   const [loadingDispenserStatus, setLoadingDispenserStatus] = useState(true);
   const [dispenserStatusError, setDispenserStatusError] = useState<string | null>(null);
+  const [waterLevel, setWaterLevel] = useState<WaterLevelResponse | null>(null);
+  const [loadingWaterLevel, setLoadingWaterLevel] = useState(true);
+  const [waterPreflightRunning, setWaterPreflightRunning] = useState(false);
+  const [waterLevelError, setWaterLevelError] = useState<string | null>(null);
+  const [waterLevelLastRefreshedAt, setWaterLevelLastRefreshedAt] =
+    useState<Date | null>(null);
   const submissionInProgress = useRef(false);
   const recoveryDriveDispatcherRef =
     useRef<LatestManualDriveDispatcher | null>(null);
@@ -296,11 +308,42 @@ export default function DeliveryScreen() {
     }
   }, []);
 
+  const refreshWaterLevel = useCallback(async (): Promise<WaterLevelResponse> => {
+    setLoadingWaterLevel(true);
+    setWaterLevelError(null);
+    try {
+      const level = await getWaterLevel();
+      setWaterLevel(level);
+      return level;
+    } catch (levelError) {
+      setWaterLevel(null);
+      setWaterLevelError(
+        levelError instanceof Error
+          ? levelError.message
+          : "Unable to read the water level.",
+      );
+      throw levelError;
+    } finally {
+      setWaterLevelLastRefreshedAt(new Date());
+      setLoadingWaterLevel(false);
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       void refreshDispenserStatus();
-    }, [refreshDispenserStatus]),
+      void refreshWaterLevel().catch(() => undefined);
+    }, [refreshDispenserStatus, refreshWaterLevel]),
   );
+
+  const verifyImmediateWaterReadiness = useCallback(async () => {
+    setWaterPreflightRunning(true);
+    try {
+      await getMissionReadyWaterLevel(refreshWaterLevel);
+    } finally {
+      setWaterPreflightRunning(false);
+    }
+  }, [refreshWaterLevel]);
 
   const selectedRoomName = useMemo(
     () =>
@@ -348,6 +391,35 @@ export default function DeliveryScreen() {
     requiredBoxes,
     selectedItems.length,
   ]);
+
+  const displayedWaterLevel = waterLevelDisplay(waterLevel);
+  const waterLevelStatus =
+    loadingWaterLevel && waterLevel === null
+      ? "Loading..."
+      : waterLevel?.status ?? "SENSOR_ERROR";
+  const waterLevelStatusColor =
+    waterLevelStatus === "OK"
+      ? theme.colors.success
+      : waterLevelStatus === "LOW"
+        ? "#B26A00"
+        : theme.colors.emergency;
+  const waterBlocksImmediateMission =
+    loadingWaterLevel ||
+    waterLevelError !== null ||
+    waterLevel === null ||
+    !waterLevel.success ||
+    waterLevel.status === "EMPTY" ||
+    waterLevel.status === "SENSOR_ERROR";
+  const waterLevelMessage =
+    loadingWaterLevel && waterLevel === null
+      ? "Checking water readiness..."
+      : waterLevel?.status === "EMPTY"
+      ? "Water tank is empty. Fill it before starting delivery."
+      : waterLevelError !== null ||
+          waterLevel === null ||
+          waterLevel.status === "SENSOR_ERROR"
+        ? "Unable to verify the water level. Check the ultrasonic sensor."
+        : displayedWaterLevel.warning;
 
   const selectedFriendlyDate = scheduledDate
     ? formatFriendlyScheduleDate(scheduledDate)
@@ -438,6 +510,7 @@ export default function DeliveryScreen() {
       try {
         setCreatingMission(true);
         setError(null);
+        await verifyImmediateWaterReadiness();
         const executor = await retryDeliveryStart(pendingImmediateMissionId);
         if (
           !executor.success ||
@@ -539,6 +612,7 @@ export default function DeliveryScreen() {
         return;
       }
 
+      await verifyImmediateWaterReadiness();
       const delivery = await startDelivery(payload);
       if (
         delivery.executor.success !== true ||
@@ -635,6 +709,79 @@ export default function DeliveryScreen() {
             ) : null}
           </View>
         ) : null}
+
+        <View
+          style={[
+            styles.waterTankCard,
+            { borderColor: waterLevelStatusColor },
+          ]}
+        >
+          <View style={styles.waterTankHeader}>
+            <View>
+              <Text style={styles.waterTankTitle}>Water Tank</Text>
+              <Text style={styles.waterTankRefreshText}>
+                {loadingWaterLevel
+                  ? "Refreshing..."
+                  : waterLevelLastRefreshedAt
+                    ? `Last refresh: ${waterLevelLastRefreshedAt.toLocaleTimeString()}`
+                    : "Not refreshed"}
+              </Text>
+            </View>
+            <Pressable
+              onPress={() => void refreshWaterLevel().catch(() => undefined)}
+              disabled={loadingWaterLevel || waterPreflightRunning}
+              style={({ pressed }) => [
+                styles.waterRefreshButton,
+                (loadingWaterLevel || waterPreflightRunning) &&
+                  styles.waterRefreshButtonDisabled,
+                pressed && styles.waterRefreshButtonPressed,
+              ]}
+            >
+              <Text style={styles.waterRefreshButtonText}>
+                {waterLevelError ? "Retry" : "Refresh"}
+              </Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.waterTankReadings}>
+            <View style={styles.waterTankReading}>
+              <Text style={styles.waterTankReadingLabel}>Water</Text>
+              <Text style={styles.waterTankReadingValue}>
+                {displayedWaterLevel.value}
+              </Text>
+            </View>
+            <View style={styles.waterTankReading}>
+              <Text style={styles.waterTankReadingLabel}>Distance</Text>
+              <Text style={styles.waterTankReadingValue}>
+                {waterLevel?.distance_cm === null || waterLevel === null
+                  ? "N/A"
+                  : `${waterLevel.distance_cm} cm`}
+              </Text>
+            </View>
+            <View style={styles.waterTankReading}>
+              <Text style={styles.waterTankReadingLabel}>Status</Text>
+              <Text
+                style={[
+                  styles.waterTankReadingValue,
+                  { color: waterLevelStatusColor },
+                ]}
+              >
+                {waterLevelStatus}
+              </Text>
+            </View>
+          </View>
+
+          {waterLevelMessage ? (
+            <Text
+              style={[
+                styles.waterTankMessage,
+                { color: waterLevelStatusColor },
+              ]}
+            >
+              {waterLevelMessage}
+            </Text>
+          ) : null}
+        </View>
 
         <View style={styles.sectionBlock}>
           <RoomSelector
@@ -875,6 +1022,7 @@ export default function DeliveryScreen() {
             onPress={handleStartDelivery}
             disabled={
               creatingMission ||
+              waterPreflightRunning ||
               manualRecoveryActive ||
               loadingRooms ||
               loadingMedicines ||
@@ -882,8 +1030,9 @@ export default function DeliveryScreen() {
               medicines.length === 0
               || selectedItems.length === 0
               || calibrationReadinessError !== null
+              || (!scheduleForLater && waterBlocksImmediateMission)
             }
-            loading={creatingMission}
+            loading={creatingMission || waterPreflightRunning}
           />
           {error ? <Text style={styles.errorText}>{error}</Text> : null}
         </View>
@@ -963,6 +1112,74 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     textAlign: "right",
     writingDirection: "rtl",
+  },
+  waterTankCard: {
+    marginTop: 18,
+    padding: 18,
+    borderRadius: 22,
+    borderWidth: 2,
+    backgroundColor: theme.colors.card,
+    gap: 16,
+  },
+  waterTankHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  waterTankTitle: {
+    color: theme.colors.textPrimary,
+    fontSize: 20,
+    fontWeight: "800",
+  },
+  waterTankRefreshText: {
+    color: theme.colors.textSecondary,
+    fontSize: 12,
+    marginTop: 3,
+  },
+  waterRefreshButton: {
+    minWidth: 86,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 18,
+    alignItems: "center",
+    backgroundColor: theme.colors.primary,
+  },
+  waterRefreshButtonDisabled: {
+    opacity: 0.55,
+  },
+  waterRefreshButtonPressed: {
+    opacity: 0.8,
+  },
+  waterRefreshButtonText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+  },
+  waterTankReadings: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  waterTankReading: {
+    flex: 1,
+    padding: 12,
+    borderRadius: 14,
+    alignItems: "center",
+    backgroundColor: theme.colors.muted,
+  },
+  waterTankReadingLabel: {
+    color: theme.colors.textSecondary,
+    fontSize: 12,
+  },
+  waterTankReadingValue: {
+    color: theme.colors.textPrimary,
+    fontSize: 16,
+    fontWeight: "800",
+    marginTop: 4,
+  },
+  waterTankMessage: {
+    fontSize: 14,
+    fontWeight: "700",
   },
   medicineList: {
     marginBottom: 20,

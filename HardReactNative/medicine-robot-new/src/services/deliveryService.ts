@@ -90,6 +90,20 @@ const startError = (error: unknown, missionId: number): ImmediateDeliveryStartEr
       true,
     );
   }
+  if (message.includes("WATER_EMPTY")) {
+    return new ImmediateDeliveryStartError(
+      "Water tank is empty. Fill it before starting delivery.",
+      missionId,
+      true,
+    );
+  }
+  if (message.includes("WATER_LEVEL_SENSOR_ERROR")) {
+    return new ImmediateDeliveryStartError(
+      "Unable to verify the water level. Check the ultrasonic sensor.",
+      missionId,
+      true,
+    );
+  }
   return new ImmediateDeliveryStartError(message, missionId, false);
 };
 

@@ -781,6 +781,8 @@ def create_app(
             MissionStartResult.HARDWARE_UNAVAILABLE.value: 503,
             MissionStartResult.EXECUTOR_BUSY.value: 409,
             MissionStartResult.INVALID_MISSION.value: 422,
+            MissionStartResult.WATER_EMPTY.value: 409,
+            MissionStartResult.WATER_LEVEL_SENSOR_ERROR.value: 409,
             MissionStartResult.HOME_UTURN_FAILED.value: 502,
             MissionStartResult.LINE_FOLLOW_START_FAILED.value: 502,
             MissionStartResult.MISSION_STATUS_UPDATE_FAILED.value: 502,

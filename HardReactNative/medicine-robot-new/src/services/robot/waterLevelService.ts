@@ -12,6 +12,18 @@ export interface WaterLevelDisplay {
   warning: string | null;
 }
 
+export const waterLevelMissionError = (
+  level: WaterLevelResponse,
+): string | null => {
+  if (level.status === "EMPTY") {
+    return "Water tank is empty. Fill it before starting delivery.";
+  }
+  if (!level.success || level.status === "SENSOR_ERROR") {
+    return "Unable to verify the water level. Check the ultrasonic sensor.";
+  }
+  return null;
+};
+
 export const getWaterLevel = async (): Promise<WaterLevelResponse> => {
   try {
     const response = await robotApi.get<unknown>("/water/level");
@@ -21,6 +33,22 @@ export const getWaterLevel = async (): Promise<WaterLevelResponse> => {
       getApiErrorMessage(error, "Unable to read the water level."),
     );
   }
+};
+
+export const getMissionReadyWaterLevel = async (
+  loadWaterLevel: () => Promise<WaterLevelResponse> = getWaterLevel,
+): Promise<WaterLevelResponse> => {
+  let level: WaterLevelResponse;
+  try {
+    level = await loadWaterLevel();
+  } catch {
+    throw new Error(
+      "Unable to verify the water level. Check the ultrasonic sensor.",
+    );
+  }
+  const readinessError = waterLevelMissionError(level);
+  if (readinessError) throw new Error(readinessError);
+  return level;
 };
 
 export const waterLevelDisplay = (
