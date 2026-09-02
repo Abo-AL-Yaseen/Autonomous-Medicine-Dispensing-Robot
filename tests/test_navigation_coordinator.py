@@ -78,7 +78,7 @@ def approved_navigation_map() -> PhysicalNavigationMap:
     return_routes = (
         ReturnRoute(1, (
             RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),
-            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+            RouteStep("NODE_0", RouteDecision.RIGHT, "HOME"),
         )),
         ReturnRoute(2, (
             RouteStep("ROOM_2", RouteDecision.U_TURN, "NODE_2"),
@@ -1059,7 +1059,7 @@ def test_room_one_full_automatic_arrival_dispense_return_home_chain() -> None:
     service.process_serial_line(U_TURN_COMPLETE)
     service.process_serial_line(INTERSECTION_EVENT)
     assert executor.state is MissionExecutionState.RETURNING_HOME
-    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
+    assert hardware.navigation == ["U_TURN", "RIGHT"]
     assert service.status()["expected_marker_id"] == 10
     service.process_serial_line(INTERSECTION_COMPLETE)
     service.process_serial_line(INTERSECTION_EVENT)
@@ -1067,7 +1067,7 @@ def test_room_one_full_automatic_arrival_dispense_return_home_chain() -> None:
     assert executor.state is MissionExecutionState.ARRIVED_HOME
     assert executor.mission_id == mission_id
     assert hardware.dispense == [(1, 1)]
-    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
+    assert hardware.navigation == ["U_TURN", "RIGHT"]
     assert hardware.line == ["stop", "stop"]
     assert hardware.water == [3000]
     assert service.status()["state"] == "ARRIVED_HOME"
@@ -1100,6 +1100,28 @@ def test_return_u_turn_runs_once_and_stale_arrival_event_cannot_move() -> None:
     assert hardware.navigation == ["U_TURN"]
     assert camera.calls == 0
     assert service.status()["expected_marker_id"] == 0
+
+
+def test_room_one_node_zero_dispatches_right_once_and_then_expects_home() -> None:
+    hardware = HardwareRecorder()
+    executor = arrived_executor(1, hardware)
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(0), confirmed_marker(10)),
+        hardware,
+    )
+    assert service.begin_return_home()["expected_marker_id"] == 0
+    service.process_serial_line(U_TURN_COMPLETE)
+
+    service.process_serial_line(INTERSECTION_EVENT)
+
+    assert hardware.navigation == ["U_TURN", "RIGHT"]
+    assert service.status()["last_node"] == "NODE_0"
+    assert service.status()["expected_marker_id"] == 10
+    service.process_serial_line(INTERSECTION_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+    assert hardware.navigation.count("RIGHT") == 1
+    assert executor.state is MissionExecutionState.ARRIVED_HOME
 
 
 def test_room_two_return_home_keeps_existing_detection_timing_until_home() -> None:
@@ -1186,7 +1208,7 @@ def test_marker_zero_continues_to_home_and_only_home_marks_arrived() -> None:
     service.process_serial_line(U_TURN_COMPLETE)
     service.process_serial_line(INTERSECTION_EVENT)
 
-    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
+    assert hardware.navigation == ["U_TURN", "RIGHT"]
     assert hardware.line == []
     assert hardware.dispense == [(1, 1)]
     assert hardware.water == [3000]
@@ -1195,7 +1217,7 @@ def test_marker_zero_continues_to_home_and_only_home_marks_arrived() -> None:
     assert service.status()["state"] == "COMMAND_SENT"
     assert service.status()["last_marker_id"] == 0
     assert service.status()["last_node"] == "NODE_0"
-    assert service.status()["last_decision"] == "STRAIGHT"
+    assert service.status()["last_decision"] == "RIGHT"
     assert service.status()["last_error"] is None
 
     service.process_serial_line(INTERSECTION_COMPLETE)
@@ -1382,7 +1404,7 @@ def test_arrived_home_is_observable_then_rearms_cleanly_without_stale_motion() -
     assert service.status()["last_decision"] == "ARRIVED"
 
     service.process_serial_line(INTERSECTION_EVENT)
-    assert hardware.navigation == ["U_TURN", "STRAIGHT"]
+    assert hardware.navigation == ["U_TURN", "RIGHT"]
     assert service.status()["armed"] is True
     assert service.status()["last_error"] is None
 
@@ -1442,7 +1464,7 @@ def test_second_mission_starts_cleanly_after_arrived_home_cleanup() -> None:
     service.process_serial_line(INTERSECTION_EVENT)
 
     assert executor.state is MissionExecutionState.GOING_TO_ROOM
-    assert hardware.navigation == ["U_TURN", "STRAIGHT", "LEFT"]
+    assert hardware.navigation == ["U_TURN", "RIGHT", "LEFT"]
     assert hardware.line == ["stop"]
     assert hardware.dispense == [(1, 1)]
     assert hardware.water == [3000]
@@ -1572,6 +1594,42 @@ def test_manual_recovery_restores_return_without_repeating_delivery() -> None:
     assert hardware.dispense == medicine_before
     assert hardware.water == water_before
     assert hardware.navigation == ["U_TURN"]
+
+
+def test_room_one_recovery_before_node_zero_preserves_pending_right() -> None:
+    hardware = HardwareRecorder()
+    executor = arrived_executor(1, hardware)
+    service = coordinator(executor, FakeCamera(confirmed_marker(0)), hardware)
+    assert service.begin_return_home()["success"] is True
+    service.process_serial_line(U_TURN_COMPLETE)
+
+    service.process_serial_line("EVENT|LINE_LOST|PATTERN=11111")
+
+    assert service.status()["expected_marker_id"] == 0
+    assert service.status()["manual_recovery_checkpoint_completed"] is False
+    assert service.resume_manual_recovery()["success"] is True
+    assert hardware.navigation == ["U_TURN"]
+    service.process_serial_line(INTERSECTION_EVENT)
+    assert hardware.navigation == ["U_TURN", "RIGHT"]
+    assert service.status()["expected_marker_id"] == 10
+
+
+def test_room_one_recovery_after_completed_right_does_not_repeat_it() -> None:
+    hardware = HardwareRecorder()
+    executor = arrived_executor(1, hardware)
+    service = coordinator(executor, FakeCamera(confirmed_marker(0)), hardware)
+    assert service.begin_return_home()["success"] is True
+    service.process_serial_line(U_TURN_COMPLETE)
+    service.process_serial_line(INTERSECTION_EVENT)
+    service.process_serial_line(INTERSECTION_COMPLETE)
+    assert hardware.navigation == ["U_TURN", "RIGHT"]
+    assert service.status()["expected_marker_id"] == 10
+
+    service.process_serial_line("EVENT|LINE_LOST|PATTERN=11111")
+    assert service.resume_manual_recovery()["success"] is True
+
+    assert service.status()["expected_marker_id"] == 10
+    assert hardware.navigation.count("RIGHT") == 1
 
 
 def test_manual_recovery_timeout_stops_and_fails_exactly_once() -> None:

@@ -133,7 +133,7 @@ class PhysicalNavigationMapTest extends TestCase
         return [
             '1' => [
                 ['ROOM_1', 'U_TURN', 'NODE_0'],
-                ['NODE_0', 'STRAIGHT', 'HOME'],
+                ['NODE_0', 'RIGHT', 'HOME'],
             ],
             '2' => [
                 ['ROOM_2', 'U_TURN', 'NODE_2'],
@@ -232,6 +232,15 @@ class PhysicalNavigationMapTest extends TestCase
             ['from_node' => 'NODE_2', 'to_node' => 'ROOM_3', 'direction' => 'LEFT'],
             ['from_node' => 'NODE_2', 'to_node' => 'ROOM_2', 'direction' => 'RIGHT'],
         ], $response->json('connections'));
+
+        $this->assertSame([
+            'room_id' => Room::query()->where('room_number', '1')->value('id'),
+            'room_number' => '1',
+            'steps' => [
+                ['from_node' => 'ROOM_1', 'to_node' => 'NODE_0', 'direction' => 'U_TURN'],
+                ['from_node' => 'NODE_0', 'to_node' => 'HOME', 'direction' => 'RIGHT'],
+            ],
+        ], $response->json('return_routes.0'));
 
         $this->assertSame([
             'room_id' => Room::query()->where('room_number', '2')->value('id'),

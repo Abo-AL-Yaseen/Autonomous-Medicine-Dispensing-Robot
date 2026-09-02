@@ -490,7 +490,7 @@ class MissionExecutor:
             self._state = MissionExecutionState.ARRIVED_AT_ROOM
             self._hand_confirmed = False
             mission_id = self._mission.id if self._mission else None
-        self._announce_voice(VoiceEvent.ARRIVED_AT_ROOM, mission_id)
+        self._announce_voice_and_wait(VoiceEvent.ARRIVED_AT_ROOM, mission_id)
 
     def wait_for_hand_confirmation(self, timeout_seconds: float) -> MissionHandOutcome:
         """Wait once for the ESP32's debounced hand confirmation at the room."""
@@ -510,9 +510,7 @@ class MissionExecutor:
             self._last_error = None
             mission_id = self._mission.id if self._mission else None
 
-        # This instruction is queued before the existing hand-sensor wait.
-        # Playback remains informational and never delays sensor handling.
-        self._announce_voice(VoiceEvent.WAITING_FOR_HAND, mission_id)
+        self._announce_voice_and_wait(VoiceEvent.WAITING_FOR_HAND, mission_id)
 
         try:
             if self._wait_for_hand is None:
@@ -535,6 +533,7 @@ class MissionExecutor:
                 MissionHandResult.HAND_TIMEOUT.value,
             )
 
+        self._announce_voice_and_wait(VoiceEvent.HAND_DETECTED, mission_id)
         with self._lock:
             if self._state is not MissionExecutionState.WAITING_FOR_HAND:
                 return MissionHandOutcome(
@@ -544,10 +543,13 @@ class MissionExecutor:
                 )
             self._hand_confirmed = True
             self._last_error = None
-        self._announce_voice(VoiceEvent.HAND_DETECTED, mission_id)
         return MissionHandOutcome(MissionHandResult.HAND_CONFIRMED, True)
 
-    def start_return_home(self) -> MissionReturnOutcome:
+    def start_return_home(
+        self,
+        *,
+        before_u_turn: Callable[[], None] | None = None,
+    ) -> MissionReturnOutcome:
         """Start one existing U-turn only after the pickup countdown reaches zero."""
 
         with self._lock:
@@ -581,23 +583,28 @@ class MissionExecutor:
                 "Mission destination context is unavailable.",
             )
 
+        with self._lock:
+            if (
+                self._state is not MissionExecutionState.WAITING_FOR_PICKUP
+                or self._pickup_seconds_remaining != 0
+            ):
+                return MissionReturnOutcome(
+                    MissionReturnResult.RETURN_NOT_ALLOWED,
+                    False,
+                    f"MissionExecutor is {self._state.value}.",
+                )
+            # Claim the return transition before waiting or hardware I/O so a
+            # second request cannot dispatch another U-turn concurrently.
+            self._state = MissionExecutionState.RETURNING_HOME
+            self._last_error = None
+
+        self._announce_voice_and_wait(VoiceEvent.RETURNING_HOME, mission.id)
+
         try:
+            if before_u_turn is not None:
+                before_u_turn()
             if self._u_turn is None:
                 raise RuntimeError("U-turn operation is not configured")
-            with self._lock:
-                if (
-                    self._state is not MissionExecutionState.WAITING_FOR_PICKUP
-                    or self._pickup_seconds_remaining != 0
-                ):
-                    return MissionReturnOutcome(
-                        MissionReturnResult.RETURN_NOT_ALLOWED,
-                        False,
-                        f"MissionExecutor is {self._state.value}.",
-                    )
-                # Claim the return transition before hardware I/O so a second
-                # request cannot dispatch another U-turn concurrently.
-                self._state = MissionExecutionState.RETURNING_HOME
-                self._last_error = None
             acknowledgement = self._u_turn()
             if acknowledgement != U_TURN_STARTED_ACK:
                 raise RuntimeError(
@@ -614,7 +621,6 @@ class MissionExecutor:
                 message,
             )
 
-        self._announce_voice(VoiceEvent.RETURNING_HOME, mission.id)
         return MissionReturnOutcome(MissionReturnResult.RETURN_STARTED, True)
 
     def dispense_at_room(self) -> MissionDispenseOutcome:
@@ -656,7 +662,7 @@ class MissionExecutor:
             self._last_error = None
             mission_id = mission.id
 
-        self._announce_voice(VoiceEvent.DISPENSING, mission_id)
+        self._announce_voice_and_wait(VoiceEvent.DISPENSING, mission_id)
 
         try:
             if self._get_disk_status is not None:
@@ -694,10 +700,10 @@ class MissionExecutor:
                 message,
             )
 
+        self._announce_voice_and_wait(VoiceEvent.MEDICINE_COMPLETED, mission_id)
         with self._lock:
             self._state = MissionExecutionState.DISPENSE_COMPLETED
             self._last_error = None
-        self._announce_voice(VoiceEvent.MEDICINE_COMPLETED, mission_id)
         return MissionDispenseOutcome(
             MissionDispenseResult.DISPENSE_COMPLETED,
             True,
@@ -749,10 +755,10 @@ class MissionExecutor:
                 message,
             )
 
+        self._announce_voice_and_wait(VoiceEvent.DELIVERY_COMPLETED, mission_id)
         with self._lock:
             self._state = MissionExecutionState.WATER_DISPENSE_COMPLETED
             self._last_error = None
-        self._announce_voice(VoiceEvent.DELIVERY_COMPLETED, mission_id)
         return MissionWaterOutcome(
             MissionWaterResult.WATER_DISPENSE_COMPLETED,
             True,
@@ -803,7 +809,7 @@ class MissionExecutor:
                 )
             self._state = MissionExecutionState.ARRIVED_HOME
             mission_id = self._mission.id if self._mission else None
-        self._announce_voice(VoiceEvent.ARRIVED_HOME, mission_id)
+        self._announce_voice_and_wait(VoiceEvent.ARRIVED_HOME, mission_id)
 
     def finalize_arrived_home(self) -> bool:
         """Complete the confirmed mission and release its runtime context.
@@ -1142,3 +1148,23 @@ class MissionExecutor:
             self._voice.say(event, scope=mission_id)
         except Exception as exc:
             logger.warning("VOICE enqueue failed: %s", exc)
+
+    def _announce_voice_and_wait(
+        self,
+        event: VoiceEvent,
+        mission_id: int | None,
+    ) -> None:
+        """Bound critical playback while keeping voice outside executor locks."""
+
+        if self._voice is None:
+            return
+        try:
+            say_and_wait = getattr(self._voice, "say_and_wait", None)
+            if callable(say_and_wait):
+                say_and_wait(event, scope=mission_id)
+            else:
+                # Compatibility for injected announcers that only implement
+                # the original asynchronous protocol.
+                self._voice.say(event, scope=mission_id)
+        except Exception as exc:
+            logger.warning("VOICE blocking playback failed: %s", exc)

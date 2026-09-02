@@ -7,7 +7,7 @@ import os
 import queue
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VOICE_LANGUAGE = "ar"
 DEFAULT_PLAYBACK_TIMEOUT_SECONDS = 30.0
+DEFAULT_BLOCKING_TIMEOUT_SECONDS = 30.0
 MAX_DEDUPLICATION_KEYS = 512
 
 
@@ -81,11 +82,13 @@ class VoiceSettings:
     language: str = DEFAULT_VOICE_LANGUAGE
     audio_directory: Path | None = None
     playback_timeout_seconds: float = DEFAULT_PLAYBACK_TIMEOUT_SECONDS
+    blocking_timeout_seconds: float = DEFAULT_BLOCKING_TIMEOUT_SECONDS
 
     @classmethod
     def from_environment(cls) -> "VoiceSettings":
         audio_directory = os.getenv("VOICE_AUDIO_DIR")
         timeout_raw = os.getenv("VOICE_PLAYBACK_TIMEOUT_SECONDS")
+        blocking_timeout_raw = os.getenv("VOICE_BLOCKING_TIMEOUT_SECONDS")
         timeout = DEFAULT_PLAYBACK_TIMEOUT_SECONDS
         if timeout_raw is not None:
             try:
@@ -99,6 +102,19 @@ class VoiceSettings:
                     "VOICE_PLAYBACK_TIMEOUT_SECONDS must be positive"
                 )
 
+        blocking_timeout = DEFAULT_BLOCKING_TIMEOUT_SECONDS
+        if blocking_timeout_raw is not None:
+            try:
+                blocking_timeout = float(blocking_timeout_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "VOICE_BLOCKING_TIMEOUT_SECONDS must be a number"
+                ) from exc
+            if blocking_timeout <= 0:
+                raise ValueError(
+                    "VOICE_BLOCKING_TIMEOUT_SECONDS must be positive"
+                )
+
         return cls(
             enabled=_read_boolean_setting("VOICE_ENABLED", False),
             language=os.getenv("VOICE_LANGUAGE", DEFAULT_VOICE_LANGUAGE),
@@ -108,6 +124,7 @@ class VoiceSettings:
                 else None
             ),
             playback_timeout_seconds=timeout,
+            blocking_timeout_seconds=blocking_timeout,
         )
 
 
@@ -116,6 +133,15 @@ class VoiceAnnouncer(Protocol):
 
     def say(self, event: VoiceEvent, *, scope: int | str | None = None) -> bool:
         """Queue an event and return immediately."""
+
+    def say_and_wait(
+        self,
+        event: VoiceEvent,
+        *,
+        scope: int | str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        """Wait boundedly for one exact queued event to finish playback."""
 
 
 class AudioPlayer(Protocol):
@@ -163,6 +189,14 @@ class LinuxAudioPlayer:
     def close(self) -> None:
         with self._process_lock:
             self._closed = True
+            process = self._active_process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    def cancel_current(self) -> None:
+        """Terminate only the currently active local playback process."""
+
+        with self._process_lock:
             process = self._active_process
         if process is not None and process.poll() is None:
             process.terminate()
@@ -219,14 +253,33 @@ class LinuxAudioPlayer:
         return stdout or b""
 
 
-@dataclass(frozen=True)
+@dataclass
 class _QueuedSpeech:
     event: VoiceEvent
     message: str
+    deduplication_key: tuple[str, VoiceEvent]
+    completion: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    started: bool = False
+    cancelled: bool = False
+
+    def begin(self) -> bool:
+        with self.lock:
+            if self.cancelled:
+                return False
+            self.started = True
+            return True
+
+    def cancel_before_start(self) -> bool:
+        with self.lock:
+            if self.started:
+                return False
+            self.cancelled = True
+            return True
 
 
 class VoiceService:
-    """Queue patient guidance without making mission execution wait for audio."""
+    """Single-worker voice queue with async and bounded synchronous delivery."""
 
     def __init__(
         self,
@@ -240,6 +293,7 @@ class VoiceService:
         self._stop_event = threading.Event()
         self._state_lock = threading.Lock()
         self._seen_keys: dict[tuple[str, VoiceEvent], None] = {}
+        self._pending_items: dict[tuple[str, VoiceEvent], _QueuedSpeech] = {}
         self._closed = False
         self._worker: threading.Thread | None = None
 
@@ -267,20 +321,81 @@ class VoiceService:
     def say(self, event: VoiceEvent, *, scope: int | str | None = None) -> bool:
         """Queue one deduplicated event without waiting for synthesis or playback."""
 
+        speech = self._enqueue(event, scope=scope)
+        return speech is not None
+
+    def say_and_wait(
+        self,
+        event: VoiceEvent,
+        *,
+        scope: int | str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        """Wait for actual playback completion without ever waiting forever."""
+
+        if threading.current_thread() is self._worker:
+            logger.warning("VOICE blocking playback requested from voice worker")
+            return False
+        wait_seconds = (
+            self._settings.blocking_timeout_seconds
+            if timeout is None
+            else timeout
+        )
+        if wait_seconds <= 0:
+            raise ValueError("voice blocking timeout must be positive")
+
+        speech = self._enqueue(event, scope=scope)
+        if speech is None:
+            return False
+        if speech.completion.wait(wait_seconds):
+            return True
+
+        cancelled_before_start = speech.cancel_before_start()
+        if cancelled_before_start:
+            with self._state_lock:
+                if self._pending_items.get(speech.deduplication_key) is speech:
+                    del self._pending_items[speech.deduplication_key]
+        else:
+            cancel_current = getattr(self._player, "cancel_current", None)
+            if callable(cancel_current):
+                try:
+                    cancel_current()
+                except Exception as exc:
+                    logger.warning("VOICE playback cancellation failed: %s", exc)
+        logger.warning(
+            "VOICE blocking timeout event=%s started=%s",
+            event.value,
+            not cancelled_before_start,
+        )
+        return False
+
+    def _enqueue(
+        self,
+        event: VoiceEvent,
+        *,
+        scope: int | str | None,
+    ) -> _QueuedSpeech | None:
+        """Claim one scope/event key and enqueue it exactly once."""
+
         with self._state_lock:
             if not self.enabled or self._closed:
-                return False
+                return None
             deduplication_key = (str(scope) if scope is not None else "global", event)
-            if deduplication_key in self._seen_keys:
-                return False
-            self._seen_keys[deduplication_key] = None
-            if len(self._seen_keys) > MAX_DEDUPLICATION_KEYS:
-                oldest_key = next(iter(self._seen_keys))
-                del self._seen_keys[oldest_key]
+            if (
+                deduplication_key in self._seen_keys
+                or deduplication_key in self._pending_items
+            ):
+                return None
+            speech = _QueuedSpeech(
+                event,
+                ARABIC_MESSAGES[event],
+                deduplication_key,
+            )
+            self._pending_items[deduplication_key] = speech
 
-        self._queue.put(_QueuedSpeech(event, ARABIC_MESSAGES[event]))
+        self._queue.put(speech)
         logger.info("VOICE event=%s", event.value)
-        return True
+        return speech
 
     def status(self) -> dict[str, object]:
         with self._state_lock:
@@ -290,6 +405,7 @@ class VoiceService:
                 "language": self._settings.language,
                 "worker_running": bool(worker and worker.is_alive()),
                 "queued_messages": self._queue.qsize(),
+                "blocking_timeout_seconds": self._settings.blocking_timeout_seconds,
                 "prerecorded_audio_directory": (
                     str(self._settings.audio_directory)
                     if self._settings.audio_directory is not None
@@ -320,11 +436,26 @@ class VoiceService:
             try:
                 if speech is None or self._stop_event.is_set():
                     return
+                if not speech.begin():
+                    with self._state_lock:
+                        if self._pending_items.get(speech.deduplication_key) is speech:
+                            del self._pending_items[speech.deduplication_key]
+                    speech.completion.set()
+                    continue
+                with self._state_lock:
+                    if self._pending_items.get(speech.deduplication_key) is speech:
+                        del self._pending_items[speech.deduplication_key]
+                    self._seen_keys[speech.deduplication_key] = None
+                    if len(self._seen_keys) > MAX_DEDUPLICATION_KEYS:
+                        oldest_key = next(iter(self._seen_keys))
+                        del self._seen_keys[oldest_key]
                 try:
                     self._player.play(speech.event, speech.message)
                 except Exception as exc:
                     if not self._stop_event.is_set():
                         logger.warning("VOICE playback failed: %s", exc)
+                finally:
+                    speech.completion.set()
             finally:
                 self._queue.task_done()
 

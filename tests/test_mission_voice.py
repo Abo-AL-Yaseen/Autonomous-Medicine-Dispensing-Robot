@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from raspberry_controller.services.laravel_api_client import ClaimedMission
 from raspberry_controller.services.mission_executor import (
     MissionExecutionState,
@@ -29,6 +31,48 @@ class RecordingVoice:
         if self.fail:
             raise RuntimeError("voice queue unavailable")
         return True
+
+    def say_and_wait(
+        self,
+        event: VoiceEvent,
+        *,
+        scope: int | str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        return self.say(event, scope=scope)
+
+
+class GatedVoice(RecordingVoice):
+    def __init__(self, gated_event: VoiceEvent, *, fail: bool = False) -> None:
+        super().__init__(fail=fail)
+        self.gated_event = gated_event
+        self.playback_started = threading.Event()
+        self.playback_release = threading.Event()
+
+    def say_and_wait(
+        self,
+        event: VoiceEvent,
+        *,
+        scope: int | str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        result = self.say(event, scope=scope)
+        if event is self.gated_event:
+            self.playback_started.set()
+            self.playback_release.wait(1.0)
+        return result
+
+
+class TimeoutVoice(RecordingVoice):
+    def say_and_wait(
+        self,
+        event: VoiceEvent,
+        *,
+        scope: int | str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        self.events.append((event, scope))
+        return False
 
 
 def mission() -> ClaimedMission:
@@ -60,7 +104,7 @@ def navigation_map() -> PhysicalNavigationMap:
                 1,
                 (
                     RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),
-                    RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+                    RouteStep("NODE_0", RouteDecision.RIGHT, "HOME"),
                 ),
             ),
         ),
@@ -70,6 +114,8 @@ def navigation_map() -> PhysicalNavigationMap:
 def build_executor(
     voice: RecordingVoice,
     *,
+    wait_for_hand=None,
+    u_turn=None,
     dispense_medicine=None,
     dispense_water=None,
 ) -> MissionExecutor:
@@ -77,8 +123,8 @@ def build_executor(
         hardware_available=lambda: True,
         start_line_follow=lambda: "ACK|LINE_FOLLOW_STARTED",
         stop_line_follow=lambda: "ACK|LINE_FOLLOW_STOPPED",
-        u_turn=lambda: "ACK|U_TURN_STARTED",
-        wait_for_hand=lambda _timeout: True,
+        u_turn=u_turn or (lambda: "ACK|U_TURN_STARTED"),
+        wait_for_hand=wait_for_hand or (lambda _timeout: True),
         dispense_medicine=dispense_medicine
         or (
             lambda box, quantity: {
@@ -157,6 +203,20 @@ def test_voice_enqueue_failure_never_changes_successful_mission_state(caplog) ->
     assert "VOICE enqueue failed: voice queue unavailable" in caplog.text
 
 
+def test_voice_timeout_result_never_fails_physical_mission_stages() -> None:
+    voice = TimeoutVoice()
+    executor = build_executor(voice)
+
+    advance_to_hand_confirmed(executor)
+    assert executor.dispense_at_room().success
+    assert executor.dispense_water_at_room().success
+    assert executor.begin_pickup_wait(1)
+    assert executor.update_pickup_wait(0)
+    assert executor.start_return_home().success
+
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+
+
 def test_medicine_failure_has_one_specific_failure_event() -> None:
     voice = RecordingVoice()
 
@@ -200,3 +260,129 @@ def test_manual_recovery_voice_failure_does_not_block_recovery(caplog) -> None:
     assert executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
     assert VoiceEvent.MANUAL_RECOVERY in event_names(voice)
     assert "VOICE enqueue failed: voice queue unavailable" in caplog.text
+
+
+def test_hand_polling_starts_only_after_waiting_prompt_completes() -> None:
+    voice = GatedVoice(VoiceEvent.WAITING_FOR_HAND)
+    hand_polled = threading.Event()
+    executor = build_executor(
+        voice,
+        wait_for_hand=lambda _timeout: hand_polled.set() or True,
+    )
+    assert executor.accept(mission())
+    assert executor.start_ready_mission().success
+    executor.mark_arrived_at_room()
+    outcomes = []
+    caller = threading.Thread(
+        target=lambda: outcomes.append(executor.wait_for_hand_confirmation(1.0))
+    )
+
+    caller.start()
+    assert voice.playback_started.wait(1.0)
+    assert hand_polled.is_set() is False
+    voice.playback_release.set()
+    caller.join(1.0)
+
+    assert outcomes[0].success is True
+    assert hand_polled.is_set()
+
+
+def test_medicine_command_waits_for_dispensing_prompt() -> None:
+    voice = GatedVoice(VoiceEvent.DISPENSING)
+    medicine_sent = threading.Event()
+    executor = build_executor(
+        voice,
+        dispense_medicine=lambda box, quantity: (
+            medicine_sent.set()
+            or {
+                "box_number": box,
+                "requested_pills": quantity,
+                "dispensed_pills": quantity,
+            }
+        ),
+    )
+    advance_to_hand_confirmed(executor)
+    outcomes = []
+    caller = threading.Thread(
+        target=lambda: outcomes.append(executor.dispense_at_room())
+    )
+
+    caller.start()
+    assert voice.playback_started.wait(1.0)
+    assert medicine_sent.is_set() is False
+    voice.playback_release.set()
+    caller.join(1.0)
+
+    assert outcomes[0].success is True
+    assert medicine_sent.is_set()
+
+
+def test_water_command_waits_for_medicine_completed_prompt() -> None:
+    voice = GatedVoice(VoiceEvent.MEDICINE_COMPLETED)
+    water_sent = threading.Event()
+    executor = build_executor(
+        voice,
+        dispense_water=lambda duration: water_sent.set() or {"duration_ms": duration},
+    )
+    advance_to_hand_confirmed(executor)
+    medicine_outcomes = []
+    caller = threading.Thread(
+        target=lambda: medicine_outcomes.append(executor.dispense_at_room())
+    )
+
+    caller.start()
+    assert voice.playback_started.wait(1.0)
+    assert executor.state is MissionExecutionState.DISPENSING
+    assert water_sent.is_set() is False
+    voice.playback_release.set()
+    caller.join(1.0)
+    assert medicine_outcomes[0].success is True
+
+    assert executor.dispense_water_at_room().success
+    assert water_sent.is_set()
+
+
+def test_return_u_turn_waits_for_returning_home_prompt() -> None:
+    voice = GatedVoice(VoiceEvent.RETURNING_HOME)
+    u_turn_sent = threading.Event()
+    executor = build_executor(
+        voice,
+        u_turn=lambda: u_turn_sent.set() or "ACK|U_TURN_STARTED",
+    )
+    advance_to_hand_confirmed(executor)
+    assert executor.dispense_at_room().success
+    assert executor.dispense_water_at_room().success
+    assert executor.begin_pickup_wait(1)
+    assert executor.update_pickup_wait(0)
+    outcomes = []
+    caller = threading.Thread(
+        target=lambda: outcomes.append(executor.start_return_home())
+    )
+
+    caller.start()
+    assert voice.playback_started.wait(1.0)
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+    assert u_turn_sent.is_set() is False
+    voice.playback_release.set()
+    caller.join(1.0)
+
+    assert outcomes[0].success is True
+    assert u_turn_sent.is_set()
+
+
+def test_arrived_home_voice_failure_does_not_prevent_cleanup(caplog) -> None:
+    voice = RecordingVoice(fail=True)
+    executor = build_executor(voice)
+    advance_to_hand_confirmed(executor)
+    assert executor.dispense_at_room().success
+    assert executor.dispense_water_at_room().success
+    assert executor.begin_pickup_wait(1)
+    assert executor.update_pickup_wait(0)
+    assert executor.start_return_home().success
+
+    executor.mark_arrived_home()
+    assert executor.finalize_arrived_home() is True
+
+    assert executor.state is MissionExecutionState.IDLE
+    assert executor.mission_id is None
+    assert "VOICE blocking playback failed" in caplog.text

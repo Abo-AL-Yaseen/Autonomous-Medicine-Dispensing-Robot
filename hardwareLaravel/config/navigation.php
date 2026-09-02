@@ -14,7 +14,7 @@ return [
     'return_routes' => [
         '1' => [
             ['from_node' => 'ROOM_1', 'to_node' => 'NODE_0', 'direction' => 'U_TURN'],
-            ['from_node' => 'NODE_0', 'to_node' => 'HOME', 'direction' => 'STRAIGHT'],
+            ['from_node' => 'NODE_0', 'to_node' => 'HOME', 'direction' => 'RIGHT'],
         ],
         '2' => [
             ['from_node' => 'ROOM_2', 'to_node' => 'NODE_2', 'direction' => 'U_TURN'],

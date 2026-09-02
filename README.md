@@ -45,6 +45,7 @@ The API reads these optional environment variables:
 | `VOICE_LANGUAGE` | `ar` (eSpeak NG voice code) |
 | `VOICE_AUDIO_DIR` | unset (optional directory of prerecorded event WAV files) |
 | `VOICE_PLAYBACK_TIMEOUT_SECONDS` | `30` seconds |
+| `VOICE_BLOCKING_TIMEOUT_SECONDS` | `30` seconds (maximum wait for critical patient guidance) |
 
 ## Arabic Bluetooth voice guidance
 
@@ -102,9 +103,11 @@ For higher-quality recorded Arabic, set `VOICE_AUDIO_DIR` to a directory of
 WAV files named after the lowercase event, such as
 `arrived_at_room.wav`, `waiting_for_hand.wav`, and
 `delivery_completed.wav`. A matching file is played with `paplay`; a missing
-file automatically falls back to offline eSpeak NG synthesis. Playback is
-queued and informational: audio errors are logged and never alter mission,
-navigation, dispensing, or water state.
+file automatically falls back to offline eSpeak NG synthesis. Playback uses
+one queue and worker. Critical patient prompts wait for actual playback before
+the corresponding physical action, bounded by `VOICE_BLOCKING_TIMEOUT_SECONDS`;
+other events remain asynchronous. Audio errors and timeouts are logged and
+never alter mission, navigation, dispensing, or water state.
 
 ## Validation
 

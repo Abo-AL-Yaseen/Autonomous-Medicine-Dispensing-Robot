@@ -374,7 +374,11 @@ def _navigation_map_fixture() -> PhysicalNavigationMap:
             room_id,
             (
                 RouteStep(f"ROOM_{room_id}", RouteDecision.U_TURN, "NODE_0"),
-                RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+                RouteStep(
+                    "NODE_0",
+                    RouteDecision.RIGHT if room_id == 1 else RouteDecision.STRAIGHT,
+                    "HOME",
+                ),
             ),
         )
         for room_id in range(1, 6)
@@ -1954,14 +1958,6 @@ def test_movement_endpoint_sends_exactly_one_command(
 ) -> None:
     response = client.post(endpoint)
 
-    if endpoint.startswith("/movement/manual/"):
-        assert response.status_code == 409
-        assert response.json() == {
-            "detail": {"code": "MANUAL_RECOVERY_NOT_ACTIVE"}
-        }
-        assert fake_hardware.movement_calls == []
-        return
-
     assert response.status_code == 200
     assert response.json() == {
         "success": True,
@@ -1969,6 +1965,64 @@ def test_movement_endpoint_sends_exactly_one_command(
         "response": acknowledgement,
     }
     assert fake_hardware.movement_calls == [movement]
+    executor: MissionExecutor = client.app.state.mission_executor
+    assert executor.state is MissionExecutionState.IDLE
+    assert executor.mission_id is None
+    assert executor.manual_recovery_snapshot() is None
+
+
+def test_manual_direction_is_rejected_during_active_autonomous_mission(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor: MissionExecutor = client.app.state.mission_executor
+    assert executor.accept(executable_mission()) is True
+
+    response = client.post("/movement/manual/forward")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "MANUAL_CONTROL_NOT_ALLOWED_DURING_ACTIVE_MISSION"
+        }
+    }
+    assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
+    assert fake_hardware.movement_calls == []
+
+
+def test_emergency_stop_remains_available_during_active_mission(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor: MissionExecutor = client.app.state.mission_executor
+    assert executor.accept(executable_mission()) is True
+
+    response = client.post("/movement/stop")
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "ACK|STOP"
+    assert executor.state is MissionExecutionState.READY_FOR_EXECUTION
+    assert fake_hardware.movement_calls == ["stop"]
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/executor/manual-recovery/resume",
+        "/executor/manual-recovery/cancel",
+    ],
+)
+def test_manual_recovery_actions_remain_unavailable_while_idle(
+    client: TestClient,
+    endpoint: str,
+) -> None:
+    response = client.post(endpoint)
+
+    assert response.status_code == 409
+    assert response.json()["result"] == "MANUAL_RECOVERY_NOT_ACTIVE"
+    executor: MissionExecutor = client.app.state.mission_executor
+    assert executor.state is MissionExecutionState.IDLE
+    assert executor.mission_id is None
 
 
 def enter_api_manual_recovery(client: TestClient) -> MissionExecutor:
@@ -2063,6 +2117,21 @@ def test_manual_recovery_cancel_endpoint_uses_the_same_safe_stop(
     assert response.json()["response"] == "ACK|STOP"
     assert executor.state is MissionExecutionState.FAILED
     assert fake_hardware.movement_calls.count("stop") == 1
+
+
+def test_failed_state_keeps_ordinary_manual_control_without_recovery(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor = enter_api_manual_recovery(client)
+    assert client.post("/executor/manual-recovery/cancel").status_code == 200
+
+    response = client.post("/movement/manual/backward")
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "ACK|MANUAL_BACKWARD"
+    assert executor.state is MissionExecutionState.FAILED
+    assert executor.manual_recovery_snapshot() is None
 
 
 def test_hardware_disconnection_exits_manual_recovery_instead_of_extending_it(

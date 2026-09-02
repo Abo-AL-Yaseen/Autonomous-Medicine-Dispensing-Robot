@@ -1003,7 +1003,7 @@ def create_app(
 
     @application.post("/movement/manual/forward")
     def manual_forward(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-forward",
             lambda controller: controller.manual_forward(),
@@ -1011,7 +1011,7 @@ def create_app(
 
     @application.post("/movement/manual/backward")
     def manual_backward(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-backward",
             lambda controller: controller.manual_backward(),
@@ -1019,7 +1019,7 @@ def create_app(
 
     @application.post("/movement/manual/left")
     def manual_left(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-left",
             lambda controller: controller.manual_left(),
@@ -1027,7 +1027,7 @@ def create_app(
 
     @application.post("/movement/manual/right")
     def manual_right(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-right",
             lambda controller: controller.manual_right(),
@@ -1035,7 +1035,7 @@ def create_app(
 
     @application.post("/movement/manual/forward-left")
     def manual_forward_left(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-forward-left",
             lambda controller: controller.manual_forward_left(),
@@ -1043,7 +1043,7 @@ def create_app(
 
     @application.post("/movement/manual/forward-right")
     def manual_forward_right(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-forward-right",
             lambda controller: controller.manual_forward_right(),
@@ -1051,7 +1051,7 @@ def create_app(
 
     @application.post("/movement/manual/backward-left")
     def manual_backward_left(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-backward-left",
             lambda controller: controller.manual_backward_left(),
@@ -1059,7 +1059,7 @@ def create_app(
 
     @application.post("/movement/manual/backward-right")
     def manual_backward_right(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-backward-right",
             lambda controller: controller.manual_backward_right(),
@@ -1067,7 +1067,7 @@ def create_app(
 
     @application.post("/movement/manual/stop")
     def manual_stop(request: Request) -> dict[str, object]:
-        return _manual_recovery_movement_response(
+        return _manual_movement_response(
             request,
             "manual-stop",
             lambda controller: controller.manual_stop(),
@@ -1288,12 +1288,29 @@ def _movement_response(
     return {"success": True, "movement": movement, "response": response}
 
 
-def _manual_recovery_movement_response(
+def _manual_movement_response(
     request: Request,
     movement: str,
     operation: Callable[[RobotHardwareController], str],
 ) -> dict[str, object]:
-    """Allow manual PWM only inside the coordinator's bounded recovery lock."""
+    """Route ordinary and recovery manual drive under their state policies."""
+
+    executor: MissionExecutor = request.app.state.mission_executor
+    executor_state = executor.state
+    if executor_state in {
+        MissionExecutionState.IDLE,
+        MissionExecutionState.FAILED,
+    }:
+        response = _run_hardware_operation(request, operation)
+        return {"success": True, "movement": movement, "response": response}
+
+    if executor_state is not MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MANUAL_CONTROL_NOT_ALLOWED_DURING_ACTIVE_MISSION"
+            },
+        )
 
     coordinator: NavigationCoordinator = request.app.state.navigation_coordinator
     allowed, response = coordinator.execute_manual_recovery_drive(

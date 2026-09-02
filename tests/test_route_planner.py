@@ -53,7 +53,7 @@ def approved_navigation_map() -> PhysicalNavigationMap:
     return_routes = (
         ReturnRoute(1, (
             RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),
-            RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+            RouteStep("NODE_0", RouteDecision.RIGHT, "HOME"),
         )),
         ReturnRoute(2, (
             RouteStep("ROOM_2", RouteDecision.U_TURN, "NODE_2"),
@@ -191,7 +191,7 @@ def test_missing_directed_path_returns_no_route() -> None:
 @pytest.mark.parametrize(
     ("room_id", "marker_id", "expected_steps"),
     [
-        (1, 11, [("ROOM_1", "U_TURN", "NODE_0"), ("NODE_0", "STRAIGHT", "HOME")]),
+        (1, 11, [("ROOM_1", "U_TURN", "NODE_0"), ("NODE_0", "RIGHT", "HOME")]),
         (2, 12, [
             ("ROOM_2", "U_TURN", "NODE_2"),
             ("NODE_2", "LEFT", "NODE_1"),
@@ -229,6 +229,8 @@ def test_exact_approved_return_routes(
         for step in plan.steps
     ] == expected_steps
     at_node_zero = planner.plan_return(0, room_id)
-    assert at_node_zero.decision is RouteDecision.STRAIGHT
+    assert at_node_zero.decision is (
+        RouteDecision.RIGHT if room_id == 1 else RouteDecision.STRAIGHT
+    )
     assert at_node_zero.next_node == "HOME"
     assert planner.plan_return(10, room_id).decision is RouteDecision.ARRIVED

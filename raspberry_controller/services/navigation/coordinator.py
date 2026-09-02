@@ -7,6 +7,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TypeVar
 
 from ..camera import ArucoCameraService, FreshConfirmationSession
 from ..mission_executor import (
@@ -15,6 +16,7 @@ from ..mission_executor import (
     MISSION_PICKUP_WAIT_SECONDS,
     MissionExecutionState,
     MissionExecutor,
+    MissionReturnOutcome,
     MissionStartResult,
     MissionRouteUnavailableError,
 )
@@ -33,6 +35,8 @@ U_TURN_COMPLETE_PREFIX = "EVENT|U_TURN_COMPLETE|"
 U_TURN_FAILED_PREFIX = "EVENT|U_TURN_FAILED"
 LINE_LOST_PREFIX = "EVENT|LINE_LOST|"
 U_TURN_FAILURE_DIAGNOSTIC_PREFIX = "UTURN|FAILURE="
+
+_OperationResult = TypeVar("_OperationResult")
 
 
 @dataclass(frozen=True)
@@ -551,7 +555,7 @@ class NavigationCoordinator:
                 self._last_error = None
                 self._state = NavigationCoordinatorState.RETURNING_HOME
 
-            outcome = self._executor.start_return_home()
+            outcome = self._start_return_home_with_unlocked_voice()
             if not outcome.success:
                 with self._lock:
                     self._expected_marker_id = None
@@ -1175,9 +1179,13 @@ class NavigationCoordinator:
                 except Exception:
                     stop_error = "LINE_FOLLOW_STOP_FAILED"
                 if executor_state is MissionExecutionState.RETURNING_HOME:
-                    self._executor.mark_arrived_home()
+                    self._run_without_processing_lock(
+                        self._executor.mark_arrived_home
+                    )
                 else:
-                    self._executor.mark_arrived_at_room()
+                    self._run_without_processing_lock(
+                        self._executor.mark_arrived_at_room
+                    )
                 with self._lock:
                     self._expected_marker_id = None
                     self._state = (
@@ -1234,6 +1242,37 @@ class NavigationCoordinator:
         with self._lock:
             self._state = NavigationCoordinatorState.ERROR
             self._last_error = code
+
+    def _run_without_processing_lock(
+        self,
+        operation: Callable[[], _OperationResult],
+    ) -> _OperationResult:
+        """Run bounded patient audio without retaining the route/hardware lock."""
+
+        self._processing_lock.release()
+        try:
+            return operation()
+        finally:
+            self._processing_lock.acquire()
+
+    def _start_return_home_with_unlocked_voice(self) -> MissionReturnOutcome:
+        """Release for voice, then reacquire immediately before the U-turn."""
+
+        processing_lock_reacquired = False
+
+        def reacquire_before_u_turn() -> None:
+            nonlocal processing_lock_reacquired
+            self._processing_lock.acquire()
+            processing_lock_reacquired = True
+
+        self._processing_lock.release()
+        try:
+            return self._executor.start_return_home(
+                before_u_turn=reacquire_before_u_turn
+            )
+        finally:
+            if not processing_lock_reacquired:
+                self._processing_lock.acquire()
 
     def _start_home_finalization(self) -> None:
         """Keep the confirmed home arrival observable, then release it."""

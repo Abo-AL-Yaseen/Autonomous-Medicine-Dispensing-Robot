@@ -134,7 +134,7 @@ def navigation_map_for_room_one() -> PhysicalNavigationMap:
                 1,
                 (
                     RouteStep("ROOM_1", RouteDecision.U_TURN, "NODE_0"),
-                    RouteStep("NODE_0", RouteDecision.STRAIGHT, "HOME"),
+                    RouteStep("NODE_0", RouteDecision.RIGHT, "HOME"),
                 ),
             ),
         ),
