@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from math import ceil
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -53,6 +54,7 @@ from .services.mission_scheduler import (
     MissionSchedulerLoop,
     SchedulerSettings,
 )
+from .services.voice_service import VoiceEvent, VoiceService, VoiceSettings
 
 
 API_NAME = "Autonomous Medicine Dispensing Robot Hardware API"
@@ -67,6 +69,7 @@ ResultType = TypeVar("ResultType")
 ControllerFactory = Callable[["HardwareSettings"], RobotHardwareController]
 LaravelClientFactory = Callable[[SchedulerSettings], LaravelMissionClient]
 CameraFactory = Callable[[CameraSettings], ArucoCameraService]
+VoiceFactory = Callable[[VoiceSettings], VoiceService]
 
 
 @dataclass(frozen=True)
@@ -242,11 +245,18 @@ def build_camera_service(settings: CameraSettings) -> ArucoCameraService:
     return ArucoCameraService(settings)
 
 
+def build_voice_service(settings: VoiceSettings) -> VoiceService:
+    """Create the optional process-wide voice queue without playing audio yet."""
+
+    return VoiceService(settings)
+
+
 def create_app(
     controller_factory: ControllerFactory = build_hardware_controller,
     laravel_client_factory: LaravelClientFactory = build_laravel_client,
     camera_factory: CameraFactory = build_camera_service,
     utc_now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    voice_factory: VoiceFactory = build_voice_service,
 ) -> FastAPI:
     """Create an API application, optionally with an injected test controller."""
 
@@ -258,16 +268,20 @@ def create_app(
         scheduler_settings = SchedulerSettings.from_environment()
         camera_settings = CameraSettings.from_environment()
         navigation_settings = NavigationCoordinatorSettings.from_environment()
+        voice_settings = VoiceSettings.from_environment()
         controller = controller_factory(settings)
         hardware_lock = threading.Lock()
         laravel_client = laravel_client_factory(scheduler_settings)
         camera_service = camera_factory(camera_settings)
+        voice_service = voice_factory(voice_settings)
 
         application.state.hardware_controller = controller
         application.state.hardware_lock = hardware_lock
         application.state.hardware_connected = False
         application.state.hardware_settings = settings
         application.state.camera_service = camera_service
+        application.state.voice_service = voice_service
+        application.state.voice_settings = voice_settings
 
         def hardware_available() -> bool:
             return bool(application.state.hardware_connected)
@@ -371,6 +385,7 @@ def create_app(
             mark_mission_in_progress=laravel_client.start_claimed_mission,
             mark_mission_completed=laravel_client.complete_claimed_mission,
             load_navigation_map=laravel_client.get_navigation_map,
+            voice=voice_service,
             auto_execution_enabled=scheduler_settings.auto_execution_enabled,
             require_home_readiness=True,
         )
@@ -435,6 +450,7 @@ def create_app(
         # require a FastAPI restart.
         navigation_coordinator.confirm_home_readiness()
 
+        voice_service.start()
         navigation_coordinator.start()
         scheduler_loop.start()
 
@@ -443,6 +459,7 @@ def create_app(
         finally:
             scheduler_loop.stop()
             navigation_coordinator.stop()
+            voice_service.close()
             try:
                 camera_service.close()
             except Exception:
@@ -488,6 +505,8 @@ def create_app(
                 "/executor/status",
                 "/executor/start",
                 "/executor/return-home",
+                "/voice/status",
+                "/voice/test",
                 "/dispense",
                 "/water/level",
                 "/water/dispense",
@@ -527,6 +546,26 @@ def create_app(
                 "/missions/{id}/cancel",
                 "/docs",
             ],
+        }
+
+    @application.get("/voice/status")
+    def voice_status(request: Request) -> dict[str, object]:
+        """Report voice availability without probing Bluetooth or playing audio."""
+
+        voice: VoiceService = request.app.state.voice_service
+        return voice.status()
+
+    @application.post("/voice/test")
+    def voice_test(request: Request) -> dict[str, object]:
+        """Queue one fixed Arabic test sentence; no caller text reaches a process."""
+
+        voice: VoiceService = request.app.state.voice_service
+        queued = voice.say(VoiceEvent.TEST, scope=f"test-{time.monotonic_ns()}")
+        return {
+            "success": queued,
+            "queued": queued,
+            "enabled": voice.enabled,
+            "event": VoiceEvent.TEST.value,
         }
 
     @application.get("/health")

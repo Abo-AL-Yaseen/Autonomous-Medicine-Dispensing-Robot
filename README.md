@@ -41,6 +41,70 @@ The API reads these optional environment variables:
 | `NAVIGATION_AUTO_ENABLED` | `false` (intersection events are observable but cannot move the robot) |
 | `ARUCO_MIN_AREA_RATIO` | `1.4` (minimum largest/second-largest marker dominance) |
 | `MISSION_CLAIM_LEASE_SECONDS` | `60` seconds (Laravel stale-claim recovery) |
+| `VOICE_ENABLED` | `false` (voice guidance is opt-in) |
+| `VOICE_LANGUAGE` | `ar` (eSpeak NG voice code) |
+| `VOICE_AUDIO_DIR` | unset (optional directory of prerecorded event WAV files) |
+| `VOICE_PLAYBACK_TIMEOUT_SECONDS` | `30` seconds |
+
+## Arabic Bluetooth voice guidance
+
+Voice runs only on the Raspberry Pi. It sends audio to the current Linux
+PulseAudio/PipeWire default sink, so Bluetooth pairing and default-speaker
+selection remain operating-system responsibilities. The application never
+stores a speaker MAC address or attempts to pair a device during a mission.
+
+Install the offline system audio tools:
+
+```bash
+sudo apt update
+sudo apt install -y espeak-ng pulseaudio-utils
+```
+
+Pair/connect the speaker once with the Raspberry Pi desktop or `bluetoothctl`,
+then select it as the default sink. On Raspberry Pi OS using PipeWire, inspect
+and select sinks with:
+
+```bash
+wpctl status
+wpctl set-default <bluetooth-sink-id>
+```
+
+The PulseAudio-compatible alternative is:
+
+```bash
+pactl list short sinks
+pactl set-default-sink <bluetooth-sink-name>
+```
+
+Test offline Arabic synthesis through the selected speaker before starting the
+API:
+
+```bash
+espeak-ng --stdout -v ar "مرحباً، نظام الصوت يعمل بنجاح." | paplay
+```
+
+Enable guidance for the one-worker production process:
+
+```bash
+VOICE_ENABLED=true \
+VOICE_LANGUAGE=ar \
+python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+Then inspect the worker and queue a fixed safe test sentence:
+
+```bash
+curl http://127.0.0.1:8000/voice/status
+curl -X POST http://127.0.0.1:8000/voice/test
+```
+
+For higher-quality recorded Arabic, set `VOICE_AUDIO_DIR` to a directory of
+WAV files named after the lowercase event, such as
+`arrived_at_room.wav`, `waiting_for_hand.wav`, and
+`delivery_completed.wav`. A matching file is played with `paplay`; a missing
+file automatically falls back to offline eSpeak NG synthesis. Playback is
+queued and informational: audio errors are logged and never alter mission,
+navigation, dispensing, or water state.
 
 ## Validation
 
