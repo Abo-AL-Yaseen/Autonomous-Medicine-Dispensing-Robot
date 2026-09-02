@@ -11,6 +11,7 @@ import type {
   MissionItem,
   MissionExecutorState,
   MissionExecutorStatus,
+  ManualRecoveryResponse,
   MovementResponse,
   ExecutorStartResponse,
   RobotHardwareStatus,
@@ -104,6 +105,7 @@ const missionExecutorStates: readonly MissionExecutorState[] = [
   "WATER_DISPENSE_COMPLETED",
   "WAITING_FOR_PICKUP",
   "RETURNING_HOME",
+  "WAITING_FOR_MANUAL_RECOVERY",
   "ARRIVED_HOME",
   "FAILED",
 ];
@@ -124,7 +126,36 @@ export const normalizeMissionExecutorStatus = (
     );
   }
 
-  return {
+  const manualRecoveryActive =
+    value.manual_recovery_active === undefined
+      ? false
+      : requireBoolean(
+          value.manual_recovery_active,
+          "FastAPI executor status",
+          "manual_recovery_active",
+        );
+  const manualRecoveryPreviousState =
+    value.manual_recovery_previous_state === undefined ||
+    value.manual_recovery_previous_state === null
+      ? null
+      : requireString(
+          value.manual_recovery_previous_state,
+          "FastAPI executor status",
+          "manual_recovery_previous_state",
+        );
+  if (
+    manualRecoveryPreviousState !== null &&
+    !missionExecutorStates.includes(
+      manualRecoveryPreviousState as MissionExecutorState,
+    )
+  ) {
+    return invalidResponse(
+      "FastAPI executor status",
+      "has an unsupported manual recovery previous state.",
+    );
+  }
+
+  const normalized: MissionExecutorStatus = {
     state: state as MissionExecutorState,
     mission_id: nullableMissionId(
       value.mission_id,
@@ -147,6 +178,70 @@ export const normalizeMissionExecutorStatus = (
             0,
           ),
   };
+  if (manualRecoveryActive || state === "WAITING_FOR_MANUAL_RECOVERY") {
+    normalized.manual_recovery_active = manualRecoveryActive;
+    normalized.manual_recovery_reason =
+      optionalNullableString(
+        value.manual_recovery_reason,
+        "FastAPI executor status",
+        "manual_recovery_reason",
+      ) ?? null;
+    normalized.manual_recovery_seconds_remaining = requireInteger(
+      value.manual_recovery_seconds_remaining,
+      "FastAPI executor status",
+      "manual_recovery_seconds_remaining",
+      0,
+    );
+    normalized.manual_recovery_previous_state =
+      manualRecoveryPreviousState as MissionExecutorState | null;
+    normalized.manual_recovery_can_resume = requireBoolean(
+      value.manual_recovery_can_resume,
+      "FastAPI executor status",
+      "manual_recovery_can_resume",
+    );
+  }
+  return normalized;
+};
+
+export const normalizeManualRecoveryResponse = (
+  payload: unknown,
+): ManualRecoveryResponse => {
+  const value = requireRecord(payload, "FastAPI manual recovery");
+  return {
+    success: requireBoolean(value.success, "FastAPI manual recovery", "success"),
+    result: requireString(value.result, "FastAPI manual recovery", "result"),
+    message:
+      optionalNullableString(
+        value.message,
+        "FastAPI manual recovery",
+        "message",
+      ) ?? null,
+    ...(value.already_resumed === undefined
+      ? {}
+      : {
+          already_resumed: requireBoolean(
+            value.already_resumed,
+            "FastAPI manual recovery",
+            "already_resumed",
+          ),
+        }),
+    ...(typeof value.line_reading === "string"
+      ? { line_reading: value.line_reading }
+      : {}),
+    ...(typeof value.previous_state === "string"
+      ? { previous_state: value.previous_state as MissionExecutorState }
+      : {}),
+    ...(value.checkpoint_completed === undefined
+      ? {}
+      : {
+          checkpoint_completed: requireBoolean(
+            value.checkpoint_completed,
+            "FastAPI manual recovery",
+            "checkpoint_completed",
+          ),
+        }),
+    executor: normalizeMissionExecutorStatus(value.executor),
+  };
 };
 
 export const missionExecutorStatusText = (
@@ -157,6 +252,10 @@ export const missionExecutorStatusText = (
       status.pickup_seconds_remaining === undefined
       ? "Waiting for patient pickup"
       : `Waiting for patient pickup (${status.pickup_seconds_remaining}s)`;
+  }
+
+  if (status.state === "WAITING_FOR_MANUAL_RECOVERY") {
+    return `Manual route recovery (${status.manual_recovery_seconds_remaining ?? 0}s)`;
   }
 
   return status.state

@@ -32,6 +32,7 @@ class VoiceEvent(str, Enum):
     DELIVERY_COMPLETED = "DELIVERY_COMPLETED"
     RETURNING_HOME = "RETURNING_HOME"
     ARRIVED_HOME = "ARRIVED_HOME"
+    MANUAL_RECOVERY = "MANUAL_RECOVERY"
     MEDICINE_FAILED = "MEDICINE_FAILED"
     WATER_FAILED = "WATER_FAILED"
     GENERAL_FAILED = "GENERAL_FAILED"
@@ -56,6 +57,9 @@ ARABIC_MESSAGES: dict[VoiceEvent, str] = {
     ),
     VoiceEvent.RETURNING_HOME: "جاري العودة إلى نقطة البداية.",
     VoiceEvent.ARRIVED_HOME: "تم الوصول إلى نقطة البداية.",
+    VoiceEvent.MANUAL_RECOVERY: (
+        "تم فقدان المسار، يرجى إعادة الروبوت إلى الخط ثم الضغط على متابعة."
+    ),
     VoiceEvent.MEDICINE_FAILED: (
         "تنبيه، تعذر صرف الدواء. يرجى طلب المساعدة."
     ),

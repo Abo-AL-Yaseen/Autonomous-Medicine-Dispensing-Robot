@@ -173,6 +173,12 @@ class HardwareRecorder:
         self.command_event = threading.Event()
         self.dispense_event = threading.Event()
         self.return_started_event = threading.Event()
+        self.manual: list[str] = []
+        self.emergency_stops = 0
+        self.resume_line_valid = True
+        self.resume_line_reading = (
+            "LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011"
+        )
 
     def command(self, direction: str) -> str:
         self.navigation.append(direction)
@@ -182,6 +188,21 @@ class HardwareRecorder:
     def stop_line_follow(self) -> str:
         self.line.append("stop")
         return "ACK|LINE_FOLLOW_STOPPED"
+
+    def start_line_follow(self) -> str:
+        self.line.append("start")
+        return "ACK|LINE_FOLLOW_STARTED"
+
+    def prepare_manual_recovery_resume(self) -> tuple[bool, str, str | None]:
+        self.manual.append("stop")
+        acknowledgement = (
+            self.start_line_follow() if self.resume_line_valid else None
+        )
+        return self.resume_line_valid, self.resume_line_reading, acknowledgement
+
+    def emergency_stop(self) -> str:
+        self.emergency_stops += 1
+        return "ACK|STOP"
 
     def u_turn(self) -> str:
         self.navigation.append("U_TURN")
@@ -231,6 +252,7 @@ def going_executor(
     wait_for_hand: Callable[[float], bool] | None = None,
     dispense_medicine: Callable[[int, int], dict[str, int]] | None = None,
     dispense_water: Callable[[int], dict[str, int]] | None = None,
+    monotonic: Callable[[], float] | None = None,
 ) -> MissionExecutor:
     executor = MissionExecutor(
         hardware_available=lambda: True,
@@ -243,6 +265,7 @@ def going_executor(
         mark_mission_in_progress=lambda mission: None,
         load_navigation_map=load_map,
         require_home_readiness=False,
+        **({"monotonic": monotonic} if monotonic is not None else {}),
     )
     assert executor.accept(mission_for_room(room_id)) is True
     assert executor.start_ready_mission().success is True
@@ -280,12 +303,14 @@ def coordinator(
     home_line_position_is_valid: Callable[[], bool] = lambda: True,
     pickup_wait_seconds: int = 30,
     wait_for_pickup_tick: Callable[[float], bool] = lambda _: False,
+    manual_recovery_timeout_seconds: float = 15.0,
 ) -> NavigationCoordinator:
     return NavigationCoordinator(
         settings=NavigationCoordinatorSettings(
             enabled=enabled,
             arrived_home_observation_seconds=arrived_home_observation_seconds,
             pickup_wait_seconds=pickup_wait_seconds,
+            manual_recovery_timeout_seconds=manual_recovery_timeout_seconds,
         ),
         executor=executor,
         camera_service=camera,  # type: ignore[arg-type]
@@ -299,6 +324,8 @@ def coordinator(
         wait_for_pickup_tick=wait_for_pickup_tick,
         load_navigation_map=approved_navigation_map,
         home_line_position_is_valid=home_line_position_is_valid,
+        prepare_manual_recovery_resume=hardware.prepare_manual_recovery_resume,
+        emergency_stop=hardware.emergency_stop,
     )
 
 
@@ -441,6 +468,38 @@ def test_outbound_u_turn_failure_never_starts_line_follow() -> None:
     assert started["result"] == "HOME_UTURN_FAILED"
     assert executor.state is MissionExecutionState.FAILED
     assert line_starts == []
+
+
+def test_outbound_u_turn_event_can_resume_without_restarting_the_mission() -> None:
+    hardware = HardwareRecorder()
+    line_starts: list[str] = []
+    executor = home_ready_executor(
+        1,
+        u_turn=hardware.u_turn,
+        line_starts=line_starts,
+    )
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(10)),
+        hardware,
+    )
+    started = service.begin_outbound_from_home()
+    mission_id = executor.mission_id
+
+    service.process_serial_line("UTURN|FAILURE=LOCK_TIMEOUT")
+    service.process_serial_line("EVENT|U_TURN_FAILED")
+
+    assert executor.status()["manual_recovery_previous_state"] == "STARTING"
+    assert line_starts == []
+    resumed = service.resume_manual_recovery()
+
+    assert resumed["success"] is True
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert executor.mission_id == mission_id
+    assert line_starts == []
+    assert hardware.line == ["stop", "start"]
+    assert hardware.navigation == ["U_TURN"]
+    assert service.status()["expected_marker_id"] == started["expected_marker_id"]
 
 
 def test_navigation_auto_is_disabled_by_default(
@@ -719,7 +778,7 @@ def test_expected_room_marker_is_used_for_arrival_after_previous_decision() -> N
     assert service.status()["expected_marker_id"] == 0
 
 
-def test_failed_maneuver_is_reported_and_does_not_rearm() -> None:
+def test_failed_maneuver_enters_manual_recovery_and_ignores_stale_events() -> None:
     hardware = HardwareRecorder()
     service = coordinator(
         going_executor(1),
@@ -730,11 +789,16 @@ def test_failed_maneuver_is_reported_and_does_not_rearm() -> None:
     service.process_serial_line(INTERSECTION_EVENT)
     service.process_serial_line(INTERSECTION_FAILED)
     assert service.status()["last_error"] == "INTERSECTION_MANEUVER_FAILED"
+    assert (
+        service._executor.state
+        is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+    )
     service.process_serial_line(INTERSECTION_EVENT)
+    service.process_serial_line(INTERSECTION_COMPLETE)
 
     assert hardware.navigation == ["LEFT"]
     assert service.status()["armed"] is False
-    assert service.status()["last_error"] == "DUPLICATE_INTERSECTION_EVENT"
+    assert service.status()["last_error"] == "INTERSECTION_MANEUVER_FAILED"
 
 
 @pytest.mark.parametrize(
@@ -1410,3 +1474,143 @@ def test_disabled_preview_never_moves_or_changes_executor_state() -> None:
     assert status["state"] == "DISABLED"
     assert status["last_command"] is None
     assert status["last_error"] is None
+
+
+def test_manual_recovery_preserves_outbound_route_and_resumes_checkpoint_once() -> None:
+    hardware = HardwareRecorder()
+    executor = going_executor(1)
+    mission_id = executor.mission_id
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(0)),
+        hardware,
+    )
+
+    service.process_serial_line(INTERSECTION_EVENT)
+    expected_marker = service.status()["expected_marker_id"]
+    service.process_serial_line(INTERSECTION_FAILED)
+
+    recovery = executor.status()
+    assert recovery["state"] == "WAITING_FOR_MANUAL_RECOVERY"
+    assert recovery["mission_id"] == mission_id
+    assert recovery["manual_recovery_seconds_remaining"] == 15
+    assert recovery["manual_recovery_previous_state"] == "GOING_TO_ROOM"
+    assert service.status()["expected_marker_id"] == expected_marker
+    assert service.status()["manual_recovery_checkpoint_completed"] is True
+    with pytest.raises(RuntimeError, match="already holding a mission"):
+        executor.accept(mission_for_room(2))
+
+    allowed, response = service.execute_manual_recovery_drive(
+        lambda: hardware.manual.append("forward") or "ACK|MANUAL_FORWARD"
+    )
+    assert allowed is True
+    assert response == "ACK|MANUAL_FORWARD"
+
+    hardware.resume_line_valid = False
+    rejected = service.resume_manual_recovery()
+    assert rejected["result"] == "LINE_NOT_DETECTED_FOR_RESUME"
+    assert executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+
+    hardware.resume_line_valid = True
+    resumed = service.resume_manual_recovery()
+    duplicate = service.resume_manual_recovery()
+
+    assert resumed["success"] is True
+    assert resumed["checkpoint_completed"] is True
+    assert duplicate["success"] is True
+    assert duplicate["already_resumed"] is True
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert executor.mission_id == mission_id
+    assert service.status()["expected_marker_id"] == expected_marker
+    assert service.status()["state"] == "WAITING_FOR_INTERSECTION"
+    assert hardware.navigation == ["LEFT"]
+    assert hardware.line == ["stop", "start"]
+
+    service.process_serial_line("EVENT|LINE_LOST|PATTERN=11111")
+    assert service.cancel_manual_recovery()["success"] is True
+    assert service.resume_manual_recovery()["success"] is False
+
+
+def test_stale_u_turn_diagnostic_during_recovery_cannot_leak_after_resume() -> None:
+    hardware = HardwareRecorder()
+    executor = going_executor(1)
+    service = coordinator(executor, FakeCamera(confirmed_marker(0)), hardware)
+
+    service.process_serial_line("UTURN|FAILURE=PREVIOUS_FAILURE")
+    service.process_serial_line("EVENT|LINE_LOST|PATTERN=11111")
+    service.process_serial_line("UTURN|FAILURE=STALE_FAILURE")
+    assert service.resume_manual_recovery()["success"] is True
+
+    service.process_serial_line("EVENT|U_TURN_FAILED")
+
+    assert executor.status()["manual_recovery_reason"] == "U_TURN_MANEUVER_FAILED"
+
+
+def test_manual_recovery_restores_return_without_repeating_delivery() -> None:
+    hardware = HardwareRecorder()
+    executor = arrived_executor(1, hardware)
+    service = coordinator(executor, FakeCamera(confirmed_marker(0)), hardware)
+    assert service.begin_return_home()["success"] is True
+    medicine_before = list(hardware.dispense)
+    water_before = list(hardware.water)
+    expected_marker = service.status()["expected_marker_id"]
+
+    service.process_serial_line("UTURN|FAILURE=ALIGN_LINE_LOST")
+    service.process_serial_line("EVENT|U_TURN_FAILED")
+    status = executor.status()
+
+    assert status["manual_recovery_reason"] == (
+        "U_TURN_MANEUVER_FAILED|FAILURE=ALIGN_LINE_LOST"
+    )
+    assert status["manual_recovery_previous_state"] == "RETURNING_HOME"
+    resumed = service.resume_manual_recovery()
+
+    assert resumed["success"] is True
+    assert executor.state is MissionExecutionState.RETURNING_HOME
+    assert service.status()["state"] == "RETURNING_HOME"
+    assert service.status()["expected_marker_id"] == expected_marker
+    assert hardware.dispense == medicine_before
+    assert hardware.water == water_before
+    assert hardware.navigation == ["U_TURN"]
+
+
+def test_manual_recovery_timeout_stops_and_fails_exactly_once() -> None:
+    now = [100.0]
+    hardware = HardwareRecorder()
+    executor = going_executor(1, monotonic=lambda: now[0])
+    service = coordinator(
+        executor,
+        FakeCamera(confirmed_marker(0)),
+        hardware,
+        manual_recovery_timeout_seconds=15,
+    )
+
+    service.process_serial_line("EVENT|LINE_LOST|PATTERN=11111")
+    assert executor.status()["manual_recovery_seconds_remaining"] == 15
+    now[0] = 114.1
+    assert executor.status()["manual_recovery_seconds_remaining"] == 1
+    now[0] = 115.0
+
+    assert service.check_manual_recovery_timeout() is True
+    assert service.check_manual_recovery_timeout() is False
+    assert executor.state is MissionExecutionState.FAILED
+    assert executor.status()["last_error"] == "MANUAL_RECOVERY_TIMEOUT"
+    assert hardware.emergency_stops == 1
+
+
+def test_stop_during_manual_recovery_clears_context_once() -> None:
+    hardware = HardwareRecorder()
+    executor = going_executor(1)
+    service = coordinator(executor, FakeCamera(confirmed_marker(0)), hardware)
+    service.process_serial_line("EVENT|LINE_LOST|PATTERN=11111")
+
+    cancelled = service.cancel_manual_recovery()
+    duplicate = service.cancel_manual_recovery()
+
+    assert cancelled["success"] is True
+    assert cancelled["response"] == "ACK|STOP"
+    assert duplicate["success"] is False
+    assert executor.state is MissionExecutionState.FAILED
+    assert "manual_recovery_active" not in executor.status()
+    assert "manual_recovery_checkpoint_completed" not in service.status()
+    assert hardware.emergency_stops == 1

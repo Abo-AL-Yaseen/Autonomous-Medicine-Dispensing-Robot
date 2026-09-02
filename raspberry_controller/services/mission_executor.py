@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -25,6 +27,7 @@ LINE_FOLLOW_STOPPED_ACK = "ACK|LINE_FOLLOW_STOPPED"
 U_TURN_STARTED_ACK = "ACK|U_TURN_STARTED"
 MISSION_WATER_DISPENSE_MS = 3000
 MISSION_PICKUP_WAIT_SECONDS = 30
+MANUAL_RECOVERY_TIMEOUT_SECONDS = 15.0
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,7 @@ class MissionExecutionState(str, Enum):
     WATER_DISPENSE_COMPLETED = "WATER_DISPENSE_COMPLETED"
     WAITING_FOR_PICKUP = "WAITING_FOR_PICKUP"
     RETURNING_HOME = "RETURNING_HOME"
+    WAITING_FOR_MANUAL_RECOVERY = "WAITING_FOR_MANUAL_RECOVERY"
     ARRIVED_HOME = "ARRIVED_HOME"
     FAILED = "FAILED"
 
@@ -88,6 +92,16 @@ class MissionHandResult(str, Enum):
 
 class MissionRouteUnavailableError(RuntimeError):
     """No accepted mission or Laravel map is available for route preview."""
+
+
+@dataclass(frozen=True)
+class ManualRecoverySnapshot:
+    """Immutable executor context used to serialize recovery races safely."""
+
+    generation: int
+    previous_state: MissionExecutionState
+    reason: str
+    deadline: float
 
 
 @dataclass(frozen=True)
@@ -179,6 +193,7 @@ class MissionExecutor:
         mark_mission_completed: Callable[[ClaimedMission], None] | None = None,
         load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
         voice: VoiceAnnouncer | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
         auto_execution_enabled: bool = False,
         require_home_readiness: bool = True,
     ) -> None:
@@ -199,10 +214,15 @@ class MissionExecutor:
         self._mark_mission_completed = mark_mission_completed
         self._load_navigation_map = load_navigation_map
         self._voice = voice
+        self._monotonic = monotonic
         self._route_planner: LaravelRoutePlanner | None = None
         self._destination_node: PhysicalNode | None = None
         self._hand_confirmed = False
         self._pickup_seconds_remaining: int | None = None
+        self._manual_recovery_generation = 0
+        self._manual_recovery_previous_state: MissionExecutionState | None = None
+        self._manual_recovery_reason: str | None = None
+        self._manual_recovery_deadline: float | None = None
         self._auto_execution_enabled = auto_execution_enabled
         self._require_home_readiness = require_home_readiness
         self._home_ready = not require_home_readiness
@@ -273,7 +293,135 @@ class MissionExecutor:
             self._last_error = None
             self._hand_confirmed = False
             self._pickup_seconds_remaining = None
+            self._clear_manual_recovery_locked()
             self._state = MissionExecutionState.READY_FOR_EXECUTION
+            return True
+
+    def begin_manual_recovery(
+        self,
+        reason: str,
+        *,
+        timeout_seconds: float = MANUAL_RECOVERY_TIMEOUT_SECONDS,
+    ) -> ManualRecoverySnapshot | None:
+        """Pause one navigation phase without releasing its mission context."""
+
+        if not reason:
+            raise ValueError("manual recovery reason must not be empty")
+        if timeout_seconds <= 0:
+            raise ValueError("manual recovery timeout must be positive")
+
+        with self._lock:
+            if (
+                self._state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+                and self._manual_recovery_previous_state is not None
+                and self._manual_recovery_reason is not None
+                and self._manual_recovery_deadline is not None
+            ):
+                return ManualRecoverySnapshot(
+                    self._manual_recovery_generation,
+                    self._manual_recovery_previous_state,
+                    self._manual_recovery_reason,
+                    self._manual_recovery_deadline,
+                )
+            if self._state not in {
+                MissionExecutionState.STARTING,
+                MissionExecutionState.GOING_TO_ROOM,
+                MissionExecutionState.RETURNING_HOME,
+            }:
+                return None
+
+            previous_state = self._state
+            self._manual_recovery_generation += 1
+            self._manual_recovery_previous_state = previous_state
+            self._manual_recovery_reason = reason
+            self._manual_recovery_deadline = self._monotonic() + timeout_seconds
+            self._state = MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+            self._last_error = reason
+            mission_id = self._mission.id if self._mission else None
+            snapshot = ManualRecoverySnapshot(
+                self._manual_recovery_generation,
+                previous_state,
+                reason,
+                self._manual_recovery_deadline,
+            )
+
+        self._announce_voice(VoiceEvent.MANUAL_RECOVERY, mission_id)
+        return snapshot
+
+    def manual_recovery_snapshot(self) -> ManualRecoverySnapshot | None:
+        with self._lock:
+            if (
+                self._state is not MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+                or self._manual_recovery_previous_state is None
+                or self._manual_recovery_reason is None
+                or self._manual_recovery_deadline is None
+            ):
+                return None
+            return ManualRecoverySnapshot(
+                self._manual_recovery_generation,
+                self._manual_recovery_previous_state,
+                self._manual_recovery_reason,
+                self._manual_recovery_deadline,
+            )
+
+    def manual_recovery_expired(self, generation: int) -> bool:
+        with self._lock:
+            return bool(
+                self._state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+                and self._manual_recovery_generation == generation
+                and self._manual_recovery_deadline is not None
+                and self._monotonic() >= self._manual_recovery_deadline
+            )
+
+    def restore_manual_recovery(
+        self,
+        generation: int,
+    ) -> MissionExecutionState | None:
+        """Restore the paused navigation phase exactly once."""
+
+        with self._lock:
+            if (
+                self._state is not MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+                or self._manual_recovery_generation != generation
+                or self._manual_recovery_previous_state is None
+                or self._manual_recovery_deadline is None
+                or self._monotonic() >= self._manual_recovery_deadline
+            ):
+                return None
+            previous_state = self._manual_recovery_previous_state
+            self._state = previous_state
+            self._last_error = None
+            self._clear_manual_recovery_locked()
+            return previous_state
+
+    def fail_manual_recovery(self, generation: int, reason: str) -> bool:
+        """Apply the existing retained-mission failure state once."""
+
+        with self._lock:
+            if (
+                self._state is not MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+                or self._manual_recovery_generation != generation
+            ):
+                return False
+            self._state = MissionExecutionState.FAILED
+            self._last_error = reason
+            self._clear_manual_recovery_locked()
+            return True
+
+    def fail_active_navigation(self, reason: str) -> bool:
+        """Fail one active navigation phase without releasing the mission."""
+
+        with self._lock:
+            if self._state not in {
+                MissionExecutionState.STARTING,
+                MissionExecutionState.GOING_TO_ROOM,
+                MissionExecutionState.RETURNING_HOME,
+                MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY,
+            }:
+                return False
+            self._state = MissionExecutionState.FAILED
+            self._last_error = reason
+            self._clear_manual_recovery_locked()
             return True
 
     def plan_route(self, marker_id: int) -> tuple[ClaimedMission, RoutePlan]:
@@ -695,6 +843,7 @@ class MissionExecutor:
             self._route_planner = None
             self._destination_node = None
             self._pickup_seconds_remaining = None
+            self._clear_manual_recovery_locked()
             self._last_error = None
             self._state = MissionExecutionState.IDLE
         return True
@@ -778,7 +927,11 @@ class MissionExecutor:
 
         return MissionStartOutcome(MissionStartResult.U_TURN_STARTED, True)
 
-    def complete_start_u_turn(self) -> MissionStartOutcome:
+    def complete_start_u_turn(
+        self,
+        *,
+        line_follow_already_started: bool = False,
+    ) -> MissionStartOutcome:
         """Start outbound line following after the ESP32 confirms the U-turn."""
 
         with self._lock:
@@ -796,17 +949,24 @@ class MissionExecutor:
                 "Claimed mission data is missing.",
             )
 
-        try:
-            if self._start_line_follow is None:
-                raise RuntimeError("Line-follow start operation is not configured")
-            acknowledgement = self._start_line_follow()
-            if acknowledgement != LINE_FOLLOW_STARTED_ACK:
-                raise RuntimeError(
-                    f"Unexpected line-follow acknowledgement: {acknowledgement!r}"
+        if not line_follow_already_started:
+            try:
+                if self._start_line_follow is None:
+                    raise RuntimeError("Line-follow start operation is not configured")
+                acknowledgement = self._start_line_follow()
+                if acknowledgement != LINE_FOLLOW_STARTED_ACK:
+                    raise RuntimeError(
+                        "Unexpected line-follow acknowledgement: "
+                        f"{acknowledgement!r}"
+                    )
+            except Exception as exc:
+                message = self._stop_after_failure(
+                    f"Line-follow start failed: {exc}"
                 )
-        except Exception as exc:
-            message = self._stop_after_failure(f"Line-follow start failed: {exc}")
-            return self._fail(MissionStartResult.LINE_FOLLOW_START_FAILED, message)
+                return self._fail(
+                    MissionStartResult.LINE_FOLLOW_START_FAILED,
+                    message,
+                )
 
         try:
             if self._mark_mission_in_progress is None:
@@ -844,7 +1004,20 @@ class MissionExecutor:
     def status(self) -> dict[str, object]:
         with self._lock:
             mission = self._mission
-            return {
+            manual_recovery_active = (
+                self._state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+                and self._manual_recovery_deadline is not None
+            )
+            seconds_remaining = (
+                max(
+                    0,
+                    math.ceil(self._manual_recovery_deadline - self._monotonic()),
+                )
+                if manual_recovery_active
+                and self._manual_recovery_deadline is not None
+                else None
+            )
+            result: dict[str, object] = {
                 "state": self._state.value,
                 "mission_id": mission.id if mission else None,
                 "room_id": mission.room_id if mission else None,
@@ -859,6 +1032,24 @@ class MissionExecutor:
                 "home_ready": self._home_ready,
                 "home_readiness_error": self._home_readiness_error,
             }
+            if manual_recovery_active:
+                result.update(
+                    {
+                        "manual_recovery_active": True,
+                        "manual_recovery_reason": self._manual_recovery_reason,
+                        "manual_recovery_seconds_remaining": seconds_remaining,
+                        "manual_recovery_previous_state": (
+                            self._manual_recovery_previous_state.value
+                            if self._manual_recovery_previous_state is not None
+                            else None
+                        ),
+                        "manual_recovery_can_resume": bool(
+                            seconds_remaining is not None
+                            and seconds_remaining > 0
+                        ),
+                    }
+                )
+            return result
 
     @staticmethod
     def _validate_mission(mission: ClaimedMission | None) -> str | None:
@@ -898,7 +1089,13 @@ class MissionExecutor:
         with self._lock:
             self._state = MissionExecutionState.FAILED
             self._last_error = message
+            self._clear_manual_recovery_locked()
         return MissionStartOutcome(result, False, message)
+
+    def _clear_manual_recovery_locked(self) -> None:
+        self._manual_recovery_previous_state = None
+        self._manual_recovery_reason = None
+        self._manual_recovery_deadline = None
 
     def _announce_voice(
         self,

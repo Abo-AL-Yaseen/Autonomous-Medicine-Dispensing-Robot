@@ -15,6 +15,7 @@ from raspberry_controller.api import (
     WaterCalibrationError,
     calculate_water_duration_ms,
     create_app,
+    is_safe_manual_recovery_line,
 )
 from raspberry_controller.hardware_controller import SerialConnectionError
 from raspberry_controller.services.camera import (
@@ -71,6 +72,9 @@ class FakeHardwareController:
         self.line_stop_response = "ACK|LINE_FOLLOW_STOPPED"
         self.line_status = (
             "LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=00000"
+        )
+        self.line_reading = (
+            "LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011"
         )
         self.line_start_error: Exception | None = None
         self.camera_calls: list[str] = []
@@ -230,7 +234,7 @@ class FakeHardwareController:
     def get_line_reading(self) -> str:
         return self._record_line_call(
             "get_line_reading",
-            "LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011",
+            self.line_reading,
         )
 
     def get_line_status(self) -> str:
@@ -594,6 +598,8 @@ def test_root_lists_api_information(client: TestClient) -> None:
     assert "/executor/status" in body["endpoints"]
     assert "/executor/start" in body["endpoints"]
     assert "/executor/return-home" in body["endpoints"]
+    assert "/executor/manual-recovery/resume" in body["endpoints"]
+    assert "/executor/manual-recovery/cancel" in body["endpoints"]
     assert "/water/level" in body["endpoints"]
     assert "/water/dispense" in body["endpoints"]
     assert "/water/pump/start" in body["endpoints"]
@@ -1897,6 +1903,14 @@ def test_movement_endpoint_sends_exactly_one_command(
 ) -> None:
     response = client.post(endpoint)
 
+    if endpoint.startswith("/movement/manual/"):
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": {"code": "MANUAL_RECOVERY_NOT_ACTIVE"}
+        }
+        assert fake_hardware.movement_calls == []
+        return
+
     assert response.status_code == 200
     assert response.json() == {
         "success": True,
@@ -1904,6 +1918,133 @@ def test_movement_endpoint_sends_exactly_one_command(
         "response": acknowledgement,
     }
     assert fake_hardware.movement_calls == [movement]
+
+
+def enter_api_manual_recovery(client: TestClient) -> MissionExecutor:
+    executor: MissionExecutor = client.app.state.mission_executor
+    assert executor.accept(executable_mission()) is True
+    assert client.post("/executor/start").status_code == 202
+    coordinator = client.app.state.navigation_coordinator
+    coordinator.process_serial_line("EVENT|U_TURN_COMPLETE|PATTERN=11011")
+    coordinator.process_serial_line("EVENT|LINE_LOST|PATTERN=11111")
+    assert executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+    return executor
+
+
+def test_manual_controls_are_allowed_during_recovery(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    enter_api_manual_recovery(client)
+
+    response = client.post("/movement/manual/forward")
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "ACK|MANUAL_FORWARD"
+    assert fake_hardware.movement_calls[-1] == "manual-forward"
+
+
+def test_manual_recovery_resume_rejects_no_line_and_keeps_countdown(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor = enter_api_manual_recovery(client)
+    fake_hardware.line_reading = (
+        "LINE|O1=1|O2=1|O3=1|O4=1|O5=1|PATTERN=11111"
+    )
+
+    response = client.post("/executor/manual-recovery/resume")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "LINE_NOT_DETECTED_FOR_RESUME"
+    assert response.json()["result"] == "LINE_NOT_DETECTED_FOR_RESUME"
+    assert executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+    assert executor.status()["manual_recovery_can_resume"] is True
+    assert fake_hardware.movement_calls[-1] == "manual-stop"
+
+
+def test_manual_recovery_resume_is_idempotent_and_restarts_same_mission(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor = enter_api_manual_recovery(client)
+    mission_id = executor.mission_id
+    starts_before = fake_hardware.line_calls.count("start_line_follow")
+
+    first = client.post("/executor/manual-recovery/resume")
+    duplicate = client.post("/executor/manual-recovery/resume")
+
+    assert first.status_code == 200
+    assert first.json()["result"] == "MANUAL_RECOVERY_RESUMED"
+    assert first.json()["checkpoint_completed"] is False
+    assert duplicate.status_code == 200
+    assert duplicate.json()["already_resumed"] is True
+    assert executor.state is MissionExecutionState.GOING_TO_ROOM
+    assert executor.mission_id == mission_id
+    assert fake_hardware.line_calls.count("start_line_follow") == starts_before + 1
+
+
+def test_stop_during_manual_recovery_cancels_and_stops_motors_once(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor = enter_api_manual_recovery(client)
+
+    response = client.post("/movement/stop")
+
+    assert response.status_code == 200
+    assert response.json()["manual_recovery_cancelled"] is True
+    assert response.json()["response"] == "ACK|STOP"
+    assert executor.state is MissionExecutionState.FAILED
+    assert fake_hardware.movement_calls.count("stop") == 1
+
+
+def test_manual_recovery_cancel_endpoint_uses_the_same_safe_stop(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor = enter_api_manual_recovery(client)
+
+    response = client.post("/executor/manual-recovery/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "MANUAL_RECOVERY_CANCELLED"
+    assert response.json()["response"] == "ACK|STOP"
+    assert executor.state is MissionExecutionState.FAILED
+    assert fake_hardware.movement_calls.count("stop") == 1
+
+
+def test_hardware_disconnection_exits_manual_recovery_instead_of_extending_it(
+    client: TestClient,
+    fake_hardware: FakeHardwareController,
+) -> None:
+    executor = enter_api_manual_recovery(client)
+    fake_hardware.hardware_error = SerialConnectionError("SERIAL_WRITE_FAILED")
+
+    response = client.post("/movement/manual/forward")
+
+    assert response.status_code == 503
+    assert executor.state is MissionExecutionState.FAILED
+    assert executor.status()["last_error"].startswith(
+        "MANUAL_RECOVERY_HARDWARE_FAILED"
+    )
+
+
+@pytest.mark.parametrize(
+    ("reading", "expected"),
+    [
+        ("LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011", True),
+        ("LINE|O1=1|O2=1|O3=1|O4=0|O5=1|PATTERN=11101", True),
+        ("LINE|O1=1|O2=1|O3=1|O4=1|O5=0|PATTERN=11110", False),
+        ("LINE|O1=1|O2=1|O3=1|O4=1|O5=1|PATTERN=11111", False),
+        ("LINE|O1=0|O2=0|O3=0|O4=0|O5=1|PATTERN=00001", False),
+    ],
+)
+def test_manual_recovery_line_validation_requires_a_safe_inner_pattern(
+    reading: str,
+    expected: bool,
+) -> None:
+    assert is_safe_manual_recovery_line(reading) is expected
 
 
 def test_movement_hardware_error_returns_service_unavailable(

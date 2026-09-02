@@ -10,6 +10,8 @@ from enum import Enum
 
 from ..camera import ArucoCameraService, FreshConfirmationSession
 from ..mission_executor import (
+    LINE_FOLLOW_STARTED_ACK,
+    MANUAL_RECOVERY_TIMEOUT_SECONDS,
     MISSION_PICKUP_WAIT_SECONDS,
     MissionExecutionState,
     MissionExecutor,
@@ -28,6 +30,8 @@ INTERSECTION_COMPLETE_PREFIX = "EVENT|INTERSECTION_COMPLETE|"
 INTERSECTION_FAILED_PREFIX = "EVENT|INTERSECTION_FAILED|"
 U_TURN_COMPLETE_PREFIX = "EVENT|U_TURN_COMPLETE|"
 U_TURN_FAILED_PREFIX = "EVENT|U_TURN_FAILED"
+LINE_LOST_PREFIX = "EVENT|LINE_LOST|"
+U_TURN_FAILURE_DIAGNOSTIC_PREFIX = "UTURN|FAILURE="
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,7 @@ class NavigationCoordinatorSettings:
     arrived_home_observation_seconds: float = 1.0
     hand_wait_timeout_seconds: float = 30.0
     pickup_wait_seconds: int = MISSION_PICKUP_WAIT_SECONDS
+    manual_recovery_timeout_seconds: float = MANUAL_RECOVERY_TIMEOUT_SECONDS
 
     @classmethod
     def from_environment(cls) -> "NavigationCoordinatorSettings":
@@ -66,10 +71,26 @@ class NavigationCoordinatorSettings:
             raise ValueError("HAND_WAIT_TIMEOUT_SECONDS must be a number") from exc
         if hand_wait_timeout_seconds <= 0:
             raise ValueError("HAND_WAIT_TIMEOUT_SECONDS must be positive")
+        try:
+            manual_recovery_timeout_seconds = float(
+                os.getenv(
+                    "MANUAL_RECOVERY_TIMEOUT_SECONDS",
+                    str(MANUAL_RECOVERY_TIMEOUT_SECONDS),
+                )
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "MANUAL_RECOVERY_TIMEOUT_SECONDS must be a number"
+            ) from exc
+        if manual_recovery_timeout_seconds <= 0:
+            raise ValueError(
+                "MANUAL_RECOVERY_TIMEOUT_SECONDS must be positive"
+            )
         return cls(
             enabled=enabled,
             arrived_home_observation_seconds=observation_seconds,
             hand_wait_timeout_seconds=hand_wait_timeout_seconds,
+            manual_recovery_timeout_seconds=manual_recovery_timeout_seconds,
         )
 
 
@@ -84,8 +105,22 @@ class NavigationCoordinatorState(str, Enum):
     WATER_DISPENSING = "WATER_DISPENSING"
     WAITING_FOR_PICKUP = "WAITING_FOR_PICKUP"
     RETURNING_HOME = "RETURNING_HOME"
+    WAITING_FOR_MANUAL_RECOVERY = "WAITING_FOR_MANUAL_RECOVERY"
     ARRIVED_HOME = "ARRIVED_HOME"
     ERROR = "ERROR"
+
+
+@dataclass(frozen=True)
+class ManualRecoveryRouteContext:
+    """Coordinator fields preserved across one bounded manual intervention."""
+
+    generation: int
+    previous_state: NavigationCoordinatorState
+    armed: bool
+    expected_marker_id: int | None
+    expected_mission_id: int | None
+    last_command: str | None
+    completed_maneuver_checkpoint: bool
 
 
 class NavigationCoordinator:
@@ -107,6 +142,10 @@ class NavigationCoordinator:
         wait_for_pickup_tick: Callable[[float], bool] | None = None,
         load_navigation_map: Callable[[], PhysicalNavigationMap] | None = None,
         home_line_position_is_valid: Callable[[], bool] | None = None,
+        prepare_manual_recovery_resume: (
+            Callable[[], tuple[bool, str, str | None]] | None
+        ) = None,
+        emergency_stop: Callable[[], str] | None = None,
     ) -> None:
         self._settings = settings
         self._executor = executor
@@ -127,6 +166,8 @@ class NavigationCoordinator:
         self._show_pickup_countdown = show_pickup_countdown or (lambda seconds: "")
         self._load_navigation_map = load_navigation_map
         self._home_line_position_is_valid = home_line_position_is_valid
+        self._prepare_manual_recovery_resume = prepare_manual_recovery_resume
+        self._emergency_stop = emergency_stop
         self._lock = threading.Lock()
         self._processing_lock = threading.Lock()
         self._post_arrival_lock = threading.Lock()
@@ -164,6 +205,9 @@ class NavigationCoordinator:
         self._home_marker_id: int | None = None
         self._home_line_position_valid = False
         self._home_readiness_error = "HOME_NOT_CONFIRMED"
+        self._manual_recovery_context: ManualRecoveryRouteContext | None = None
+        self._last_manual_recovery_resume_mission_id: int | None = None
+        self._pending_u_turn_failure_reason: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -181,6 +225,8 @@ class NavigationCoordinator:
         self._thread.start()
 
     def stop(self) -> None:
+        if self._executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY:
+            self.cancel_manual_recovery(reason="MANUAL_RECOVERY_CANCELLED")
         self._stop_event.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -204,6 +250,25 @@ class NavigationCoordinator:
     def process_serial_line(self, line: str) -> None:
         """Process one line already dispatched by the sole serial reader."""
 
+        if self._executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY:
+            # The sole reader keeps draining serial data while manual recovery
+            # is active. Navigation lines from the failed checkpoint are stale
+            # and must never re-arm or advance the preserved route.
+            if self._is_navigation_event(line):
+                return
+
+        if line.startswith(U_TURN_FAILURE_DIAGNOSTIC_PREFIX):
+            if self._executor.state in {
+                MissionExecutionState.STARTING,
+                MissionExecutionState.GOING_TO_ROOM,
+                MissionExecutionState.RETURNING_HOME,
+            }:
+                with self._lock:
+                    self._pending_u_turn_failure_reason = line.removeprefix(
+                        U_TURN_FAILURE_DIAGNOSTIC_PREFIX
+                    )
+            return
+
         # Arrival cleanup leaves the serial reader alive.  Ignore residual
         # completion/intersection lines until another mission actually starts,
         # so a late line from the prior mission cannot alter the clean state.
@@ -218,6 +283,12 @@ class NavigationCoordinator:
                 }
             )
         if ignore_stale_event and self._is_intersection_event(line):
+            return
+
+        if line.startswith(LINE_LOST_PREFIX):
+            with self._lock:
+                self._last_intersection_event = line
+            self._begin_manual_recovery("LINE_LOST", maneuver_failed=False)
             return
 
         if not self.enabled and self._is_intersection_event(line):
@@ -235,10 +306,15 @@ class NavigationCoordinator:
         if line.startswith(INTERSECTION_FAILED_PREFIX):
             with self._lock:
                 self._last_intersection_event = line
-            self._record_error("INTERSECTION_MANEUVER_FAILED")
+            self._begin_manual_recovery(
+                "INTERSECTION_MANEUVER_FAILED",
+                maneuver_failed=True,
+            )
             return
 
         if line.startswith(U_TURN_COMPLETE_PREFIX):
+            with self._lock:
+                self._pending_u_turn_failure_reason = None
             if self._executor.state is MissionExecutionState.STARTING:
                 outcome = self._executor.complete_start_u_turn()
                 with self._lock:
@@ -260,17 +336,14 @@ class NavigationCoordinator:
             return
 
         if line.startswith(U_TURN_FAILED_PREFIX):
-            if self._executor.state is MissionExecutionState.STARTING:
-                outcome = self._executor.fail_start_u_turn()
-                with self._lock:
-                    self._armed = False
-                    self._expected_marker_id = None
-                    self._state = NavigationCoordinatorState.ERROR
-                    self._last_error = outcome.result.value
-                return
             with self._lock:
                 self._last_intersection_event = line
-            self._record_error("U_TURN_MANEUVER_FAILED")
+                detail = self._pending_u_turn_failure_reason
+                self._pending_u_turn_failure_reason = None
+            reason = "U_TURN_MANEUVER_FAILED"
+            if detail:
+                reason = f"{reason}|FAILURE={detail}"
+            self._begin_manual_recovery(reason, maneuver_failed=True)
             return
 
         if not line.startswith(INTERSECTION_EVENT_PREFIX):
@@ -511,6 +584,20 @@ class NavigationCoordinator:
             )
         )
 
+    @staticmethod
+    def _is_navigation_event(line: str) -> bool:
+        return line.startswith(
+            (
+                INTERSECTION_EVENT_PREFIX,
+                INTERSECTION_COMPLETE_PREFIX,
+                INTERSECTION_FAILED_PREFIX,
+                U_TURN_COMPLETE_PREFIX,
+                U_TURN_FAILED_PREFIX,
+                LINE_LOST_PREFIX,
+                U_TURN_FAILURE_DIAGNOSTIC_PREFIX,
+            )
+        )
+
     def _observe_disabled_event(self, event: str) -> None:
         with self._lock:
             self._last_intersection_event = event
@@ -563,9 +650,310 @@ class NavigationCoordinator:
                 "error": error,
             }
 
+    def _begin_manual_recovery(
+        self,
+        reason: str,
+        *,
+        maneuver_failed: bool,
+    ) -> None:
+        """Stop autonomous motion and preserve one recoverable route checkpoint."""
+
+        with self._processing_lock:
+            executor_state = self._executor.state
+            if executor_state not in {
+                MissionExecutionState.STARTING,
+                MissionExecutionState.GOING_TO_ROOM,
+                MissionExecutionState.RETURNING_HOME,
+            }:
+                return
+
+            with self._lock:
+                previous_coordinator_state = self._state
+                previous_armed = self._armed
+                expected_marker_id = self._expected_marker_id
+                expected_mission_id = self._expected_mission_id
+                last_command = self._last_command
+
+            try:
+                acknowledgement = self._stop_line_follow()
+                if acknowledgement != "ACK|LINE_FOLLOW_STOPPED":
+                    raise RuntimeError(
+                        "Unexpected line-follow stop acknowledgement: "
+                        f"{acknowledgement!r}"
+                    )
+            except Exception as exc:
+                failure = f"{reason}|SAFE_STOP_FAILED={exc}"
+                self._executor.fail_active_navigation(failure)
+                self._record_error(failure)
+                return
+
+            snapshot = self._executor.begin_manual_recovery(
+                reason,
+                timeout_seconds=self._settings.manual_recovery_timeout_seconds,
+            )
+            if snapshot is None:
+                self._record_error(reason)
+                return
+
+            context = ManualRecoveryRouteContext(
+                generation=snapshot.generation,
+                previous_state=previous_coordinator_state,
+                armed=previous_armed,
+                expected_marker_id=expected_marker_id,
+                expected_mission_id=expected_mission_id,
+                last_command=last_command,
+                completed_maneuver_checkpoint=(
+                    maneuver_failed
+                    or previous_coordinator_state
+                    is NavigationCoordinatorState.COMMAND_SENT
+                    or (
+                        executor_state is MissionExecutionState.STARTING
+                        and last_command == "U_TURN"
+                    )
+                ),
+            )
+            with self._lock:
+                self._manual_recovery_context = context
+                self._last_manual_recovery_resume_mission_id = None
+                self._pending_u_turn_failure_reason = None
+                self._armed = False
+                self._state = NavigationCoordinatorState.WAITING_FOR_MANUAL_RECOVERY
+                self._last_error = reason
+
+    def execute_manual_recovery_drive(
+        self,
+        operation: Callable[[], str],
+    ) -> tuple[bool, str | None]:
+        """Serialize one manual drive request against resume, timeout, and STOP."""
+
+        with self._processing_lock:
+            snapshot = self._executor.manual_recovery_snapshot()
+            if snapshot is None:
+                return False, None
+            if self._executor.manual_recovery_expired(snapshot.generation):
+                self._fail_manual_recovery_locked("MANUAL_RECOVERY_TIMEOUT")
+                return False, None
+            try:
+                return True, operation()
+            except Exception:
+                self._fail_manual_recovery_locked(
+                    "MANUAL_RECOVERY_HARDWARE_FAILED"
+                )
+                raise
+
+    def resume_manual_recovery(self) -> dict[str, object]:
+        """Validate the line and continue the same saved route exactly once."""
+
+        with self._processing_lock:
+            snapshot = self._executor.manual_recovery_snapshot()
+            mission_id = self._executor.mission_id
+            if snapshot is None:
+                if (
+                    mission_id is not None
+                    and mission_id == self._last_manual_recovery_resume_mission_id
+                ):
+                    return {
+                        "success": True,
+                        "result": "MANUAL_RECOVERY_RESUMED",
+                        "already_resumed": True,
+                        "executor": self._executor.status(),
+                    }
+                return {
+                    "success": False,
+                    "result": "MANUAL_RECOVERY_NOT_ACTIVE",
+                    "code": "MANUAL_RECOVERY_NOT_ACTIVE",
+                    "message": "Manual recovery is not active.",
+                    "executor": self._executor.status(),
+                }
+
+            if self._executor.manual_recovery_expired(snapshot.generation):
+                self._fail_manual_recovery_locked("MANUAL_RECOVERY_TIMEOUT")
+                return {
+                    "success": False,
+                    "result": "MANUAL_RECOVERY_TIMEOUT",
+                    "code": "MANUAL_RECOVERY_TIMEOUT",
+                    "message": "The manual recovery window has expired.",
+                    "executor": self._executor.status(),
+                }
+
+            if self._prepare_manual_recovery_resume is None:
+                raise RuntimeError("Manual recovery line validation is not configured")
+            try:
+                line_is_valid, line_reading, acknowledgement = (
+                    self._prepare_manual_recovery_resume()
+                )
+            except Exception:
+                self._fail_manual_recovery_locked(
+                    "MANUAL_RECOVERY_RESUME_FAILED"
+                )
+                raise
+            if not line_is_valid:
+                return {
+                    "success": False,
+                    "result": "LINE_NOT_DETECTED_FOR_RESUME",
+                    "code": "LINE_NOT_DETECTED_FOR_RESUME",
+                    "message": "A safe line position was not detected on O2, O3, or O4.",
+                    "line_reading": line_reading,
+                    "executor": self._executor.status(),
+                }
+            if acknowledgement != LINE_FOLLOW_STARTED_ACK:
+                self._fail_manual_recovery_locked(
+                    "MANUAL_RECOVERY_RESUME_FAILED"
+                )
+                raise RuntimeError(
+                    "Unexpected line-follow start acknowledgement: "
+                    f"{acknowledgement!r}"
+                )
+
+            if snapshot.previous_state is MissionExecutionState.STARTING:
+                restored_state = self._executor.restore_manual_recovery(
+                    snapshot.generation
+                )
+                if restored_state is not MissionExecutionState.STARTING:
+                    self._fail_manual_recovery_locked("MANUAL_RECOVERY_TIMEOUT")
+                    return {
+                        "success": False,
+                        "result": "MANUAL_RECOVERY_TIMEOUT",
+                        "code": "MANUAL_RECOVERY_TIMEOUT",
+                        "message": "The manual recovery window has expired.",
+                        "executor": self._executor.status(),
+                    }
+                outcome = self._executor.complete_start_u_turn(
+                    line_follow_already_started=True
+                )
+                if not outcome.success:
+                    with self._lock:
+                        self._manual_recovery_context = None
+                        self._state = NavigationCoordinatorState.ERROR
+                        self._last_error = outcome.result.value
+                    return {
+                        **outcome.as_dict(),
+                        "executor": self._executor.status(),
+                    }
+            else:
+                restored_state = self._executor.restore_manual_recovery(
+                    snapshot.generation
+                )
+                if restored_state is None:
+                    self._fail_manual_recovery_locked("MANUAL_RECOVERY_TIMEOUT")
+                    return {
+                        "success": False,
+                        "result": "MANUAL_RECOVERY_TIMEOUT",
+                        "code": "MANUAL_RECOVERY_TIMEOUT",
+                        "message": "The manual recovery window has expired.",
+                        "executor": self._executor.status(),
+                    }
+
+            with self._lock:
+                context = self._manual_recovery_context
+                if context is not None and context.generation == snapshot.generation:
+                    self._expected_marker_id = context.expected_marker_id
+                    self._expected_mission_id = context.expected_mission_id
+                    self._last_command = context.last_command
+                    if context.completed_maneuver_checkpoint:
+                        self._armed = True
+                        self._state = (
+                            NavigationCoordinatorState.RETURNING_HOME
+                            if snapshot.previous_state
+                            is MissionExecutionState.RETURNING_HOME
+                            else NavigationCoordinatorState.WAITING_FOR_INTERSECTION
+                        )
+                    else:
+                        self._armed = context.armed
+                        self._state = context.previous_state
+                    self._manual_recovery_context = None
+                self._last_error = None
+                self._last_manual_recovery_resume_mission_id = mission_id
+
+            return {
+                "success": True,
+                "result": "MANUAL_RECOVERY_RESUMED",
+                "already_resumed": False,
+                "line_reading": line_reading,
+                "previous_state": snapshot.previous_state.value,
+                "checkpoint_completed": bool(
+                    context and context.completed_maneuver_checkpoint
+                ),
+                "executor": self._executor.status(),
+            }
+
+    def cancel_manual_recovery(
+        self,
+        *,
+        reason: str = "MANUAL_RECOVERY_CANCELLED",
+    ) -> dict[str, object]:
+        """Stop motion and apply the retained-mission failure path once."""
+
+        with self._processing_lock:
+            applied, response = self._fail_manual_recovery_locked(reason)
+            return {
+                "success": applied,
+                "result": reason if applied else "MANUAL_RECOVERY_NOT_ACTIVE",
+                "response": response,
+                "executor": self._executor.status(),
+            }
+
+    def check_manual_recovery_timeout(self) -> bool:
+        """Apply an elapsed monotonic deadline without blocking the event loop."""
+
+        if not self._processing_lock.acquire(blocking=False):
+            return False
+        try:
+            snapshot = self._executor.manual_recovery_snapshot()
+            if (
+                snapshot is None
+                or not self._executor.manual_recovery_expired(snapshot.generation)
+            ):
+                return False
+            applied, _ = self._fail_manual_recovery_locked(
+                "MANUAL_RECOVERY_TIMEOUT"
+            )
+            return applied
+        finally:
+            self._processing_lock.release()
+
+    def _fail_manual_recovery_locked(
+        self,
+        reason: str,
+    ) -> tuple[bool, str | None]:
+        snapshot = self._executor.manual_recovery_snapshot()
+        if snapshot is None:
+            return False, None
+
+        response: str | None = None
+        stop_error: Exception | None = None
+        try:
+            if self._emergency_stop is None:
+                raise RuntimeError("Emergency stop operation is not configured")
+            response = self._emergency_stop()
+            if response != "ACK|STOP":
+                raise RuntimeError(
+                    f"Unexpected emergency stop acknowledgement: {response!r}"
+                )
+        except Exception as exc:
+            stop_error = exc
+
+        final_reason = (
+            reason
+            if stop_error is None
+            else f"{reason}|SAFE_STOP_FAILED={stop_error}"
+        )
+        applied = self._executor.fail_manual_recovery(
+            snapshot.generation,
+            final_reason,
+        )
+        if applied:
+            with self._lock:
+                self._manual_recovery_context = None
+                self._armed = False
+                self._state = NavigationCoordinatorState.ERROR
+                self._last_error = final_reason
+        return applied, response
+
     def status(self) -> dict[str, object]:
         with self._lock:
-            return {
+            recovery_context = self._manual_recovery_context
+            result: dict[str, object] = {
                 "enabled": self.enabled,
                 "state": self._state.value,
                 "mission_id": self._executor.mission_id,
@@ -594,13 +982,25 @@ class NavigationCoordinator:
                 "home_line_position_valid": self._home_line_position_valid,
                 "home_readiness_error": self._home_readiness_error,
             }
+            if recovery_context is not None:
+                result["manual_recovery_checkpoint_completed"] = (
+                    recovery_context.completed_maneuver_checkpoint
+                )
+            return result
 
     def _event_loop(self) -> None:
         while not self._stop_event.is_set():
+            self.check_manual_recovery_timeout()
             try:
                 line = self._next_serial_event(0.2)
             except Exception:
-                self._record_error("SERIAL_EVENT_READ_FAILED")
+                if self._executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY:
+                    with self._processing_lock:
+                        self._fail_manual_recovery_locked(
+                            "SERIAL_EVENT_READ_FAILED"
+                        )
+                else:
+                    self._record_error("SERIAL_EVENT_READ_FAILED")
                 self._stop_event.wait(0.2)
                 continue
             if line is not None:

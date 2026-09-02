@@ -114,6 +114,7 @@ export type MissionExecutorState =
   | "WATER_DISPENSE_COMPLETED"
   | "WAITING_FOR_PICKUP"
   | "RETURNING_HOME"
+  | "WAITING_FOR_MANUAL_RECOVERY"
   | "ARRIVED_HOME"
   | "FAILED";
 
@@ -122,6 +123,22 @@ export interface MissionExecutorStatus {
   mission_id: number | null;
   last_error: string | null;
   pickup_seconds_remaining?: number | null;
+  manual_recovery_active?: boolean;
+  manual_recovery_reason?: string | null;
+  manual_recovery_seconds_remaining?: number | null;
+  manual_recovery_previous_state?: MissionExecutorState | null;
+  manual_recovery_can_resume?: boolean;
+}
+
+export interface ManualRecoveryResponse {
+  success: boolean;
+  result: string;
+  message?: string | null;
+  already_resumed?: boolean;
+  line_reading?: string;
+  previous_state?: MissionExecutorState;
+  checkpoint_completed?: boolean;
+  executor: MissionExecutorStatus;
 }
 
 export interface RobotRtcResponse {

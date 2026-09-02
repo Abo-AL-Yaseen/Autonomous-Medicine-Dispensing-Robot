@@ -14,6 +14,7 @@ import {
 import { Text } from "react-native-paper";
 
 import { MissionStatusCard } from "@/src/components/MissionStatusCard";
+import { DirectionPad } from "@/src/components/DirectionPad";
 import { LiveCameraModal } from "@/src/components/LiveCameraModal";
 import { PrimaryButton } from "@/src/components/PrimaryButton";
 import { RobotStatusCard } from "@/src/components/RobotStatusCard";
@@ -24,14 +25,34 @@ import {
   buildRobotScheduleDateTime,
   missionExecutorStatusText,
 } from "@/src/services/apiAdapters";
-import { retryDeliveryStart, startDelivery } from "@/src/services/api";
+import {
+  manualBackward,
+  manualBackwardLeft,
+  manualBackwardRight,
+  manualForward,
+  manualForwardLeft,
+  manualForwardRight,
+  manualLeft,
+  manualRight,
+  manualStop,
+  retryDeliveryStart,
+  startDelivery,
+} from "@/src/services/api";
 import { ImmediateDeliveryStartError } from "@/src/services/deliveryService";
 import { requiredDispenserBoxes } from "@/src/services/dispenserReadiness";
 import { getMedicines } from "@/src/services/laravel/medicineService";
 import { createMission } from "@/src/services/laravel/missionService";
 import { getRooms } from "@/src/services/laravel/roomService";
 import { getDispenserStatus } from "@/src/services/robot/dispenserCalibrationService";
-import { getMissionExecutorStatus } from "@/src/services/robot/executorService";
+import {
+  cancelManualRecovery,
+  getMissionExecutorStatus,
+  resumeManualRecovery,
+} from "@/src/services/robot/executorService";
+import {
+  LatestManualDriveDispatcher,
+  ManualDriveState,
+} from "@/src/services/robot/manualDriveController";
 import {
   createPickerWallClockSelection,
   formatApiScheduleSummary,
@@ -43,7 +64,29 @@ import {
   PickerWallClockSelection,
 } from "@/src/services/scheduleDateTime";
 import { theme } from "@/src/theme/theme";
-import { DispenserStatus, Medicine, MissionState, Room } from "@/src/types";
+import {
+  DispenserStatus,
+  Medicine,
+  MissionExecutorStatus,
+  MissionState,
+  MovementResponse,
+  Room,
+} from "@/src/types";
+
+const recoveryDriveRequests: Record<
+  ManualDriveState,
+  () => Promise<MovementResponse>
+> = {
+  MANUAL_FORWARD: manualForward,
+  MANUAL_BACKWARD: manualBackward,
+  MANUAL_LEFT: manualLeft,
+  MANUAL_RIGHT: manualRight,
+  MANUAL_FORWARD_LEFT: manualForwardLeft,
+  MANUAL_FORWARD_RIGHT: manualForwardRight,
+  MANUAL_BACKWARD_LEFT: manualBackwardLeft,
+  MANUAL_BACKWARD_RIGHT: manualBackwardRight,
+  MANUAL_STOP: manualStop,
+};
 
 export default function DeliveryScreen() {
   const [cameraVisible, setCameraVisible] = useState(false);
@@ -53,6 +96,13 @@ export default function DeliveryScreen() {
   const [selectedQuantities, setSelectedQuantities] = useState<Record<number, number>>({});
   const [missionState, setMissionState] = useState<MissionState>("Waiting");
   const [executorStatusDetail, setExecutorStatusDetail] = useState<string | null>(null);
+  const [executorStatus, setExecutorStatus] =
+    useState<MissionExecutorStatus | null>(null);
+  const [manualRecoveryRequestRunning, setManualRecoveryRequestRunning] =
+    useState(false);
+  const [manualRecoveryError, setManualRecoveryError] =
+    useState<string | null>(null);
+  const [recoveryPadResetSignal, setRecoveryPadResetSignal] = useState(0);
   const [scheduleForLater, setScheduleForLater] = useState(false);
   const [scheduledDate, setScheduledDate] =
     useState<PickerWallClockSelection | null>(null);
@@ -69,16 +119,31 @@ export default function DeliveryScreen() {
   const [loadingDispenserStatus, setLoadingDispenserStatus] = useState(true);
   const [dispenserStatusError, setDispenserStatusError] = useState<string | null>(null);
   const submissionInProgress = useRef(false);
+  const recoveryDriveDispatcherRef =
+    useRef<LatestManualDriveDispatcher | null>(null);
   const router = useRouter();
 
   const robotStatus = useRobotStatus();
 
-  useEffect(() => {
-    if (missionState === "Waiting") {
-      setExecutorStatusDetail(null);
-      return;
-    }
+  if (recoveryDriveDispatcherRef.current === null) {
+    recoveryDriveDispatcherRef.current = new LatestManualDriveDispatcher({
+      sendManual: (state) => recoveryDriveRequests[state](),
+      sendEmergencyStop: manualStop,
+      onError: (driveError) => {
+        setManualRecoveryError(
+          driveError instanceof Error
+            ? driveError.message
+            : "تعذر إرسال أمر الحركة اليدوية.",
+        );
+      },
+    });
+  }
 
+  const manualRecoveryActive =
+    executorStatus?.state === "WAITING_FOR_MANUAL_RECOVERY" &&
+    executorStatus.manual_recovery_active === true;
+
+  useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -86,10 +151,21 @@ export default function DeliveryScreen() {
       try {
         const status = await getMissionExecutorStatus();
         if (cancelled) return;
+        setExecutorStatus(status);
         setExecutorStatusDetail(missionExecutorStatusText(status));
+        if (status.state === "WAITING_FOR_MANUAL_RECOVERY") {
+          setMissionState(
+            status.manual_recovery_previous_state === "RETURNING_HOME"
+              ? "Returning"
+              : "Moving",
+          );
+        }
         if (status.state === "WAITING_FOR_PICKUP") setMissionState("Delivering");
         if (status.state === "RETURNING_HOME") setMissionState("Returning");
         if (status.state === "ARRIVED_HOME") setMissionState("Completed");
+        if (status.state === "IDLE" && missionState === "Waiting") {
+          setExecutorStatusDetail(null);
+        }
         if (status.state !== "IDLE" && status.state !== "FAILED") {
           timer = setTimeout(pollExecutor, 1000);
         }
@@ -104,6 +180,55 @@ export default function DeliveryScreen() {
       if (timer !== undefined) clearTimeout(timer);
     };
   }, [missionState]);
+
+  const handleRecoveryDriveStateChange = (
+    driveState: ManualDriveState,
+    force = false,
+  ) => {
+    if (!manualRecoveryActive || manualRecoveryRequestRunning) return;
+    recoveryDriveDispatcherRef.current?.setDesired(driveState, force);
+  };
+
+  const handleResumeManualRecovery = async () => {
+    if (!manualRecoveryActive || manualRecoveryRequestRunning) return;
+    try {
+      setManualRecoveryRequestRunning(true);
+      setManualRecoveryError(null);
+      const result = await resumeManualRecovery();
+      setExecutorStatus(result.executor);
+      setRecoveryPadResetSignal((current) => current + 1);
+      setMissionState(
+        result.executor.state === "RETURNING_HOME" ? "Returning" : "Moving",
+      );
+    } catch (resumeError) {
+      setManualRecoveryError(
+        resumeError instanceof Error
+          ? resumeError.message
+          : "تعذر التحقق من الخط ومتابعة المسار.",
+      );
+    } finally {
+      setManualRecoveryRequestRunning(false);
+    }
+  };
+
+  const handleCancelManualRecovery = async () => {
+    if (!manualRecoveryActive || manualRecoveryRequestRunning) return;
+    try {
+      setManualRecoveryRequestRunning(true);
+      setManualRecoveryError(null);
+      const result = await cancelManualRecovery();
+      setExecutorStatus(result.executor);
+      setRecoveryPadResetSignal((current) => current + 1);
+    } catch (cancelError) {
+      setManualRecoveryError(
+        cancelError instanceof Error
+          ? cancelError.message
+          : "تعذر إيقاف الاستعادة اليدوية.",
+      );
+    } finally {
+      setManualRecoveryRequestRunning(false);
+    }
+  };
 
   useEffect(() => {
     const loadOptions = async () => {
@@ -306,7 +431,7 @@ export default function DeliveryScreen() {
   };
 
   const handleStartDelivery = async () => {
-    if (submissionInProgress.current) return;
+    if (submissionInProgress.current || manualRecoveryActive) return;
 
     if (pendingImmediateMissionId !== null && !scheduleForLater) {
       submissionInProgress.current = true;
@@ -474,6 +599,42 @@ export default function DeliveryScreen() {
           onPress={() => setCameraVisible(true)}
           style={styles.cameraButton}
         />
+
+        {manualRecoveryActive ? (
+          <View style={styles.manualRecoveryCard}>
+            <Text style={styles.manualRecoveryWarning}>
+              تم فقدان المسار. أعد الروبوت إلى الخط ثم اضغط متابعة.
+            </Text>
+            <Text style={styles.manualRecoveryCountdown}>
+              {executorStatus.manual_recovery_seconds_remaining ?? 0}
+            </Text>
+            <Text style={styles.manualRecoverySeconds}>ثانية متبقية</Text>
+            <DirectionPad
+              onDriveStateChange={handleRecoveryDriveStateChange}
+              resetSignal={recoveryPadResetSignal}
+            />
+            <PrimaryButton
+              label="متابعة المسار"
+              onPress={handleResumeManualRecovery}
+              disabled={
+                manualRecoveryRequestRunning ||
+                executorStatus.manual_recovery_can_resume !== true
+              }
+              loading={manualRecoveryRequestRunning}
+            />
+            <PrimaryButton
+              label="إيقاف وإلغاء"
+              onPress={handleCancelManualRecovery}
+              disabled={manualRecoveryRequestRunning}
+              variant="danger"
+            />
+            {manualRecoveryError ? (
+              <Text style={styles.manualRecoveryError}>
+                {manualRecoveryError}
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
 
         <View style={styles.sectionBlock}>
           <RoomSelector
@@ -714,6 +875,7 @@ export default function DeliveryScreen() {
             onPress={handleStartDelivery}
             disabled={
               creatingMission ||
+              manualRecoveryActive ||
               loadingRooms ||
               loadingMedicines ||
               rooms.length === 0 ||
@@ -765,6 +927,42 @@ const styles = StyleSheet.create({
     marginTop: 12,
     color: "#C62828",
     fontWeight: "600",
+  },
+  manualRecoveryCard: {
+    marginTop: 18,
+    marginBottom: 22,
+    padding: 18,
+    borderRadius: 22,
+    borderWidth: 2,
+    borderColor: theme.colors.emergency,
+    backgroundColor: "#FFF4F2",
+    gap: 12,
+  },
+  manualRecoveryWarning: {
+    color: theme.colors.emergency,
+    fontSize: 18,
+    fontWeight: "700",
+    lineHeight: 29,
+    textAlign: "right",
+    writingDirection: "rtl",
+  },
+  manualRecoveryCountdown: {
+    color: theme.colors.emergency,
+    fontSize: 48,
+    fontWeight: "800",
+    textAlign: "center",
+  },
+  manualRecoverySeconds: {
+    color: theme.colors.textSecondary,
+    fontSize: 15,
+    textAlign: "center",
+    writingDirection: "rtl",
+  },
+  manualRecoveryError: {
+    color: theme.colors.emergency,
+    fontWeight: "700",
+    textAlign: "right",
+    writingDirection: "rtl",
   },
   medicineList: {
     marginBottom: 20,

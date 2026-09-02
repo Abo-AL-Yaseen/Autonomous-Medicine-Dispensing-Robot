@@ -212,6 +212,33 @@ def calculate_water_duration_ms(amount_ml: int, flow_ml_per_second: float) -> in
     return duration_ms
 
 
+def is_safe_manual_recovery_line(reading: str) -> bool:
+    """Require one to three black sensors including the inner O2/O3/O4 set."""
+
+    parts = reading.split("|")
+    if len(parts) != 7 or parts[0] != "LINE":
+        return False
+    sensor_values: dict[str, str] = {}
+    for index, part in enumerate(parts[1:6], start=1):
+        key = f"O{index}"
+        if not part.startswith(f"{key}="):
+            return False
+        value = part.removeprefix(f"{key}=")
+        if value not in {"0", "1"}:
+            return False
+        sensor_values[key] = value
+    if parts[6] != "PATTERN=" + "".join(
+        sensor_values[f"O{index}"] for index in range(1, 6)
+    ):
+        return False
+
+    active_count = sum(value == "0" for value in sensor_values.values())
+    inner_line_detected = any(
+        sensor_values[key] == "0" for key in ("O2", "O3", "O4")
+    )
+    return 1 <= active_count <= 3 and inner_line_detected
+
+
 def build_hardware_controller(settings: HardwareSettings) -> RobotHardwareController:
     """Create the existing serial controllers from API configuration."""
 
@@ -328,6 +355,20 @@ def create_app(
             with hardware_lock:
                 return operation()
 
+        def prepare_manual_recovery_resume() -> tuple[bool, str, str | None]:
+            """Stop, validate, and restart line following under one serial lock."""
+
+            if not application.state.hardware_connected:
+                raise HardwareControllerError("robot hardware is disconnected")
+            with hardware_lock:
+                controller.manual_stop()
+                reading = controller.get_line_reading()
+                line_is_valid = is_safe_manual_recovery_line(reading)
+                acknowledgement = (
+                    controller.start_line_follow() if line_is_valid else None
+                )
+            return line_is_valid, reading, acknowledgement
+
         def dispense_executor_medicine(
             box_number: int,
             quantity: int,
@@ -411,6 +452,8 @@ def create_app(
             show_pickup_countdown=show_executor_pickup_countdown,
             load_navigation_map=laravel_client.get_navigation_map,
             home_line_position_is_valid=home_line_position_is_valid,
+            prepare_manual_recovery_resume=prepare_manual_recovery_resume,
+            emergency_stop=lambda: run_navigation_hardware(controller.stop),
         )
         scheduler = MissionScheduler(
             hardware_available=hardware_available,
@@ -505,6 +548,8 @@ def create_app(
                 "/executor/status",
                 "/executor/start",
                 "/executor/return-home",
+                "/executor/manual-recovery/resume",
+                "/executor/manual-recovery/cancel",
                 "/voice/status",
                 "/voice/test",
                 "/dispense",
@@ -711,13 +756,14 @@ def create_app(
     @application.get("/executor/status")
     def executor_status(request: Request) -> dict[str, object]:
         executor: MissionExecutor = request.app.state.mission_executor
+        coordinator: NavigationCoordinator = (
+            request.app.state.navigation_coordinator
+        )
+        coordinator.check_manual_recovery_timeout()
         if executor.state in {
             MissionExecutionState.IDLE,
             MissionExecutionState.READY_FOR_EXECUTION,
         }:
-            coordinator: NavigationCoordinator = (
-                request.app.state.navigation_coordinator
-            )
             coordinator.confirm_home_readiness()
         return executor.status()
 
@@ -760,6 +806,39 @@ def create_app(
             MissionReturnResult.U_TURN_START_FAILED.value: 502,
         }.get(str(result["result"]), 500)
         return JSONResponse(status_code=status_code, content=result)
+
+    @application.post("/executor/manual-recovery/resume")
+    def executor_manual_recovery_resume(request: Request) -> JSONResponse:
+        coordinator: NavigationCoordinator = (
+            request.app.state.navigation_coordinator
+        )
+        try:
+            result = coordinator.resume_manual_recovery()
+        except HardwareControllerError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "HARDWARE_COMMUNICATION_FAILED"},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "INTERNAL_ERROR"},
+            ) from exc
+        return JSONResponse(
+            status_code=200 if result["success"] else 409,
+            content=result,
+        )
+
+    @application.post("/executor/manual-recovery/cancel")
+    def executor_manual_recovery_cancel(request: Request) -> JSONResponse:
+        coordinator: NavigationCoordinator = (
+            request.app.state.navigation_coordinator
+        )
+        result = coordinator.cancel_manual_recovery()
+        return JSONResponse(
+            status_code=200 if result["success"] else 409,
+            content=result,
+        )
 
     @application.post("/dispense")
     def dispense(payload: DispenseRequest, request: Request) -> dict[str, object]:
@@ -902,6 +981,18 @@ def create_app(
 
     @application.post("/movement/stop")
     def stop(request: Request) -> dict[str, object]:
+        executor: MissionExecutor = request.app.state.mission_executor
+        if executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY:
+            coordinator: NavigationCoordinator = (
+                request.app.state.navigation_coordinator
+            )
+            result = coordinator.cancel_manual_recovery()
+            return {
+                "success": bool(result["success"]),
+                "movement": "stop",
+                "response": result["response"],
+                "manual_recovery_cancelled": bool(result["success"]),
+            }
         return _movement_response(
             request,
             "stop",
@@ -910,7 +1001,7 @@ def create_app(
 
     @application.post("/movement/manual/forward")
     def manual_forward(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-forward",
             lambda controller: controller.manual_forward(),
@@ -918,7 +1009,7 @@ def create_app(
 
     @application.post("/movement/manual/backward")
     def manual_backward(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-backward",
             lambda controller: controller.manual_backward(),
@@ -926,7 +1017,7 @@ def create_app(
 
     @application.post("/movement/manual/left")
     def manual_left(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-left",
             lambda controller: controller.manual_left(),
@@ -934,7 +1025,7 @@ def create_app(
 
     @application.post("/movement/manual/right")
     def manual_right(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-right",
             lambda controller: controller.manual_right(),
@@ -942,7 +1033,7 @@ def create_app(
 
     @application.post("/movement/manual/forward-left")
     def manual_forward_left(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-forward-left",
             lambda controller: controller.manual_forward_left(),
@@ -950,7 +1041,7 @@ def create_app(
 
     @application.post("/movement/manual/forward-right")
     def manual_forward_right(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-forward-right",
             lambda controller: controller.manual_forward_right(),
@@ -958,7 +1049,7 @@ def create_app(
 
     @application.post("/movement/manual/backward-left")
     def manual_backward_left(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-backward-left",
             lambda controller: controller.manual_backward_left(),
@@ -966,7 +1057,7 @@ def create_app(
 
     @application.post("/movement/manual/backward-right")
     def manual_backward_right(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-backward-right",
             lambda controller: controller.manual_backward_right(),
@@ -974,7 +1065,7 @@ def create_app(
 
     @application.post("/movement/manual/stop")
     def manual_stop(request: Request) -> dict[str, object]:
-        return _movement_response(
+        return _manual_recovery_movement_response(
             request,
             "manual-stop",
             lambda controller: controller.manual_stop(),
@@ -1192,6 +1283,25 @@ def _movement_response(
     operation: Callable[[RobotHardwareController], str],
 ) -> dict[str, object]:
     response = _run_hardware_operation(request, operation)
+    return {"success": True, "movement": movement, "response": response}
+
+
+def _manual_recovery_movement_response(
+    request: Request,
+    movement: str,
+    operation: Callable[[RobotHardwareController], str],
+) -> dict[str, object]:
+    """Allow manual PWM only inside the coordinator's bounded recovery lock."""
+
+    coordinator: NavigationCoordinator = request.app.state.navigation_coordinator
+    allowed, response = coordinator.execute_manual_recovery_drive(
+        lambda: _run_hardware_operation(request, operation)
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "MANUAL_RECOVERY_NOT_ACTIVE"},
+        )
     return {"success": True, "movement": movement, "response": response}
 
 

@@ -13,6 +13,7 @@ import {
   normalizeFastApiStatus,
   normalizeFastApiWaterDispense,
   normalizeFastApiWaterLevel,
+  normalizeManualRecoveryResponse,
   normalizeHardwareActionErrorMessage,
   normalizeMedicine,
   normalizeMission,
@@ -171,6 +172,44 @@ test("accepts and labels the patient pickup executor countdown", () => {
     missionExecutorStatusText(status),
     "Waiting for patient pickup (30s)",
   );
+});
+
+test("normalizes the backend-owned manual recovery countdown", () => {
+  const status = normalizeMissionExecutorStatus({
+    state: "WAITING_FOR_MANUAL_RECOVERY",
+    mission_id: 42,
+    last_error: "LINE_LOST",
+    manual_recovery_active: true,
+    manual_recovery_reason: "LINE_LOST",
+    manual_recovery_seconds_remaining: 15,
+    manual_recovery_previous_state: "GOING_TO_ROOM",
+    manual_recovery_can_resume: true,
+  });
+
+  assert.equal(status.manual_recovery_active, true);
+  assert.equal(status.manual_recovery_seconds_remaining, 15);
+  assert.equal(status.manual_recovery_previous_state, "GOING_TO_ROOM");
+  assert.equal(missionExecutorStatusText(status), "Manual route recovery (15s)");
+});
+
+test("normalizes a successful manual recovery resume", () => {
+  const response = normalizeManualRecoveryResponse({
+    success: true,
+    result: "MANUAL_RECOVERY_RESUMED",
+    already_resumed: false,
+    line_reading: "LINE|O1=1|O2=1|O3=0|O4=1|O5=1|PATTERN=11011",
+    previous_state: "RETURNING_HOME",
+    checkpoint_completed: true,
+    executor: {
+      state: "RETURNING_HOME",
+      mission_id: 42,
+      last_error: null,
+    },
+  });
+
+  assert.equal(response.success, true);
+  assert.equal(response.executor.state, "RETURNING_HOME");
+  assert.equal(response.checkpoint_completed, true);
 });
 
 test("normalizes FastAPI health when hardware is disconnected", () => {

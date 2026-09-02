@@ -6,6 +6,7 @@ import {
 } from "@/src/config/api";
 import {
   normalizeExecutorStart,
+  normalizeManualRecoveryResponse,
   normalizeMissionExecutorStatus,
   normalizeRobotRtc,
   normalizeSchedulerTick,
@@ -15,10 +16,13 @@ import {
   MissionExecutorStatus,
   RobotRtcResponse,
   SchedulerTickResponse,
+  ManualRecoveryResponse,
 } from "@/src/types";
 
 export const ROBOT_RTC_ENDPOINT = "/rtc";
 export const ROBOT_RTC_SYNC_ENDPOINT = "/rtc/sync-system";
+export const MANUAL_RECOVERY_RESUME_ENDPOINT = "/executor/manual-recovery/resume";
+export const MANUAL_RECOVERY_CANCEL_ENDPOINT = "/executor/manual-recovery/cancel";
 
 export const robotClockErrorMessage = (
   code: string | null,
@@ -60,6 +64,25 @@ export const getMissionExecutorStatus =
       );
     }
   };
+
+const manualRecoveryRequest = async (
+  endpoint: string,
+): Promise<ManualRecoveryResponse> => {
+  try {
+    const response = await robotApi.post<unknown>(endpoint);
+    return normalizeManualRecoveryResponse(unwrapAxiosData(response));
+  } catch (error) {
+    throw new Error(
+      getApiErrorMessage(error, "Unable to update manual route recovery."),
+    );
+  }
+};
+
+export const resumeManualRecovery = () =>
+  manualRecoveryRequest(MANUAL_RECOVERY_RESUME_ENDPOINT);
+
+export const cancelManualRecovery = () =>
+  manualRecoveryRequest(MANUAL_RECOVERY_CANCEL_ENDPOINT);
 
 export const getRobotRtc = async (): Promise<RobotRtcResponse> => {
   try {

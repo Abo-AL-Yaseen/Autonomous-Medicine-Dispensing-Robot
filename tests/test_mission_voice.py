@@ -186,3 +186,17 @@ def test_water_failure_has_one_specific_failure_event() -> None:
     assert event_names(voice).count(VoiceEvent.WATER_FAILED) == 1
     assert VoiceEvent.DELIVERY_COMPLETED not in event_names(voice)
     assert VoiceEvent.GENERAL_FAILED not in event_names(voice)
+
+
+def test_manual_recovery_voice_failure_does_not_block_recovery(caplog) -> None:
+    voice = RecordingVoice(fail=True)
+    executor = build_executor(voice)
+    assert executor.accept(mission())
+    assert executor.start_ready_mission().success
+
+    snapshot = executor.begin_manual_recovery("LINE_LOST")
+
+    assert snapshot is not None
+    assert executor.state is MissionExecutionState.WAITING_FOR_MANUAL_RECOVERY
+    assert VoiceEvent.MANUAL_RECOVERY in event_names(voice)
+    assert "VOICE enqueue failed: voice queue unavailable" in caplog.text
