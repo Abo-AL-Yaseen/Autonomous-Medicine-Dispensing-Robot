@@ -756,7 +756,7 @@ def test_calibrated_disks_allow_normal_multi_item_dispense() -> None:
     assert calls == [(1, 2), (2, 1)]
 
 
-def test_mission_water_is_exactly_3000_ms_and_runs_only_once_after_medicine() -> None:
+def test_mission_water_is_exactly_4500_ms_and_runs_only_once_after_medicine() -> None:
     water_calls: list[int] = []
     executor = medicine_completed_executor(
         dispense_water=lambda duration: water_calls.append(duration) or {
@@ -770,7 +770,7 @@ def test_mission_water_is_exactly_3000_ms_and_runs_only_once_after_medicine() ->
 
     assert first.success is True
     assert duplicate.success is False
-    assert water_calls == [3000]
+    assert water_calls == [4500]
     assert executor.state is MissionExecutionState.WATER_DISPENSE_COMPLETED
 
 

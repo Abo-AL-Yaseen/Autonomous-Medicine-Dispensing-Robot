@@ -1,7 +1,41 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Python
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/venv/
+.coverage
+htmlcov/
+
+# JavaScript / Expo
+**/node_modules/
+**/.expo/
+**/coverage/
+**/dist/
+
+# PHP / Laravel
+**/vendor/
+**/storage/logs/*.log
+
+# Embedded tooling and IDEs
 **/.pio/
 **/.vscode/
 **/.vscode_old/
 **/.agents/
-**/__pycache__/
-*.pyc
-.env
+
+# Local/generated duplicates retained outside the release
+/10_HOME.png
+/old_uno_mahmoud.ino
+
+# Logs and operating-system files
+*.log
+.DS_Store
+Thumbs.db

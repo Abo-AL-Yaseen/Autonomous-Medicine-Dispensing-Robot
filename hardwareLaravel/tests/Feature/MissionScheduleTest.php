@@ -507,12 +507,14 @@ class MissionScheduleTest extends TestCase
             'room_name' => 'Schedule Room '.$suffix,
             'description' => null,
         ]);
-        $medicine = Medicine::create([
-            'name' => 'Schedule Medicine '.$suffix,
-            'description' => null,
-            'stock_quantity' => 10,
-            'dispenser_box' => 1,
-        ]);
+        $medicine = Medicine::query()->firstOrCreate(
+            ['dispenser_box' => 1],
+            [
+                'name' => 'Schedule Medicine',
+                'description' => null,
+                'stock_quantity' => 10,
+            ],
+        );
 
         return [$room, $medicine];
     }

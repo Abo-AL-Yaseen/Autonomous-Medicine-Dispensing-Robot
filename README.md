@@ -1,598 +1,387 @@
 # Autonomous Medicine Dispensing Robot
 
-This repository contains the ESP32, Arduino UNO, and Raspberry Pi hardware-control
-components for the autonomous medicine dispensing robot. The Raspberry Pi exposes
-the tested USB serial controllers through a small synchronous FastAPI service.
-Laravel remains the source of truth for medicines, schedules, and missions.
+An autonomous mobile-robot prototype that transports medicine and water from a HOME station to one of five predefined rooms, guides the recipient through pickup, and returns to HOME. The system combines embedded control, computer vision, a web API, and a mobile application in a distributed three-controller architecture.
 
-## Scheduling timezone contract
+> [!IMPORTANT]
+> This is an educational graduation-project prototype. It is not a certified medical device and must not be used for clinical medication administration.
 
-The mobile app sends `scheduled_at` as a timezone-naive Palestine wall-clock
-string in exactly `YYYY-MM-DD HH:mm:ss` format. Laravel interprets that value
-once with `Asia/Hebron`, then converts it to UTC for storage. Mission API
-responses serialize `scheduled_at` as an offset-aware UTC ISO 8601 timestamp;
-the mobile app converts that instant back to `Asia/Hebron` for display. Do not
-send a mixture of wall-clock strings and ISO timestamps with offsets.
+## 1. Project Overview
 
-## Raspberry Pi setup
+The project explores how a small indoor robot can automate a repeatable delivery workflow while keeping navigation, dispensing, and user interaction independently testable. A mission is created or scheduled through the mobile application and stored by Laravel. The Raspberry Pi claims the mission, confirms that the robot is physically at HOME, coordinates the journey, and records completion.
 
-Install the Python dependencies from the repository root:
+```text
+HOME confirmation -> outbound navigation -> room confirmation -> hand detection
+-> medicine dispensing -> timed water delivery -> 30-second pickup window
+-> return navigation -> HOME confirmation -> mission completion
+```
+
+The Raspberry Pi makes mission and route decisions. The ESP32 executes real-time movement and sensing. The Arduino UNO controls the two medicine disks and the automated mission water pump.
+
+## 2. Key Features
+
+- Autonomous black-line navigation using a five-channel active-low sensor array.
+- Five destinations with directed outbound routes, explicit return routes, and a dedicated HOME node.
+- OpenCV ArUco localization using `DICT_4X4_50`, three-frame confirmation, minimum-area filtering, dominant-marker selection, and expected-marker checking.
+- Bounded intersection maneuvers, sensor-guided U-turns, automatic line-loss recovery, and timed manual recovery when autonomous recovery fails.
+- Two independently calibrated eight-slot medicine disks, each with a stepper motor and pill-passage sensor.
+- Multi-medicine missions mapped to dispenser boxes 1 and 2.
+- Hand-gated delivery, 20x4 LCD status, and a 30-second pickup countdown.
+- Ultrasonic tank-level checks and a 4.5-second automated water-delivery cycle.
+- DS1302 RTC scheduling with `Asia/Hebron` timezone handling in software.
+- Optional offline Arabic voice guidance from the Raspberry Pi.
+- Expo mobile mission, manual-control, calibration, water-status, and live-camera interfaces.
+- FastAPI hardware diagnostics plus Laravel mission, room, medicine, and physical-map APIs.
+
+## 3. System Architecture
+
+```mermaid
+flowchart LR
+    Mobile[Expo / React Native mobile app]
+    Laravel[Laravel 12 API]
+    DB[(Laravel database<br/>SQLite by default)]
+    Pi[Raspberry Pi<br/>FastAPI mission orchestrator]
+    Camera[USB camera]
+    Audio[Linux audio sink<br/>Bluetooth speaker optional]
+    ESP[ESP32]
+    UNO[Arduino UNO]
+
+    Mobile <-->|missions and catalog| Laravel
+    Mobile <-->|status, control, camera| Pi
+    Laravel <--> DB
+    Pi <-->|missions, map, lifecycle| Laravel
+    Camera -->|OpenCV / ArUco| Pi
+    Pi -->|Arabic prompts| Audio
+    Pi <-->|USB serial, 115200 baud| ESP
+    Pi <-->|USB serial, 9600 baud| UNO
+
+    ESP --> Drive[DC motors and motor driver]
+    ESP --> Line[5-channel line array]
+    ESP --> Motion[MPU6050]
+    ESP --> Interaction[hand sensor, LCD, DS1302]
+    ESP --> Level[ultrasonic tank-level sensor]
+    UNO --> Dispensers[2 stepper medicine disks]
+    UNO --> Pills[2 pill-passage sensors]
+    UNO --> Water[water-pump relay]
+```
+
+The Raspberry Pi is the only component that combines mission context, camera evidence, and the Laravel map. Embedded controllers expose bounded commands and machine-readable acknowledgements; they do not choose destinations or update mission records.
+
+## 4. Hardware Architecture
+
+Only components identifiable from current source and configuration are listed. Exact board revisions, power ratings, battery specifications, and mechanical dimensions are not recorded in the repository.
+
+| Component | Quantity | Purpose | Controller / interface |
+| --- | ---: | --- | --- |
+| Raspberry Pi | 1 | Mission orchestration, APIs, vision, audio, and controller coordination | Linux, USB, network |
+| ESP32 development board | 1 | Locomotion, navigation sensing, RTC, LCD, hand and water-level sensing | USB serial at 115200 baud |
+| Arduino UNO | 1 | Medicine mechanisms and automated water-pump relay | USB serial at 9600 baud |
+| Geared DC drive motors | 2 | Differential-drive locomotion | ESP32 through a dual motor-driver interface |
+| Five-channel IR line array | 1 | Line position, intersections, and line loss | ESP32 GPIO |
+| MPU6050 | 1 | Heading feedback for turns and recovery | ESP32 I2C |
+| USB camera | 1 | ArUco localization and MJPEG preview | Raspberry Pi `/dev/video0` by default |
+| 2048-step geared stepper motors | 2 | Rotate medicine disks by one slot | Arduino UNO via ULN2003-style wiring |
+| Eight-slot medicine disks | 2 | Hold two configured medicine types | Mechanically indexed by the UNO |
+| Pill-passage IR sensors | 2 | Confirm passage through each chute | Arduino UNO interrupt-capable inputs |
+| Water pump and active-low relay | 1 each | Timed mission water delivery | Arduino UNO D2 |
+| Ultrasonic level sensor | 1 | Classify tank level | ESP32 trigger/echo GPIO |
+| Hand-detection IR sensor | 1 | Gate dispensing on recipient presence | ESP32 GPIO with debounce |
+| 20x4 LCD | 1 | Prompts, status, and pickup countdown | ESP32 I2C |
+| DS1302 RTC module | 1 | Local scheduling wall clock | ESP32 three-wire interface |
+| Audio output / speaker | 1 | Optional Arabic guidance | Raspberry Pi default Linux audio sink |
+
+## 5. Controller Responsibilities
+
+### Raspberry Pi
+
+- Runs FastAPI and owns both USB serial connections.
+- Claims due missions from Laravel and maintains the mission state machine.
+- Loads Laravel's map and computes outbound and return decisions.
+- Owns the USB camera, validates ArUco observations, and serves MJPEG preview.
+- Checks HOME readiness, dispatches navigation, and verifies expected markers.
+- Coordinates hand, medicine, water, pickup, return, and Laravel updates.
+- Produces optional Arabic prompts using WAV files or offline eSpeak NG. Bluetooth pairing is an operating-system concern.
+
+### ESP32
+
+- Drives the two-motor differential base and manual movement.
+- Runs line following, intersection maneuvers, U-turns, and bounded line-loss recovery.
+- Uses the MPU6050 for turn and recovery heading feedback.
+- Reads the hand sensor, tank-level sensor, and DS1302 RTC.
+- Renders mission prompts and pickup time on the LCD.
+- Reports intersection, U-turn, recovery, and line-loss events.
+
+### Arduino UNO
+
+- Drives two eight-slot medicine-disk stepper motors.
+- Starts uncalibrated; the operator aligns each disk to physical Slot 0 and sends `SET_SLOT_ZERO_1` or `SET_SLOT_ZERO_2`.
+- Confirms every requested pill with its matching chute sensor.
+- Controls the active-low mission water-pump relay on D2 and reports start and completion.
+
+The ESP32 firmware retains separate maintenance pump commands, but automated missions send `WATER_DISPENSE|MS=4500` to the Arduino UNO.
+
+## 6. Navigation System
+
+The ESP32 interprets black as `0` and white as `1` across sensors `O1` through `O5`, with `O3` at the center. Proportional corrections keep the array centered. Three readings with at least four black sensors signal an intersection; three all-white readings start bounded recovery.
+
+Recovery brakes, backtracks, searches using gyro-limited headings, tracks line contact, verifies the surface pattern, and locks back onto the route. If it fails, the Raspberry Pi enters `WAITING_FOR_MANUAL_RECOVERY`. An operator has a 15-second default window to reposition and resume; cancellation or timeout fails the mission.
+
+At an intersection, the robot stops and the Raspberry Pi requests a confirmed camera observation. The marker must be approved, dominant, and—after a prior step—the expected next marker. Missing, ambiguous, unexpected, or unmapped evidence never falls back to an arbitrary straight command.
+
+### Current logical map
+
+```mermaid
+flowchart LR
+    HOME["HOME<br/>ID 10"] -->|STRAIGHT| N0["NODE_0<br/>ID 0"]
+    N0 -->|LEFT| R1["ROOM_1<br/>ID 11"]
+    N0 -->|STRAIGHT| N1["NODE_1<br/>ID 1"]
+    N1 -->|LEFT| N2["NODE_2<br/>ID 2"]
+    N1 -->|RIGHT| R4["ROOM_4<br/>ID 14"]
+    N1 -->|STRAIGHT| R5["ROOM_5<br/>ID 15"]
+    N2 -->|LEFT| R3["ROOM_3<br/>ID 13"]
+    N2 -->|RIGHT| R2["ROOM_2<br/>ID 12"]
+```
+
+Outbound paths use breadth-first search over Laravel's directed connections. Return routes are explicit because decisions are heading-aware after the room U-turn:
+
+| From room | Return decisions |
+| --- | --- |
+| Room 1 | U-turn to NODE_0, RIGHT to HOME |
+| Room 2 | U-turn to NODE_2, LEFT to NODE_1, RIGHT to NODE_0, STRAIGHT to HOME |
+| Room 3 | U-turn to NODE_2, RIGHT to NODE_1, RIGHT to NODE_0, STRAIGHT to HOME |
+| Room 4 | U-turn to NODE_1, LEFT to NODE_0, STRAIGHT to HOME |
+| Room 5 | U-turn to NODE_1, STRAIGHT to NODE_0, STRAIGHT to HOME |
+
+HOME and room departures use bounded physical-right, sensor-guided U-turns. The controller must clear the original line and reacquire a valid line before completion. Printable marker assets are in [`aruco_markers/`](aruco_markers/).
+
+## 7. Medicine Dispensing
+
+Each disk has eight equal slots. With 2048 motor steps per revolution, one pill command advances 256 steps. Position is tracked modulo eight, but there is no homing switch or absolute encoder, so both disks require manual Slot 0 alignment after power-up.
+
+For each mission item, the Raspberry Pi verifies calibration and issues one `DISPENSE_1` or `DISPENSE_2` command per requested pill. The UNO returns `ACK`, advances one slot, and waits for the matching sensor pulse. Only confirmed passage produces `DONE`; stuck-sensor and pill-timeout conditions produce an error. The Raspberry Pi compares requested and confirmed totals before advancing.
+
+The sensor confirms passage only. It does not identify a drug, verify dosage, or verify the recipient.
+
+## 8. Water Delivery
+
+The ESP32 converts ultrasonic distance into `OK`, `LOW`, `EMPTY`, or `SENSOR_ERROR`. Empty and sensor-error results block mission startup and delivery; low level remains permitted.
+
+After medicine succeeds, the Raspberry Pi sends `WATER_DISPENSE|MS=4500` to the UNO. The UNO validates the 100–60,000 ms range, activates the D2 relay without blocking serial input, turns it off, and returns matching `ACK` and `DONE` responses. This is timed delivery with no flow-meter feedback.
+
+A separate calibrated-volume development endpoint remains disabled while `WATER_FLOW_ML_PER_SECOND=0`; it also converts volume to time rather than measuring flow.
+
+## 9. Human Interaction
+
+At a confirmed room, the LCD asks the recipient to place a hand under the dispenser. The Raspberry Pi waits for the ESP32's debounced signal before allowing medicine. The LCD then reports medicine and water progress, followed by a 30-second pickup countdown before return.
+
+With `VOICE_ENABLED=true`, the Raspberry Pi plays Arabic prompts for mission start, arrival, hand placement/detection, dispensing, completion, return, HOME arrival, recovery, and failure. Playback uses one queue; audio failure does not change mission state.
+
+## 10. Mission Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> READY_FOR_EXECUTION: due mission claimed
+    READY_FOR_EXECUTION --> STARTING: HOME, hardware, water checks pass
+    STARTING --> GOING_TO_ROOM: U-turn done, line follow starts, Laravel updated
+    GOING_TO_ROOM --> ARRIVED_AT_ROOM: destination confirmed
+    ARRIVED_AT_ROOM --> WAITING_FOR_HAND
+    WAITING_FOR_HAND --> DISPENSING: hand confirmed
+    DISPENSING --> DISPENSE_COMPLETED: pills confirmed
+    DISPENSE_COMPLETED --> WATER_DISPENSING
+    WATER_DISPENSING --> WATER_DISPENSE_COMPLETED: UNO DONE
+    WATER_DISPENSE_COMPLETED --> WAITING_FOR_PICKUP
+    WAITING_FOR_PICKUP --> RETURNING_HOME: countdown zero, U-turn starts
+    RETURNING_HOME --> ARRIVED_HOME: HOME confirmed
+    ARRIVED_HOME --> IDLE: Laravel completion succeeds
+
+    STARTING --> WAITING_FOR_MANUAL_RECOVERY
+    GOING_TO_ROOM --> WAITING_FOR_MANUAL_RECOVERY
+    RETURNING_HOME --> WAITING_FOR_MANUAL_RECOVERY
+    WAITING_FOR_MANUAL_RECOVERY --> STARTING: resume
+    WAITING_FOR_MANUAL_RECOVERY --> GOING_TO_ROOM: resume
+    WAITING_FOR_MANUAL_RECOVERY --> RETURNING_HOME: resume
+
+    READY_FOR_EXECUTION --> FAILED: validation or hardware failure
+    STARTING --> FAILED: start failure
+    WAITING_FOR_HAND --> FAILED: timeout or sensor failure
+    DISPENSING --> FAILED: dispenser failure
+    WATER_DISPENSING --> FAILED: water failure
+    WAITING_FOR_MANUAL_RECOVERY --> FAILED: cancel or timeout
+```
+
+`ARRIVED_HOME` remains observable briefly before Laravel is updated and the executor returns to `IDLE`.
+
+## 11. Software Stack
+
+| Area | Current stack |
+| --- | --- |
+| Raspberry Pi | Python, FastAPI, Pydantic, pySerial, HTTPX |
+| Computer vision | OpenCV Contrib, ArUco `DICT_4X4_50` |
+| Backend | PHP 8.2+, Laravel 12, Eloquent; SQLite by default |
+| Mobile | TypeScript, React Native 0.81, Expo SDK 54, Expo Router, Axios |
+| ESP32 | C++, Arduino framework, PlatformIO, MPU6050, hd44780, DS1302 |
+| Arduino UNO | Arduino C++, `Stepper`, AVR pin-change interrupts |
+| Tests | pytest, PHPUnit, custom TypeScript/Node test runner |
+
+## 12. Repository Structure
+
+```text
+.
+├── raspberry_controller/   # FastAPI, serial, missions, vision and routing
+├── esp32_controller/       # PlatformIO locomotion, sensors, LCD and RTC firmware
+├── arduino_controller/     # UNO medicine and mission-water firmware
+├── hardwareLaravel/        # Laravel mission, inventory and map API
+├── HardReactNative/
+│   └── medicine-robot-new/ # Expo mobile application
+├── aruco_markers/          # Printable HOME, intersection and room markers
+└── tests/                  # Raspberry, protocol and navigation tests
+```
+
+`esp32_controller/backup_old_chair_code/` and excluded chair/Wi-Fi/MQTT sources are historical, not part of the PlatformIO build. Raspberry Pi `hospital.db` and older local mission services remain compatibility code; Laravel is the current mission source of truth.
+
+## 13. Communication
+
+| Link | Purpose | Interface |
+| --- | --- | --- |
+| Mobile ↔ Laravel | Catalog and mission lifecycle | HTTP/JSON |
+| Mobile ↔ Raspberry Pi | Status, control, calibration and camera | HTTP/JSON, MJPEG |
+| Raspberry Pi ↔ Laravel | Claim/start/complete missions and fetch map | HTTP/JSON |
+| Raspberry Pi ↔ ESP32 | Motion, navigation, sensing, LCD, RTC | USB serial, 115200 baud |
+| Raspberry Pi ↔ Arduino UNO | Disk state, pills and mission water | USB serial, 9600 baud |
+| Raspberry Pi ↔ USB camera | Frames and preview | Video4Linux |
+| Raspberry Pi → speaker | Arabic prompts | Linux default audio sink |
+
+All network addresses are deployment settings. Do not commit local addresses or credentials.
+
+## 14. Setup / Development
+
+### Raspberry Pi Controller
 
 ```bash
 python -m pip install -r raspberry_controller/requirements.txt
+python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-The API reads these optional environment variables:
+Use one worker without `--reload` on hardware because serial, scheduler, camera, and executor state are process-local.
 
-| Variable | Default |
+Important optional variables: `ESP32_PORT`, `ARDUINO_PORT`, `ESP32_STARTUP_DELAY`, `ARDUINO_STARTUP_DELAY`, `READ_TIMEOUT`, `LARAVEL_API_URL`, `LARAVEL_API_TIMEOUT_SECONDS`, `ROBOT_TIMEZONE`, `MISSION_SCHEDULER_ENABLED`, `MISSION_SCHEDULER_INTERVAL_SECONDS`, `MISSION_AUTO_EXECUTION_ENABLED`, `NAVIGATION_AUTO_ENABLED`, `CAMERA_ENABLED`, `CAMERA_DEVICE`, `CAMERA_WIDTH`, `CAMERA_HEIGHT`, `ARUCO_CONFIRM_FRAMES`, `ARUCO_MIN_MARKER_AREA`, `ARUCO_MIN_AREA_RATIO`, `ARRIVED_HOME_OBSERVATION_SECONDS`, `HAND_WAIT_TIMEOUT_SECONDS`, `VOICE_ENABLED`, `VOICE_LANGUAGE`, `VOICE_AUDIO_DIR`, `VOICE_PLAYBACK_TIMEOUT_SECONDS`, `VOICE_BLOCKING_TIMEOUT_SECONDS`, and `WATER_FLOW_ML_PER_SECOND`.
+
+### Laravel Backend
+
+```bash
+cd hardwareLaravel
+composer run setup
+composer run dev
+```
+
+The committed `setup` script installs dependencies, creates `.env` when needed, generates the application key, migrates, and builds assets. The example uses SQLite. Configure `ROBOT_API_URL`, `ROBOT_API_CONNECT_TIMEOUT`, `ROBOT_API_TIMEOUT`, `ROBOT_TIMEZONE`, and `MISSION_CLAIM_LEASE_SECONDS`; never commit `.env`.
+
+### React Native Mobile App
+
+```powershell
+cd HardReactNative/medicine-robot-new
+npm install
+Copy-Item .env.example .env
+npm start
+```
+
+On macOS/Linux use `cp .env.example .env`. Configure only the endpoint placeholders and timezone:
+
+```dotenv
+EXPO_PUBLIC_LARAVEL_API_URL=http://YOUR_SERVER_IP:8000/api
+EXPO_PUBLIC_ROBOT_API_URL=http://YOUR_ROBOT_IP:8000
+EXPO_PUBLIC_ROBOT_TIMEZONE=Asia/Hebron
+```
+
+### ESP32 Firmware
+
+PlatformIO defines `esp32dev` and builds only `src/main.cpp`:
+
+```bash
+cd esp32_controller
+pio run -e esp32dev
+```
+
+Upload with PlatformIO after selecting the correct local serial port. Current firmware has no required Wi-Fi or MQTT path.
+
+### Arduino UNO Firmware
+
+Open [`medicine_dispenser_uno.ino`](arduino_controller/medicine_dispenser_uno/medicine_dispenser_uno/medicine_dispenser_uno.ino) in Arduino IDE, select Arduino UNO and the correct port, then use **Verify** before **Upload**. No board-qualified Arduino CLI configuration is committed, so no CLI upload command is prescribed.
+
+## 15. Running the System
+
+1. Inspect wiring, fill the tank, align both disks, and keep the stop/power control accessible.
+2. Start Laravel with its migrated database and seeded physical map.
+3. Start FastAPI with one worker and the intended serial, camera, scheduler, navigation, and voice settings.
+4. Power both embedded controllers; verify controller, camera, water-level, HOME-marker, and stopped-line readiness.
+5. Declare Slot 0 for both physically aligned disks through the calibration UI.
+6. Start Expo and confirm its Laravel and robot endpoints.
+7. Create a mission. Enabled scheduler/auto-execution settings start due work automatically; otherwise use the available tick/start controls.
+8. Observe delivery and return. Do not run unattended near edges, stairs, people, or untested obstacles.
+
+FastAPI interactive documentation is at `http://YOUR_ROBOT_IP:8000/docs`.
+
+## 16. Testing
+
+| Area | Command |
 | --- | --- |
-| `ESP32_PORT` | `/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0` |
-| `ARDUINO_PORT` | `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0` |
-| `ESP32_STARTUP_DELAY` | `2.0` seconds |
-| `ARDUINO_STARTUP_DELAY` | `2.0` seconds |
-| `READ_TIMEOUT` | `2.0` seconds |
-| `ROBOT_TIMEZONE` | `Asia/Hebron` (the DS1302 Palestine wall-clock timezone) |
-| `WATER_FLOW_ML_PER_SECOND` | `0` (disabled until physically calibrated) |
-| `LARAVEL_API_URL` | `http://127.0.0.1:8000/api` |
-| `LARAVEL_API_TIMEOUT_SECONDS` | `2.0` seconds |
-| `MISSION_SCHEDULER_ENABLED` | `false` |
-| `MISSION_SCHEDULER_INTERVAL_SECONDS` | `5.0` seconds |
-| `MISSION_AUTO_EXECUTION_ENABLED` | `false` (start an accepted scheduled mission through the existing HOME coordinator) |
-| `NAVIGATION_AUTO_ENABLED` | `false` (intersection events are observable but cannot move the robot) |
-| `ARUCO_MIN_AREA_RATIO` | `1.4` (minimum largest/second-largest marker dominance) |
-| `MISSION_CLAIM_LEASE_SECONDS` | `60` seconds (Laravel stale-claim recovery) |
-| `VOICE_ENABLED` | `false` (voice guidance is opt-in) |
-| `VOICE_LANGUAGE` | `ar` (eSpeak NG voice code) |
-| `VOICE_AUDIO_DIR` | unset (optional directory of prerecorded event WAV files) |
-| `VOICE_PLAYBACK_TIMEOUT_SECONDS` | `30` seconds |
-| `VOICE_BLOCKING_TIMEOUT_SECONDS` | `30` seconds (maximum wait for critical patient guidance) |
+| Python syntax | `python -m compileall raspberry_controller tests` |
+| Raspberry/controller tests | `python -m pytest -q` |
+| Mobile tests | `npm test` |
+| Mobile type check | `npm run typecheck` |
+| Mobile lint | `npm run lint` |
+| Laravel tests | `composer test` |
+| Laravel frontend build | `npm run build` |
+| ESP32 firmware | `pio run -e esp32dev` |
+| Arduino UNO | Arduino IDE **Verify** for the UNO sketch |
 
-## Arabic Bluetooth voice guidance
+Release-run results belong in the handoff or commit history, not as permanent success claims in this README.
 
-Voice runs only on the Raspberry Pi. It sends audio to the current Linux
-PulseAudio/PipeWire default sink, so Bluetooth pairing and default-speaker
-selection remain operating-system responsibilities. The application never
-stores a speaker MAC address or attempts to pair a device during a mission.
+## 17. Safety and Limitations
 
-Install the offline system audio tools:
+- University prototype; not a certified medical device or production hospital system.
+- No drug identity, dosage, recipient, ingestion, allergy, or contraindication verification.
+- Pill sensors confirm passage only; water delivery is timed with no flow meter.
+- Disks lack homing switches/absolute encoders and require manual Slot 0 calibration.
+- Navigation is limited to a prepared line/marker map; general obstacle avoidance and free-space localization are not in the active mission path.
+- Time/angle bounds exist, but no long-term quantitative reliability or medical-grade fault tolerance is established.
+- Raspberry runtime state is process-local; one worker is required and power loss can interrupt a mission.
+- Operational APIs do not implement production-grade access control.
+- Enclosure, electrical protection, emergency stop, battery supervision, and production sanitation are not specified by the repository.
 
-```bash
-sudo apt update
-sudo apt install -y espeak-ng pulseaudio-utils
-```
+## 18. Future Improvements
 
-Pair/connect the speaker once with the Raspberry Pi desktop or `bluetoothctl`,
-then select it as the default sink. On Raspberry Pi OS using PipeWire, inspect
-and select sinks with:
+- Wheel encoders and closed-loop speed/distance control.
+- Charging dock and battery telemetry.
+- Flow sensor and closed-loop water-volume delivery.
+- Homing sensors or encoders for both medicine disks.
+- Recipient/medicine verification and role-based API authentication.
+- Independent emergency-stop, watchdog, and power-fault handling.
+- Improved mechanical isolation, enclosure cleanability, and chute reliability.
+- Repeatable navigation, dispensing, and endurance measurements.
 
-```bash
-wpctl status
-wpctl set-default <bluetooth-sink-id>
-```
+## 19. Demo & Documentation
 
-The PulseAudio-compatible alternative is:
+**Project demo:** No public demo URL is currently included.
 
-```bash
-pactl list short sinks
-pactl set-default-sink <bluetooth-sink-name>
-```
+**Graduation project report:** No report file is currently present. When approved for publication, place it under `docs/` and link it here.
 
-Test offline Arabic synthesis through the selected speaker before starting the
-API:
+Versioned marker print assets are available in [`aruco_markers/`](aruco_markers/).
 
-```bash
-espeak-ng --stdout -v ar "مرحباً، نظام الصوت يعمل بنجاح." | paplay
-```
+## 20. Team
 
-Enable guidance for the one-worker production process:
+**Students**
 
-```bash
-VOICE_ENABLED=true \
-VOICE_LANGUAGE=ar \
-python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000 --workers 1
-```
+- Mahmoud Abdul Jabar Ali Yaseen
+- Ayham Fuqha
 
-Then inspect the worker and queue a fixed safe test sentence:
+**Supervisor:** Dr. Luai Malhis
 
-```bash
-curl http://127.0.0.1:8000/voice/status
-curl -X POST http://127.0.0.1:8000/voice/test
-```
+An-Najah National University<br>
+Faculty of Engineering and Information Technology<br>
+Computer Engineering Department<br>
+Academic Year 2025/2026
 
-For higher-quality recorded Arabic, set `VOICE_AUDIO_DIR` to a directory of
-WAV files named after the lowercase event, such as
-`arrived_at_room.wav`, `waiting_for_hand.wav`, and
-`delivery_completed.wav`. A matching file is played with `paplay`; a missing
-file automatically falls back to offline eSpeak NG synthesis. Playback uses
-one queue and worker. Critical patient prompts wait for actual playback before
-the corresponding physical action, bounded by `VOICE_BLOCKING_TIMEOUT_SECONDS`;
-other events remain asynchronous. Audio errors and timeouts are logged and
-never alter mission, navigation, dispensing, or water state.
+## 21. License
 
-## Validation
-
-Run syntax checks without connecting to hardware:
-
-```bash
-python -m compileall raspberry_controller tests
-```
-
-Run the automated API tests. The tests inject a fake hardware controller and never
-open `/dev/serial` devices:
-
-```bash
-python -m pytest -q
-```
-
-## Start the API
-
-Turn the project hardware power switch **ON**, then run:
-
-```bash
-python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000
-```
-
-Production scheduled execution remains opt-in and must use one process:
-
-```bash
-ROBOT_TIMEZONE=Asia/Hebron \
-MISSION_SCHEDULER_ENABLED=true \
-MISSION_AUTO_EXECUTION_ENABLED=true \
-NAVIGATION_AUTO_ENABLED=true \
-python -m uvicorn raspberry_controller.api:app --host 0.0.0.0 --port 8000 --workers 1
-```
-
-Do not add `--reload` or increase `--workers`; serial ownership, executor state,
-and the scheduler loop are process-local.
-
-Swagger documentation is available at `http://<raspberry-pi-address>:8000/docs`.
-
-## USB camera preview
-
-FastAPI owns one `/dev/video0` `VideoCapture` and one camera-reader thread. The
-reader supplies a shared frame buffer to both ArUco detection and the browser
-preview, so opening multiple browser clients never opens the camera again.
-
-Open `http://<raspberry-pi-address>:8000/camera/stream` for an MJPEG preview at
-approximately 12 FPS. The preview draws marker boxes, IDs, estimated areas, and
-camera resolution on a copy of each frame. `POST /camera/detect` continues to
-apply `DICT_4X4_50`, approved-marker filtering, minimum area, and consecutive
-frame confirmation to the unmodified buffered frames.
-
-Approved ArUco candidates are ranked by image area because the installed
-markers share one printed size. Candidates below `ARUCO_MIN_MARKER_AREA` are
-discarded. When two remain, the largest must be at least
-`ARUCO_MIN_AREA_RATIO` times the second largest or the frame is reported as
-ambiguous and confirmation resets. After a route decision, the coordinator
-also requires the marker of the expected next node resolved from the loaded
-Laravel map; it never replaces a larger unexpected marker with a smaller one.
-
-## DS1302 RTC API
-
-The Raspberry Pi reads the ESP32 using this exact serial command:
-
-```text
-GET_RTC
-RTC|YYYY=2026|MM=08|DD=09|HH=20|MIN=30|SEC=00
-```
-
-`GET /rtc` returns the parsed wall-clock value, `source: DS1302`, and the
-configured `ROBOT_TIMEZONE`. It never changes the RTC time.
-
-Explicit writes use the same ESP32 serial connection and this exact protocol:
-
-```text
-SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=00
-ACK|SET_RTC|YYYY=2026|MM=08|DD=23|HH=13|MIN=30|SEC=00
-```
-
-The firmware requires the exact field order and widths, validates the DS1302
-year range `2000..2099`, calendar/leap-day validity, hour `0..23`, and
-minute/second `0..59`, then reads the value back before acknowledging it.
-Failures are `ERROR|SET_RTC|INVALID_FORMAT`,
-`ERROR|SET_RTC|INVALID_DATETIME`, or `ERROR|SET_RTC|WRITE_FAILED`.
-
-`POST /rtc/set` accepts the six integer fields and returns the confirmed RTC
-wall clock. `POST /rtc/sync-system` is an explicit manual operation that
-converts the current system instant to `ROBOT_TIMEZONE` before writing its
-wall-clock fields. Neither endpoint creates another serial connection, and
-there is no continuous Linux-to-RTC synchronization.
-
-The DS1302 stores calendar and clock fields only; it has no timezone or UTC
-offset metadata. Those fields represent Palestine wall-clock time. Raspberry Pi
-and Laravel must therefore interpret them with the `Asia/Hebron` timezone
-database rules. Daylight-saving conversion belongs in software and must never
-be implemented as a fixed offset in the ESP32 firmware.
-
-## Scheduled mission claiming
-
-The scheduler uses this one-way source-of-truth path:
-
-```text
-DS1302 → ESP32 GET_RTC → Raspberry MissionScheduler → HTTP → Laravel missions
-```
-
-Each eligible scheduler tick verifies that hardware is available, reads the
-DS1302 wall-clock, and posts it to Laravel's
-`POST /api/missions/claim-due` endpoint:
-
-```json
-{
-  "robot_datetime": "2026-08-09 21:40:00",
-  "timezone": "Asia/Hebron"
-}
-```
-
-Before either the hardware check or RTC read, the scheduler normally requires
-the `MissionExecutor` to be `IDLE`. Running states return `EXECUTOR_BUSY`
-without reading the RTC or calling Laravel. If auto execution is enabled, the
-one exception is the already accepted scheduled mission in
-`READY_FOR_EXECUTION`: later ticks retry its existing coordinator start without
-reading the RTC or claiming another mission. If Laravel claims a
-mission but the executor boundary unexpectedly rejects it, the scheduler keeps
-that mission in memory and retries the same acceptance before permitting a new
-claim; `/scheduler/status` exposes its ID as
-`pending_acceptance_mission_id`.
-
-When no mission is due, Laravel returns:
-
-```json
-{
-  "success": true,
-  "claimed": false,
-  "mission": null
-}
-```
-
-When a mission is claimed, `claimed` is `true` and `mission` is the normal
-Laravel mission resource, including its nested room and medicine. For example:
-
-```json
-{
-  "success": true,
-  "claimed": true,
-  "mission": {
-    "id": 8,
-    "room": { "id": 1 },
-    "medicine": { "id": 2 },
-    "quantity": 4,
-    "status": "pending",
-    "schedule_claimed_at": "2026-08-09T18:40:00+00:00"
-  }
-}
-```
-
-Laravel atomically fills `schedule_claimed_at` for the oldest eligible pending
-mission and leaves its status as `pending`. The Raspberry `MissionExecutor` then
-holds only the runtime fields required for the software state
-`READY_FOR_EXECUTION`. When auto execution is enabled, the scheduler delegates
-startup to the existing navigation coordinator; it has no movement commands of
-its own.
-
-`schedule_claimed_at` is a Laravel-managed lease rather than a permanent claim.
-A pending, due mission becomes claimable again when its claim timestamp is at
-least `MISSION_CLAIM_LEASE_SECONDS` older than the current DS1302-derived UTC
-comparison time. An in-process executor acceptance failure retries the held
-mission first; after a process crash or power loss, Laravel refreshes the stale
-lease and returns that same mission ID. Missions that are not pending or not yet
-due are never recovered through the lease.
-
-The background loop is disabled by default. When
-`MISSION_SCHEDULER_ENABLED=true`, one thread per FastAPI process calls `tick()`
-at the configured interval and stops during application shutdown. Never use
-Uvicorn `--reload` or multiple workers with it: each process owns its own
-hardware connection and scheduler loop, which could create competing RTC reads
-and claim requests.
-
-Safe development endpoints are available even when the periodic loop is off:
-
-- `GET /scheduler/status` reports whether the loop is enabled/running, executor
-  state, held mission ID, and the most recent tick result.
-- `POST /scheduler/tick` performs one scheduler cycle. With auto execution off,
-  it remains claim-only. With auto execution on, it can invoke the same
-  coordinator startup as `POST /executor/start`; it never contains separate
-  motor, navigation, or dispensing logic.
-
-## Starting a ready mission
-
-`MISSION_AUTO_EXECUTION_ENABLED` defaults to `false`, preserving manual startup.
-When both scheduler and auto execution are enabled, a newly accepted scheduled
-mission is started through the same coordinator method used by the manual API.
-If HOME readiness is not confirmed, it remains `READY_FOR_EXECUTION`; later
-scheduler ticks retry HOME confirmation without another Laravel claim.
-
-The manual software trigger `POST /executor/start` performs exactly this first
-execution step for the currently ready mission:
-
-```text
-READY_FOR_EXECUTION
-  -> confirm HOME marker and stopped HOME line signature
-  -> STARTING
-  -> ESP32 U_TURN / ACK|U_TURN_STARTED
-  -> EVENT|U_TURN_COMPLETE
-  -> ESP32 START_LINE_FOLLOW / ACK|LINE_FOLLOW_STARTED
-  -> Laravel POST /api/missions/{id}/start-execution
-  -> GOING_TO_ROOM
-```
-
-The Laravel request includes the exact `schedule_claimed_at` returned by the
-claim. Laravel atomically permits only `pending -> in_progress` while that claim
-lease still matches. It does not expose an arbitrary status update through this
-execution endpoint.
-
-If line-follow start fails or returns a malformed acknowledgement, Laravel is
-not updated and the executor enters `FAILED`. If line following starts but the
-Laravel transition fails, the executor immediately calls the existing
-`STOP_LINE_FOLLOW` operation and requires `ACK|LINE_FOLLOW_STOPPED` before
-reporting `MISSION_STATUS_UPDATE_FAILED`. `GET /executor/status` reports the
-state, mission and target-room fields, dispenser box, last error, and configured
-auto-execution flag. Repeated manual starts or scheduler ticks while `STARTING`
-or `GOING_TO_ROOM` return `EXECUTOR_BUSY` without sending another U-turn, line
-command, or Laravel status update.
-
-## Intersection navigation coordinator
-
-Automatic intersection handling is disabled unless
-`NAVIGATION_AUTO_ENABLED=true`. FastAPI owns the only ESP32 serial connection,
-and one persistent reader dispatches command responses separately from
-`EVENT|...` and `LINE|RECOVERY|...` telemetry. Neither the camera service nor
-the navigation coordinator reads serial directly.
-
-While the executor is `GOING_TO_ROOM`, an `EVENT|INTERSECTION|...` line causes
-the coordinator to request a confirmed ArUco detection, resolve its marker
-through the Laravel map snapshot loaded with the mission, and send exactly one
-existing `INTERSECTION_LEFT`, `INTERSECTION_RIGHT`, or
-`INTERSECTION_STRAIGHT` command. Any missing camera/marker/map/route or invalid
-executor state leaves the robot stopped and records a machine-readable error in
-`GET /navigation/status`; there is no straight-ahead fallback.
-
-The first intersection event disarms the coordinator. Duplicate events are
-ignored until the ESP32 emits `EVENT|INTERSECTION_COMPLETE|...`, which proves
-the accepted maneuver finished and re-arms the next physical intersection. If
-the planner reports `ARRIVED`, line following is stopped and the executor moves
-to `ARRIVED_AT_ROOM` while retaining the mission. This phase does not dispense
-medicine or water, return home, or complete the mission.
-
-`POST /navigation/test/intersection-event` is available only while automatic
-navigation is disabled. It records the synthetic event without calling the
-camera, route planner, executor validation, or ESP32, and never changes mission
-state.
-
-### Legacy Raspberry database
-
-`raspberry_controller/hospital.db`, the SQLAlchemy `MissionService`, and the old
-FastAPI `/missions` routes remain for compatibility with earlier navigation and
-camera code. They are legacy and disconnected from the new scheduler/executor.
-The scheduler never imports that service, copies a Laravel mission into SQLite,
-or queries `hospital.db`; Laravel is the only scheduled-mission database.
-
-## Calibrated water API
-
-`POST /water/dispense` accepts `{"amount_ml": 100}`. The API converts the
-requested amount to a bounded pump duration using `WATER_FLOW_ML_PER_SECOND`,
-then sends one structured ESP32 command such as `WATER_DISPENSE|MS=2000`.
-The default flow is zero, so water dispensing remains disabled until a measured
-workshop calibration is configured. This is time-based delivery, not a flow
-sensor measurement.
-
-## Manual movement API
-
-The manual movement endpoints send exactly one command to the ESP32 per request.
-Forward and backward movement continue until another movement command or STOP is
-received. Left and right use the ESP32 firmware's existing gyro-based 90-degree
-turns. No timed or automatic movement is provided by these endpoints.
-
-```bash
-curl -X POST http://YOUR_PRIVATE_IP:8000/movement/forward
-curl -X POST http://YOUR_PRIVATE_IP:8000/movement/backward
-curl -X POST http://YOUR_PRIVATE_IP:8000/movement/left
-curl -X POST http://YOUR_PRIVATE_IP:8000/movement/right
-curl -X POST http://YOUR_PRIVATE_IP:8000/movement/stop
-```
-
-For the first movement test:
-
-- Lift the wheels off the ground.
-- Keep the project power switch accessible.
-- Test `POST /movement/stop` before placing the robot on the floor.
-- Do not use Uvicorn `--reload` or multiple workers with real Serial hardware.
-
-## Black-line following API
-
-Line following runs locally on the ESP32. FastAPI only reads the five active-low
-sensor values and starts or stops the mode. The current firmware pattern order is
-`O1, O2, O3, O4, O5`, where black normally reads `0`, white normally reads `1`,
-and `O3` is the center sensor.
-
-```bash
-curl http://YOUR_PRIVATE_IP:8000/line/sensors
-curl http://YOUR_PRIVATE_IP:8000/line/status
-curl -X POST http://YOUR_PRIVATE_IP:8000/line/start
-curl -X POST http://YOUR_PRIVATE_IP:8000/line/stop
-```
-
-Use this exact real-hardware testing order:
-
-1. Keep the robot wheels lifted.
-2. Keep the physical power switch accessible.
-3. Start FastAPI without `--reload` and with one worker.
-4. Call `GET /line/sensors`.
-5. Move black tape manually under each sensor and verify physical order.
-6. Verify center-line pattern.
-7. Verify all-white line-lost pattern.
-8. Verify all-black intersection pattern.
-9. Call `POST /line/stop` before the first movement test.
-10. Place the sensor over a straight black line.
-11. Call `POST /line/start`.
-12. Observe motor corrections briefly.
-13. Call `POST /line/stop`.
-14. Only after lifted-wheel testing succeeds, test on the floor at low speed.
-
-Safety warnings:
-
-- Forward correction continues until STOP, intersection, or line loss.
-- Initial PWM and proportional gain require physical calibration.
-- Do not test near stairs or table edges.
-- Do not use Uvicorn `--reload`.
-- Do not use multiple workers.
-- Only one process may open the Serial ports.
-
-## Intersection decisions
-
-When line following confirms a wide black intersection, the ESP32 stops with
-`LINE_STATUS|MODE=STOPPED|STATE=INTERSECTION|PATTERN=00000`. A decision can then
-be started without waiting for physical completion:
-
-```bash
-curl -X POST http://YOUR_PRIVATE_IP:8000/navigation/intersection/straight
-curl -X POST http://YOUR_PRIVATE_IP:8000/navigation/intersection/left
-curl -X POST http://YOUR_PRIVATE_IP:8000/navigation/intersection/right
-```
-
-These endpoints send only the following newline-terminated ESP32 commands and
-require the exact acknowledgement shown:
-
-| Direction | Command | Immediate acknowledgement |
-| --- | --- | --- |
-| Left | `INTERSECTION_LEFT` | `ACK|INTERSECTION_LEFT_STARTED` |
-| Right | `INTERSECTION_RIGHT` | `ACK|INTERSECTION_RIGHT_STARTED` |
-| Straight | `INTERSECTION_STRAIGHT` | `ACK|INTERSECTION_STRAIGHT_STARTED` |
-
-The ESP32 returns `ERROR|NOT_AT_INTERSECTION` if a decision is requested in any
-other line state. While a maneuver is active, `GET /line/status` reports
-`MODE=NAVIGATION` and a state such as `GOING_STRAIGHT`, `CENTERING_LEFT`,
-`CENTERING_RIGHT`, `PIVOT_SEARCH_LEFT`, `PIVOT_SEARCH_RIGHT`,
-`SENSOR_ALIGN_LEFT`, `SENSOR_ALIGN_RIGHT`, `LOCKING_LINE_LEFT`,
-`LOCKING_LINE_RIGHT`, `REACQUIRING_LEFT`, `REACQUIRING_RIGHT`, or
-`ACQUIRING_STRAIGHT`.
-
-STRAIGHT retains its verified 180/180 PWM behavior: it clears the wide black
-intersection and confirms the outgoing straight line. LEFT and RIGHT use a
-separate physical sequence for the front-mounted sensor array:
-
-1. Drive forward at PWM 160 for 1800 ms to cover the estimated 20 cm distance
-   from the front sensor array to the wheel rotation axis. All sensor patterns
-   are ignored and pivot output is prohibited for the complete interval. This
-   time-based value should be calibrated physically in 100 ms increments.
-2. Pivot in place at PWM 160 using the MPU6050. The intersection mapping is
-   intentionally swapped from the manual helper names after physical testing:
-   LEFT uses the existing right-pivot output (left side backward/right forward),
-   while RIGHT uses the existing left-pivot output (left forward/right backward).
-3. Ignore line patterns below 50 degrees. After both the angle and wide-black
-   clearance guards pass, LEFT accepts initial branch entry only through O1/O2,
-   while RIGHT accepts it only through O4/O5. O3 must still be white and the
-   total black count must be one to three. Every four/five-black pattern and the
-   initial `00000` remain rejected. Search is bounded to 110 degrees or 3000 ms.
-4. On the first expected-edge reading, immediately continue with sensor-guided
-   in-place pivoting at PWM 105. O1/O2 commands a physical-left pivot; O4/O5
-   commands a physical-right pivot, allowing a small overshoot to be corrected
-   by reversing direction. Normal forward proportional control does not start
-   during alignment. Four/five-black patterns continue the current pivot and
-   can never declare alignment.
-5. Strict pivot centering requires O3 black, O1/O5 white, and one to three total
-   black sensors. O2 and/or O4 may accompany O3. Five consecutive approximately
-   25 ms readings are required before leaving the pivot controller.
-6. After strict centering, run live forward proportional correction at base PWM
-   110, gain 35, and maximum correction 70. The line must remain entirely within
-   O2/O3/O4 for 500 continuous ms; any O1/O5 excursion resets this stability
-   timer while strong correction continues. Only then does normal line following
-   resume and emit completion.
-7. A temporary all-white loss continues the last correction for at most 250 ms.
-   A longer loss returns to bounded sensor-guided pivoting using the last known
-   line side; it never invokes forward fallback after the branch was detected.
-8. Only if no expected outgoing edge was ever detected, drive
-   forward at PWM 140 for at most 1200 ms. A valid reading immediately enters
-   the same sensor-guided pivot alignment. All-white and all-black readings
-   during this fallback do not cause an immediate stop.
-
-On success, proportional line following resumes immediately without another
-`POST /line/start`, and the ESP32 emits exactly one event:
-
-```text
-EVENT|INTERSECTION_COMPLETE|DIRECTION=LEFT|PATTERN=...
-EVENT|INTERSECTION_COMPLETE|DIRECTION=RIGHT|PATTERN=...
-EVENT|INTERSECTION_COMPLETE|DIRECTION=STRAIGHT|PATTERN=...
-```
-
-STRAIGHT clearing remains limited to 1500 ms and its acquisition remains limited
-to 2500 ms. LEFT/RIGHT pivoting is limited to 110 degrees or 3000 ms; sensor
-alignment and forward reacquisition are each bounded to 1200 ms, and line lock
-has a 2000 ms overall safety timeout. A final timeout stops both motors, disables
-line following, reports
-`STATE=NAVIGATION_FAILED`, and emits exactly one corresponding failure event:
-
-```text
-EVENT|INTERSECTION_FAILED|DIRECTION=LEFT
-EVENT|INTERSECTION_FAILED|DIRECTION=RIGHT
-EVENT|INTERSECTION_FAILED|DIRECTION=STRAIGHT
-```
-
-The legacy `S` command and `POST /line/stop` cancel any maneuver and stop both
-motors immediately. Manual `F`, `B`, `L`, or `R` takes control and cancels the
-maneuver. `START_LINE_FOLLOW` is rejected at an unresolved intersection instead
-of driving away from it.
-
-Use this exact physical intersection test order:
-
-1. Keep the power switch accessible.
-2. Test with wheels lifted first.
-3. Place the sensor array over a real intersection.
-4. Confirm `STATE=INTERSECTION`.
-5. Test STRAIGHT first.
-6. Confirm the original intersection clears.
-7. Confirm the outgoing straight line is acquired.
-8. Test LEFT.
-9. Test RIGHT.
-10. Test each timeout by removing the expected outgoing branch.
-11. Verify STOP interrupts every maneuver.
-12. Only then test all decisions on the floor.
-
-The initial PWM values, confirmation count, and timeouts require real-hardware
-tuning. Do not test near table edges or stairs. Keep the power switch within
-reach throughout every test.
-
-Do not use `--reload` while connected to real hardware, and do not start multiple
-Uvicorn workers. Only one process may open the ESP32 and Arduino UNO serial ports.
-Serial operations and medicine dispensing are blocking, so the service protects all
-hardware calls with one process-local thread lock.
-
-## Manual U-turn
-
-With the robot stopped and centered over a normal straight black line, start the
-first bounded U-turn implementation with:
-
-```bash
-curl -X POST http://YOUR_PRIVATE_IP:8000/navigation/u-turn
-```
-
-The endpoint sends the newline-terminated ESP32 command `U_TURN` and requires
-`ACK|U_TURN_STARTED`. It is rejected with `ERROR|MANEUVER_ACTIVE` while another
-movement or navigation controller owns the motors.
-
-The initial calibration pivots in place toward physical RIGHT at PWM 170. Sensor
-patterns are ignored below 120 degrees; from that angle onward, the first narrow
-one-to-three-sensor black pattern immediately enters sensor-guided alignment at
-PWM 160. Alignment uses O1/O2 for physical-left correction and O4/O5 for
-physical-right correction. Strict center requires O3 black, O1/O5 white, one to
-three black sensors total, and five consecutive approximately 25 ms readings.
-
-After centering, the verified proportional line lock runs forward at PWM 110,
-gain 35, and maximum correction 70 for approximately 500 ms before normal line
-following resumes. The states are `UTURN_PIVOT_SEARCH`, `UTURN_SENSOR_ALIGN`, and
-`UTURN_LINE_LOCK`. Success emits `EVENT|U_TURN_COMPLETE|PATTERN=...`; a bounded
-failure stops both motors, enters `NAVIGATION_FAILED`, and emits
-`EVENT|U_TURN_FAILED`. The fast search is limited to 260 degrees or 15000 ms,
-sensor alignment is limited to 6000 ms, and sensor-loss grace is 500 ms. An
-independent 24000 ms whole-maneuver deadline prevents recovery transitions from
-extending the U-turn indefinitely.
-
-The pivot PWM, gyro angles/timeouts, alignment PWM, and line-lock tuning are
-initial physical values and must be calibrated with the power switch accessible.
-`S`, `STOP_LINE_FOLLOW`, and manual `F`/`B`/`L`/`R` remain cancellation paths.
-
-The current API covers hardware health, ping, status, medicine dispensing, manual
-movement, local ESP32 black-line following, left/right/straight decisions at an
-already-detected physical intersection, and a manually triggered U-turn. Camera,
-ArUco, route planning, missions, database, water dispensing, automatic room and
-return-home logic, mobile applications, and the NestJS backend are intentionally
-outside this phase.
+Licensing for this repository has not yet been specified. No license is granted by the absence of a license file.
