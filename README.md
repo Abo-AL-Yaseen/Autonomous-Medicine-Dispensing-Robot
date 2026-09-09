@@ -362,9 +362,8 @@ Release-run results belong in the handoff or commit history, not as permanent su
 
 ## 19. Demo & Documentation
 
-**Project demo:** No public demo URL is currently included.
 
-**Graduation project report:** No report file is currently present. When approved for publication, place it under `docs/` and link it here.
+**Graduation project report:** https://drive.google.com/file/d/1_rL58RuHbM0NEoY4KnE82tlnQcRoxtMs/view?usp=sharing
 
 Versioned marker print assets are available in [`aruco_markers/`](aruco_markers/).
 
